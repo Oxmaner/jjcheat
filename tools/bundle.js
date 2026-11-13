@@ -1,0 +1,1058 @@
+'use strict';
+/*
+ * 打包器：把 src/ 下的 CommonJS 模块打成单个 IIFE，
+ * 让 iOS 的 JavaScriptCore 一句 evaluateScript 就能用，无需 require。
+ *
+ * 输出：dist/engine.js   暴露全局 JJEngine
+ * 用法：node tools/bundle.js
+ */
+const fs = require('fs');
+const path = require('path');
+
+const SRC = path.join(__dirname, '..', 'src');
+const OUT_DIR = path.join(__dirname, '..', 'dist');
+
+const ENTRY_FILES = [
+  'cst/constants',
+  'cst/position',
+  'cst/notation',
+  'cst/eval',
+  'cst/search',
+  'cst/book',
+  'vision/templates',
+  'vision/recognizer',
+  'vision/tracker'
+];
+
+// 模块 id -> 源码
+const sources = new Map();
+
+function normId(fromId, reqPath) {
+  // 归一化相对路径
+  const fromDir = path.posix.dirname(fromId);
+  let p = path.posix.normalize(path.posix.join(fromDir, reqPath));
+  // 去掉前导 './'
+  p = p.replace(/^\.\//, '');
+  return p;
+}
+
+function readModule(id) {
+  if (sources.has(id)) return;
+  const file = path.join(SRC, id + '.js');
+  if (!fs.existsSync(file)) throw new Error('模块不存在: ' + file);
+  const code = fs.readFileSync(file, 'utf8');
+  sources.set(id, code);
+  // 递归解析依赖
+  const re = /require\(\s*['"]([^'"]+)['"]\s*\)/g;
+  let m;
+  while ((m = re.exec(code)) !== null) {
+    const dep = normId(id, m[1]);
+    // 允许省略 .js —— 生成器与 recognizer 里的写法都是 './templates.js'
+    if (sources.has(dep) || fs.existsSync(path.join(SRC, dep + '.js'))) { readModule(dep); continue; }
+    const stripped = dep.replace(/\.js$/, '');
+    readModule(stripped);
+  }
+}
+
+for (const f of ENTRY_FILES) {
+  const id = f.replace(/\.js$/, '');
+  readModule(id);
+}
+
+// 生成模块表
+let out = '';
+out += '/* ============================================================\n';
+out += ' *  JJ象棋 辅助引擎内核 —— 单文件打包\n';
+out += ' *  目标运行环境: iOS JavaScriptCore / Node / 浏览器\n';
+out += ' *  生成时间: ' + new Date().toISOString() + '\n';
+out += ' *  模块数: ' + sources.size + '\n';
+out += ' * ============================================================ */\n';
+out += '(function (global) {\n';
+out += "'use strict';\n";
+out += 'var __modules = {};\n';
+out += 'var __cache = {};\n';
+
+for (const [id, code] of sources) {
+  out += '\n/* ---- ' + id + ' ---- */\n';
+  out += '__modules[' + JSON.stringify(id) + '] = function (module, exports, require) {\n';
+  out += code;
+  out += '\n};\n';
+}
+
+out += `
+function __require(id) {
+  if (__cache[id]) return __cache[id].exports;
+  var m = { exports: {} };
+  __cache[id] = m;
+  var fn = __modules[id];
+  if (!fn) throw new Error('模块未找到: ' + id);
+  fn(m, m.exports, function (p) { return __require(__resolve(id, p)); });
+  return m.exports;
+}
+
+function __resolve(fromId, reqPath) {
+  var parts = fromId.split('/');
+  parts.pop();
+  var segs = reqPath.split('/');
+  for (var i = 0; i < segs.length; i++) {
+    if (segs[i] === '.' || segs[i] === '') continue;
+    if (segs[i] === '..') parts.pop();
+    else parts.push(segs[i]);
+  }
+  return parts.join('/');
+}
+
+var C = __require('cst/constants');
+var POS = __require('cst/position');
+var NOTE = __require('cst/notation');
+var ENG = __require('cst/search');
+var BOOK = __require('cst/book');
+// 把开局库装进搜索器：命中库就照谱走（跟鹏飞「库:」一样）
+ENG.setBook && ENG.setBook(BOOK);
+var REC = __require('vision/recognizer');
+var TRK = __require('vision/tracker');
+
+/* ============================================================
+ *  一站式接口 —— 给 iOS / ObjC 调用
+ * ============================================================ */
+
+/* ============================================================
+ *  棋盘朝向处理
+ *  用户执红时红子在下（标准朝向），执黑时 JJ象棋 会翻转棋盘、黑子在下。
+ *  引擎内部统一用「红在下」的标准坐标，所以画面翻转时要翻回来。
+ * ============================================================ */
+
+/** 上下翻转一张棋子编码表 */
+function flipPieceMap(map) {
+  var out = new Array(90).fill(0);
+  for (var sq = 0; sq < 90; sq++) {
+    var v = map[sq];
+    if (!v) continue;
+    var r = (sq / 9) | 0, c = sq % 9;
+    out[(9 - r) * 9 + c] = v;
+  }
+  return out;
+}
+
+/** 上下翻转一张三分类网格（返回新数组，不改原数组） */
+function flipGrid(grid) {
+  var out = new Int8Array(90);
+  for (var sq = 0; sq < 90; sq++) {
+    var r = (sq / 9) | 0, c = sq % 9;
+    // ★ 必须是「旋转 180 度」，不是「上下翻转」
+    //
+    //   你执黑时，看盘的视角是从对面看过来 —— 相当于把棋盘在桌面里转了 180 度，
+    //   行和列同时反向。原来只翻了行、列没翻，得到的是一张「左右镜像」的假局面：
+    //   帅/将恰好还在九宫里（九宫左右对称），所以合法性检查也发现不了，
+    //   但整盘棋子全在错的列上，引擎算出来的着法自然全废。
+    out[(9 - r) * 9 + (8 - c)] = grid[sq];
+  }
+  return out;
+}
+
+/** 屏幕坐标 ↔ 引擎坐标（红在下）：旋转 180 度 */
+function flipCodes(codes) {
+  var out = new Int8Array(90);
+  for (var sq = 0; sq < 90; sq++) {
+    var r = (sq / 9) | 0, c = sq % 9;
+    out[(9 - r) * 9 + (8 - c)] = codes[sq];
+  }
+  return out;
+}
+
+/* ============================================================
+ *  直接把识别出的兵种编码组回 FEN
+ *
+ *  这才是象棋软件该有的架构：识别整盘棋子 → 组局面 → 引擎算。
+ *  不依赖「从开局一步步跟踪」，所以随时中途进去也能用。
+ * ============================================================ */
+
+var PC2FEN_TABLE = ['', 'K', 'A', 'B', 'N', 'R', 'C', 'P', 'k', 'a', 'b', 'n', 'r', 'c', 'p'];
+
+/** 只拼棋盘部分（不带走子方） */
+function codesToBoardFen(codes) {
+  var rows = [];
+  for (var r = 0; r < 10; r++) {
+    var s = '', empty = 0;
+    for (var c = 0; c < 9; c++) {
+      var v = codes[r * 9 + c];
+      if (!v) { empty++; continue; }
+      if (empty) { s += empty; empty = 0; }
+      s += PC2FEN_TABLE[v] || '1';
+    }
+    if (empty) s += empty;
+    rows.push(s);
+  }
+  return rows.join('/');
+}
+
+/**
+ * 局面合法性校验
+ *
+ * 只拦「明显不合理」的情况，不做严格将帅计数校验。
+ * 之前要求 redK===1 && blkK===1，结果红帅被高亮圈/绿点遮住一帧就整盘作废，
+ * 浮窗直接冻住不动。宁可容忍个别格识别错，也不要让程序彻底停止工作。
+ */
+function validateCodes(codes) {
+  var redN = 0, blkN = 0;
+  for (var i = 0; i < 90; i++) {
+    var v = codes[i];
+    if (!v) continue;
+    if (v >= 1 && v <= 7) redN++;
+    else if (v >= 8 && v <= 14) blkN++;
+  }
+  // 棋子数不可能超过初始布局
+  if (redN > 16 || blkN > 16) return false;
+  // 全是空 / 只剩两三个子，说明识别彻底失败
+  if (redN + blkN < 6) return false;
+  return true;
+}
+
+/** 宽松版：只要不是全空就接受，用于「让程序继续工作」 */
+/**
+ * 有没有认出东西来。
+ *
+ * 只要认出至少 1 个棋子就算有结果 —— 象棋可以有只剩两个王的盘面，
+ * 任何「至少 N 个子」的门槛都是瞎猜，会误杀合法残局（实测 6 子、4 子残局都栽在这上面）。
+ * 真正意义上「什么都没认出来」是 0 个棋子，那种情况才不该覆盖上一局面。
+ */
+function codesUsable(codes) {
+  for (var i = 0; i < 90; i++) if (codes[i]) return true;
+  return false;
+}
+
+/**
+ * 严格合法性校验：这一帧识别出来的盘面「有没有可能是一盘真棋」。
+ *
+ * 为什么要这道闸：真机抓屏和离线截图不完全一致，偶尔会出几帧垃圾识别。
+ * 垃圾盘面一旦被显示出去，用户看到的就是「满盘车」「红帅变黑将」这种乱象，
+ * 而真正该做的是：宁可继续显示上一帧合法盘面，也不要把垃圾推给用户。
+ *
+ * 判据（象棋规则里不可能出现的组合）：
+ *   每方最多 1 个将帅、2 仕、2 相、2 马、2 车、2 炮、5 兵
+ *   双方棋子总数都不能超过 16，且不能少到 5 个以下（那是识别崩了）
+ *   必须有一方有将帅（至少红黑各 1 个里的一个，允许另一侧被遮挡漏读）
+ */
+function codesLegal(codes) {
+  var LIM = [0, 1, 2, 2, 2, 2, 2, 5];   // 将 仕 相 马 车 炮 兵
+  var cnt = [new Array(8).fill(0), new Array(8).fill(0)];
+  var redN = 0, blkN = 0;
+  for (var i = 0; i < 90; i++) {
+    var v = codes[i];
+    if (!v) continue;
+    if (v >= 1 && v <= 7) { redN++; cnt[0][v]++; }
+    else if (v >= 8 && v <= 14) { blkN++; cnt[1][v - 7]++; }
+  }
+  // 只拦「规则上不可能」的情况，一律是上限：
+  //   每方最多 16 子（象棋不能升变，子只会少不会多）
+  //   每类子不超过初始数量（将1 仕2 相2 马2 车2 炮2 兵5）
+  // 【没有任何下限】
+  //   只剩两个王、只剩一个车，都是合法局面；任何「至少 N 个子」的门槛
+  //   都会误杀残局（实测 6 子和 4 子的残局全被误杀过）。
+  if (redN > 16 || blkN > 16) return false;
+  for (var s = 0; s < 2; s++) {
+    for (var t = 1; t <= 7; t++) {
+      if (cnt[s][t] > LIM[t]) return false;
+    }
+  }
+  return true;
+}
+
+/* ============================================================
+ *  全局会话状态（单例）
+ * ============================================================ */
+var session = {
+  recognizer: null,
+  tracker: null,
+  corners: null,
+  lastFen: '',
+  lastResult: null,
+  pending: false,
+  flipped: false,          // true = 黑在下（用户执黑）
+  lastGridHash: 0,
+  gridStable: 0,
+  lastBoardFen: '',        // 上一帧的棋盘部分（用于判断局面是否变化）
+  sideToMoveNow: 'red'     // 当前该谁走
+};
+
+var JJEngine = {
+  version: '1.0.0',
+  C: C,
+
+  /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
+  setCorners: function (corners) {
+    session.corners = corners;
+    if (!session.recognizer) {
+      session.recognizer = new REC.BoardRecognizer({ corners: corners, enableLowConfRefine: true });
+    } else {
+      session.recognizer.corners = corners.map(function (p) { return [p[0], p[1]]; });
+    }
+    return true;
+  },
+
+  /** 重置到指定局面（默认开局） */
+  reset: function (fen) {
+    session.tracker = new TRK.MoveTracker(fen || C.START_FEN);
+    session.lastFen = session.tracker.fen;
+    session.lastResult = null;
+    session.lastGridHash = 0;
+    session.gridStable = 0;
+    // 逐格「上一稳定值」也清掉，否则换局后残留上一局的棋子
+    session.stableCodes = null;
+    session.lowStreak = null;
+    session.lowConfCount = 0;
+    // 稳定判定和朝向投票也要清，否则换一局后会被上一局的哈希/投票带偏
+    session.lastCodesHash = -1;
+    session.codesStable = 0;
+    session.legalStreak = 0;
+    session.illegalStreak = 0;
+    session.orientVote = null;
+    session.orientCount = 0;
+    if (session.lastBoardFen !== undefined) session.lastBoardFen = '';
+    if (session.lastRawFen !== undefined) session.lastRawFen = '';
+    session.searchKey = '';
+    session.searchLevel = 0;
+    session.lastBudget = 0;
+    return session.tracker.fen;
+  },
+
+  /** 在开局局面状态下学习棋盘背景 */
+  learnBoard: function (pixels, w, h) {
+    if (!session.recognizer) throw new Error('未标定');
+
+    var stats = session.recognizer.sampleAll(pixels, w, h, true);
+    session.recognizer.learnBackground(stats, []);
+
+    var startMap = TRK.startPieceMap();
+
+    function compare(a, b) {
+      var d = 0;
+      for (var i = 0; i < 90; i++) if (a[i] !== b[i]) d++;
+      return d;
+    }
+
+    // ★ 朝向判定：用「颜色分类」而不是「翻转标签再学一遍」。
+    //   为什么不能用模板：模板的红黑是靠标签给的，标签一翻，识别结果也跟着翻，
+    //   两边永远打平（实测 diffNormal=0 且 diffFlipped=0，完全分不出来）。
+    //   颜色分类只看像素本身（棋子暖色、棋盘冷色；红字发红、黑字不发红），
+    //   和标签无关，才是可靠的物理判据。
+    var colorCls = null;
+    try { colorCls = session.recognizer.classifyByColor(stats); } catch (e) { colorCls = null; }
+
+    var bRed = 0, bBlk = 0, tRed = 0, tBlk = 0;
+    if (colorCls) {
+      for (var c = 0; c < 9; c++) {
+        var vb = colorCls.grid[9 * 9 + c];
+        if (vb === 1) bRed++; else if (vb === 2) bBlk++;
+        var vt = colorCls.grid[0 * 9 + c];
+        if (vt === 1) tRed++; else if (vt === 2) tBlk++;
+      }
+    }
+
+    // 手机屏幕上「棋盘最下方」永远是自己这边：
+    //   下排红多 → 我执红（红在下）
+    //   下排黑多 → 我执黑（JJ象棋 会翻转棋盘）
+    // 上下都判不出来时，退回「谁在下方看谁」，再不行默认红。
+    var flipped = false;
+    if (colorCls) {
+      if (bBlk > bRed + 2) {
+        flipped = true;                    // 下排明显是黑
+      } else if (bRed > bBlk + 2) {
+        flipped = false;                   // 下排明显是红
+      } else {
+        // 下排看不清，用上排反推
+        flipped = (tRed > tBlk + 2);
+      }
+    }
+    session.flipped = flipped;
+
+    // ★ 不再用第一帧去学模板。
+    //   原来的做法是把第一帧当成标准开局，用开局棋子位置给模板贴标签；
+    //   用户中途进对局时第一帧就是中局，标签全错（车被标成马、炮被标成兵），
+    //   于是识别出来的 FEN 永远是开局 rnbakabnr/9/1c5c1/...。
+    //   现在模板是离线从已知正确盘面生成、内置在引擎里的，和当前帧无关。
+    //   这里只做校验，不改模板。
+
+    // 验证：用刚学到的模板识别同一帧，和标准开局比（翻转时先翻回标准坐标）
+    var clsV = session.recognizer.classify(stats);
+    var verifyDiff = 999;
+    if (clsV && clsV.codes) {
+      var got = flipped ? flipCodes(clsV.codes) : clsV.codes;
+      verifyDiff = compare(got, startMap);
+    }
+    var ok = (verifyDiff <= 8);
+
+    var learned = session.recognizer.bgModel ? 1 : 0;
+    var warmTh = session.recognizer.bgModel ? session.recognizer.bgModel.warmThreshold : -1;
+
+    return {
+      learned: learned,
+      warmThreshold: warmTh,
+      templateCount: session.recognizer.templateCount || 0,
+      verifyDiff: verifyDiff,
+      ok: ok,
+      isOpening: ok,
+      flipped: session.flipped ? 1 : 0,
+      mySide: session.flipped ? 'black' : 'red',
+      diffNormal: verifyDiff,
+      diffFlipped: flipped ? verifyDiff : -1,
+      bottomRed: bRed,
+      bottomBlack: bBlk,
+      topRed: tRed,
+      topBlack: tBlk
+    };
+  },
+
+  /** 清空学习结果，退回默认阈值模式（画面不是开局时的兜底） */
+  skipLearning: function () {
+    if (session.recognizer) {
+      session.recognizer.bgModel = null;
+      // 模板不能清空 —— 内置模板是离线从已知正确盘面生成的，
+      // 清空后就只剩「纯颜色判断」，识别率会掉一大截。
+      // 这里只是「重新装回内置模板」，等价于丢弃任何运行时学出来的模板。
+      try {
+        session.recognizer.templates = session.recognizer._buildBuiltinTemplates();
+      } catch (e) { /* 保持原样 */ }
+    }
+    return { skipped: true };
+  },
+
+  /**
+   * 自动检测棋盘四角
+   * 棋盘是严格等间距的 9 竖 10 横网格，用边缘投影 + 等距约束就能定位，
+   * 完全不需要用户手点。
+   * @returns {Array<[number,number]>|null} [[左上],[右上],[右下],[左下]]，检测失败返回 null
+   */
+  autoDetectBoard: function (pixels, w, h) {
+    try {
+      var r = REC.autoDetectBoard(pixels, w, h);
+      if (!r) return null;
+      return [
+        [r[0][0], r[0][1]],
+        [r[1][0], r[1][1]],
+        [r[2][0], r[2][1]],
+        [r[3][0], r[3][1]]
+      ];
+    } catch (e) {
+      return null;
+    }
+  },
+
+  /**
+   * 自动检测 + 用棋子实测校验，校验不过就明确报不通过。
+   *
+   * 为什么要校验：边缘投影找到的线间距可能偏小 10~20%（实测格高 59.9 vs 实际 73.3），
+   * 这种误差逐行累积，到第 7 行采样点已经偏了整整一格，炮就被采到上面空格去了。
+   * 检测本身没法自己发现自己错了，只能用「棋子应该落在交叉点上」来验证。
+   *
+   * 校验方法：网格算出来后，采 90 个格子，统计「暖色盘面」的格子数
+   * 和它们到最近交叉点的偏移。棋子数太少或偏移太大 → 判定网格不可信。
+   */
+  /**
+   * 自动检测的调试信息：初始边缘投影四角 / 棋子反推结果 / 最终走了哪条路
+   */
+  autoDetectDebug: function (pixels, w, h) {
+    var r = null;
+    try { r = JJEngine.autoDetectBoard(pixels, w, h); } catch (e) { return { error: String(e && e.message || e) }; }
+    return { corners: r, debug: REC.autoDetectBoard.lastDebug || null };
+  },
+
+  autoDetectBoardChecked: function (pixels, w, h) {
+    var corners = JJEngine.autoDetectBoard(pixels, w, h);
+    if (!corners) return { ok: false, reason: 'no_grid' };
+
+    // 用这组角采样，看有多少格是「有棋子盘面」
+    JJEngine.setCorners(corners);
+    if (!session.recognizer) return { ok: false, reason: 'no_recognizer' };
+    var stats;
+    try { stats = session.recognizer.sampleAll(pixels, w, h, false); } catch (e) { return { ok: false, reason: 'sample_fail' }; }
+
+    var pieceCells = 0;
+    var warmSum = 0;
+    for (var i = 0; i < 90; i++) {
+      var s = stats[i];
+      if (!s) continue;
+      var warmR = s.warmR || 0;
+      if (warmR >= 0.30) { pieceCells++; warmSum += warmR; }
+    }
+    return {
+      ok: true,
+      corners: corners,
+      pieceCells: pieceCells,
+      avgWarm: pieceCells ? (warmSum / pieceCells) : 0,
+      // 中局一般 20~32 个子，低于 8 个基本就是网格歪了
+      plausible: pieceCells >= 8
+    };
+  },
+
+  /** 自动检测并直接应用（一步到位） */
+  autoCalibrate: function (pixels, w, h) {
+    var r = JJEngine.autoDetectBoard(pixels, w, h);
+    if (!r) return { ok: false };
+    JJEngine.setCorners(r);
+    return { ok: true, corners: r };
+  },
+
+  /** 调试：直接输出单帧的兵种识别结果（不走稳定性门槛、不写 session） */
+  classifyBoard: function (pixels, w, h) {
+    if (!session.recognizer) return null;
+    var stats = session.recognizer.sampleAll(pixels, w, h, true);
+    var cls = null;
+    try { cls = session.recognizer.classify(stats); } catch (e) { return { error: String(e && e.message || e) }; }
+    if (!cls || !cls.codes) return { error: 'no_codes' };
+    var codes = Array.prototype.slice.call(cls.codes);
+    var redN = 0, blkN = 0, details = [];
+    for (var i = 0; i < 90; i++) {
+      var v = codes[i];
+      if (!v) continue;
+      if (v >= 1 && v <= 7) redN++; else blkN++;
+      details.push([i, v]);
+    }
+    return {
+      codes: codes,
+      fen: codesToBoardFen(codes),
+      redN: redN,
+      blkN: blkN,
+      valid: validateCodes(codes),
+      usable: codesUsable(codes),
+      occupied: details.length,
+      details: details,
+      conf: session.recognizer.lastConf ? Array.prototype.slice.call(session.recognizer.lastConf) : null,
+      ranked: session.recognizer.lastRanked || null
+    };
+  },
+
+  /**
+   * 调试：对单格做半径/偏移扫描，看「换个采样窗口这一格会变成什么」
+   * @param {number} sq 格子序号 0..89
+   * @param {number} scale 半径倍率（相对默认 radius）
+   * @param {number} dxF cell 单位的水平偏移
+   * @param {number} dyF cell 单位的垂直偏移
+   */
+  debugCell: function (pixels, w, h, sq, scale, dxF, dyF) {
+    var rec = session.recognizer;
+    if (!rec) return null;
+    var pts = rec.gridPoints();
+    var cell = rec.cellSize(pts);
+    var radius = Math.max(3, Math.round(cell * rec.cellRadiusRatio * (scale || 1)));
+    var gain = rec.estimateGain(pixels, w, h, pts);
+    var cx = pts[sq * 2] + (dxF || 0) * cell;
+    var cy = pts[sq * 2 + 1] + (dyF || 0) * cell;
+    var s = rec.sampleCell(pixels, w, h, cx, cy, radius, true, gain);
+    var m = rec.matchCell(s);
+    return {
+      key: m.key, score: m.score, warmRatio: m.warmRatio,
+      alts: (m.alts || []).map(function (a) { return [a.key, Math.round(a.score * 1000) / 1000]; }),
+      inkR: Math.round((s.inkR || 0) * 1000) / 1000,
+      warmR: Math.round((s.warmR || 0) * 1000) / 1000,
+      skipped: s.skipped || 0,
+      cell: cell, radius: radius
+    };
+  },
+
+  /**
+   * 这一步在这个局面里到底合不合法
+   *
+   * 为什么必须有：云库（chessdb）对「该谁走」的理解和我们不一定一致，
+   * 一旦 FEN 的走子方或朝向有偏差，它给的可能是对方的着法 ——
+   * 界面上就会出现「兵七退一」这种红兵往回走的鬼话。
+   * 这里直接用它自己的走法生成器核对一遍，不合法就丢掉，退回本机引擎。
+   */
+  isLegalMove: function (fen, ucci) {
+    try {
+      var pos = new POS.Position(fen);
+      var s = new ENG.Searcher();
+      var roots = s._rootMoves(pos);
+      for (var i = 0; i < roots.length; i++) {
+        if (C.mvToUcci(roots[i]) === String(ucci)) return 1;
+      }
+      return 0;
+    } catch (e) {
+      return 0;
+    }
+  },
+
+  /**
+   * 把一步 UCCI 着法翻译成中文着法 + 起止格
+   * （云库返回的是 move:c0e2 这种，界面上要「相三进五」）
+   */
+  moveInfo: function (fen, ucci) {
+    try {
+      var pos = new POS.Position(fen);
+      var mv = C.ucciToMv(ucci);
+      if (!mv) return { chinese: '', from: -1, to: -1 };
+      return {
+        chinese: NOTE.mvToChinese(pos.board, mv, pos.side),
+        from: C.mvFrom(mv),
+        to: C.mvTo(mv)
+      };
+    } catch (e) {
+      return { chinese: '', from: -1, to: -1 };
+    }
+  },
+
+  /** 调试：切换兵种打分方式 'dot' | 'f1' | 'mass' | 'mass:0.5'（后者同时设惩罚系数） */
+  setScoreMode: function (mode) {
+    if (!session.recognizer) return false;
+    var parts = String(mode).split(':');
+    session.recognizer.scoreMode = parts[0];
+    if (parts.length > 1) session.recognizer.massK = parseFloat(parts[1]);
+    return session.recognizer.scoreMode === parts[0];
+  },
+
+  /** 调试：输出 90 个格子的原始特征，用来定位「哪一格为什么判错」 */
+  debugSample: function (pixels, w, h) {
+    if (!session.recognizer) return null;
+    var stats = session.recognizer.sampleAll(pixels, w, h, true);
+    var out = [];
+    for (var i = 0; i < 90; i++) {
+      var s = stats[i] || {};
+      out.push([
+        i,
+        Math.round((s.inkR || 0) * 1000) / 1000,
+        Math.round((s.warmR || 0) * 1000) / 1000,
+        Math.round((s.redInkR || 0) * 1000) / 1000,
+        Math.round((s.darkInkR || 0) * 1000) / 1000,
+        Math.round((s.redR || 0) * 1000) / 1000,
+        s.skipped || 0
+      ]);
+    }
+    return out;
+  },
+
+  /**
+   * 主流程：喂一帧 RGBA 像素，返回识别 + 建议
+   * @param {Uint8ClampedArray|Uint8Array} pixels RGBA
+   * @param {number} w
+   * @param {number} h
+   * @param {object} opts { timeMs, autoReset }
+   * @returns {object}
+   */
+  process: function (pixels, w, h, opts) {
+    opts = opts || {};
+    if (!session.recognizer) throw new Error('未标定');
+    if (!session.tracker) JJEngine.reset();
+
+    // 模板匹配需要 patch，所以这里必须采
+    var stats = session.recognizer.sampleAll(pixels, w, h, true);
+    var cls = session.recognizer.classify(stats);
+
+    // ★ 逐格置信度 + 保留上一稳定值
+    //
+    // 为什么需要：JJ象棋 在落子瞬间会把刚走的棋子放大 1.25 倍并偏移十几像素
+    // （还有红圈/白圈/绿点），那一两帧的模板分数会掉到 0.2 左右（正常 1.3~2.7），
+    // 于是红仕被判成红兵。这些效果「只在特定时候出现」，是瞬时干扰。
+    //
+    // 做法：分数够高的格子直接采信；分数太低的格子沿用上一帧的稳定值，
+    // 连续多帧都低才认这一次的结果（避免被一个动画帧永久带偏）。
+    var LOWCONF = 0.55;
+    // 实时模式（录屏 + 浮窗）：本帧结果直接采信。
+    //
+    //   为什么要单独一条：稳定值机制本来是为了挡落子动画的一两帧干扰，
+    //   但实时模式下棋盘会一直停在「对方刚走完」的状态里 ——
+    //   那几格刚好因为放大/高亮圈分数偏低，就一直沿用旧值，
+    //   表现就是「对方走了，浮窗里没变」。所以在实时模式下不搞保留。
+    var liveMode = !!(opts && opts.live);
+    var prevCodes = session.stableCodes;
+    var mergedCodes = new Array(90);
+    var lowConfCount = 0;
+    for (var sm = 0; sm < 90; sm++) {
+      // ★ 被浮窗盖住的格子：整格作废，保留上一帧的值
+      //
+      //   浮窗会一起被截进截图里，那几格采到的其实是浮窗画面（我们自己的小棋盘），
+      //   拿去识别就会凭空多出棋子、还把网格拉偏 —— 历史上这就是「浮窗挡棋盘」翻车的根源。
+      //   现在浮窗自带一圈洋红边框（App 端画的），引擎按边框精确算出盖住了哪几格，
+      //   这几格保留上一帧的值；没有上一帧就留空（宁可少一个子，也不要凭空多一个）。
+      if (session.recognizer && session.recognizer.occluded && session.recognizer.occluded[sm]) {
+        mergedCodes[sm] = (prevCodes && prevCodes[sm] !== undefined && prevCodes[sm] !== null)
+          ? prevCodes[sm] : 0;
+        session.lowStreak = session.lowStreak || new Array(90).fill(0);
+        session.lowStreak[sm] = 0;
+        continue;
+      }
+      var raw = cls.codes ? cls.codes[sm] : 0;
+      var conf = cls.conf ? (cls.conf[sm] || 0) : 1;
+      if (liveMode) { mergedCodes[sm] = raw; continue; }
+      var st = stats[sm];
+      var warm = st ? (st.warmR || 0) : 0;
+      var okCell;
+      if (!raw) {
+        // 判空：暖色占比确实很低才可信
+        okCell = (warm < 0.12);
+      } else {
+        okCell = (conf >= LOWCONF);
+      }
+      if (!okCell) lowConfCount++;
+      if (okCell || !prevCodes || prevCodes[sm] === undefined || prevCodes[sm] === null) {
+        mergedCodes[sm] = raw;
+        session.lowStreak = session.lowStreak || new Array(90).fill(0);
+        session.lowStreak[sm] = 0;
+      } else if ((session.lowStreak[sm] = (session.lowStreak[sm] || 0) + 1) >= 8) {
+        // 连续 8 帧都不确定，就接受新值，免得永远卡在旧局面上
+        mergedCodes[sm] = raw;
+        session.lowStreak[sm] = 0;
+      } else {
+        mergedCodes[sm] = prevCodes[sm];
+      }
+    }
+    if (cls.codes) cls.codes = mergedCodes;
+    session.lowConfCount = lowConfCount;
+
+    // 画面翻转时（用户执黑）翻回标准坐标，引擎内部一律「红在下」
+    //
+    // ★ 朝向改成每帧重判，不再只信 learnBoard 那一帧的结论。
+    //   之前 session.flipped 只在 learnBoard 时定一次，之后永不更新：
+    //   learnBoard 那一帧如果刚好没读准，或者你换了执红/执黑，
+    //   朝向就一直错着，着法自然全是乱的（浮窗还会把「你执黑」写成「你执红」）。
+    //   判据：看底部两行（第 8、9 行）以哪一方棋子为主 —— 玩家自己永远在下方。
+    //   只有双方数量差 ≥3 才投票，且要连续 2 帧一致才改，避免中途抖动。
+    (function detectOrientation(codes) {
+      // ★ 朝向改用「走不出自己半场」的棋子投票，不再数底两行的颜色
+      //
+      // 老判据是「屏幕底两行哪种颜色多，哪种就是玩家」。这在开局没问题，
+      // 但残局会直接反掉：「雨打芭蕉 编号:19」里黑方 5 个子已经压到红方底线，
+      // 底两行黑 6 红 2，于是被判成「玩家执黑」——
+      // 整盘翻面、引擎 FEN 全反，我方得分算出 -29999（自己被将死），着法全废。
+      //
+      // 帅/将出不了九宫（红帅只可能在下三行、黑将只可能在上三行），
+      // 仕/士同样只在九宫，相/象过不了河 —— 这些都是「位置锁定」的棋子，
+      // 拿它们投票，对方冲到哪都不会干扰。
+      var s = 0;
+      for (var i = 0; i < 90; i++) {
+        var c = codes[i];
+        if (!c) continue;
+        var row = (i / 9) | 0;
+        if (c === 1) s += (row >= 5 ? 6 : -6);          // 红帅在下方 → 画面正常
+        else if (c === 8) s += (row <= 4 ? 6 : -6);     // 黑将在上方 → 画面正常
+        else if (c === 2) s += (row >= 5 ? 2 : -2);     // 红仕只能在下方九宫
+        else if (c === 9) s += (row <= 4 ? 2 : -2);
+        else if (c === 3) s += (row >= 5 ? 1 : -1);     // 红相过不了河
+        else if (c === 10) s += (row <= 4 ? 1 : -1);
+      }
+      var vote = null;
+      if (s >= 3) vote = 'red';        // 红在下 → 我执红
+      else if (s <= -3) vote = 'black'; // 红在上 → 我执黑
+      if (!vote) {
+        // 将帅都没认出来时，退回老办法（底两行颜色），聊胜于无
+        var r2 = 0, b2 = 0;
+        for (var rr = 8; rr <= 9; rr++) {
+          for (var cc = 0; cc < 9; cc++) {
+            var code2 = codes[rr * 9 + cc];
+            if (code2 >= 1 && code2 <= 7) r2++; else if (code2 >= 8) b2++;
+          }
+        }
+        if (b2 >= r2 + 3) vote = 'black';
+        else if (r2 >= b2 + 3) vote = 'red';
+        if (!vote) return;
+      }
+      if (vote === session.orientVote) {
+        session.orientCount = (session.orientCount || 0) + 1;
+      } else {
+        session.orientVote = vote;
+        session.orientCount = 1;
+      }
+      if (!session.orientSeen || (session.orientCount || 0) >= 2) {
+        session.orientSeen = true;
+        session.flipped = (vote === 'black');
+      }
+    })(cls.codes);
+
+    var grid = session.flipped ? flipGrid(cls.grid) : cls.grid;
+
+    // ★ 我执红还是执黑：由画面朝向决定（黑在下 = 我执黑，红在下 = 我执红）
+    var mySideDetected = session.flipped ? 'black' : 'red';
+    var bottomRed = mySideDetected === 'red' ? 1 : 0;
+    var bottomBlack = mySideDetected === 'black' ? 1 : 0;
+
+    // 1) 尝试推进一步棋
+    // ★ 画面稳定性检测
+    //   落子动画、高亮圈闪烁会让同一局面在相邻帧里识别出不同结果，
+    //   如果每帧都拿去匹配走法，tracker 会被误判推着往前跑（而且退不回来），
+    //   表现就是「一会这样一会那样，一会又等对方走」。
+    //   所以要求连续 2 帧识别结果完全一致，才认为画面稳定、才做走法判定。
+    var gridHash = 0;
+    for (var gi = 0; gi < 90; gi++) {
+      gridHash = ((gridHash * 31) + grid[gi]) | 0;
+    }
+    if (session.lastGridHash === gridHash) {
+      session.gridStable = (session.gridStable || 0) + 1;
+    } else {
+      session.gridStable = 0;
+      session.lastGridHash = gridHash;
+    }
+    var isStable = (session.gridStable >= 1);
+
+    var out = {
+      grid: Array.prototype.slice.call(grid),
+      fen: session.tracker.fen,
+      moveDetected: false,
+      mySide: mySideDetected,
+      bottomRed: bottomRed,
+      bottomBlack: bottomBlack,
+      stable: isStable ? 1 : 0,
+      // 浮窗盖住了几格（浮窗自带洋红边框，引擎按边框算出来的，不是猜颜色）
+      pipOverlap: (session.recognizer && session.recognizer.occludedCount) || 0,
+      pipRect: (session.recognizer && session.recognizer.pipRect) || null,
+      hiddenCells: (session.recognizer && session.recognizer.occludedCount) || 0
+    };
+
+    // ★ 主路径：直接把识别出的兵种组回 FEN
+    //   这才是象棋软件该有的做法 —— 不依赖「从开局一步步跟踪」，
+    //   所以哪怕你中途进对局，也能立刻认出当前局面并给出下一步。
+    //
+    //   关键：识别结果必须先稳定下来才更新局面。
+    //   采样点只要偏几像素，相邻帧可能把同一个棋子识别成不同兵种，
+    //   FEN 每帧都不一样，着法就会乱跳（实测同一开局给出过相三进五/兵四进一/兵三进一三个答案）。
+    var directFen = null;
+    var codesOk = false;
+    var codesHash = 0;
+    if (cls.codes) {
+      for (var ci = 0; ci < 90; ci++) {
+        codesHash = ((codesHash * 31) + cls.codes[ci]) | 0;
+      }
+    }
+    if (session.lastCodesHash === codesHash) {
+      session.codesStable = (session.codesStable || 0) + 1;
+    } else {
+      session.codesStable = 0;
+      session.lastCodesHash = codesHash;
+    }
+    // 要求连续 3 帧识别结果完全一致才认为局面定下来了。
+    // 2 帧门槛太低：一次落子动画 + 高亮圈切换就能凑够两帧抖动。
+    var codesSettled = liveMode ? true : (session.codesStable >= 2);
+
+    // 第一帧只要认出来就直接落地，不再等「3 帧完全一致」。
+    //   之前一律要求 3 帧一致才更新，结果中途进对局时识别在两组结果之间抖
+    //   （几个高亮格来回翻），永远凑不出 3 帧一致，浮窗就一直是开局的棋盘。
+    //   现在：第一次落地无条件（限流照旧），之后才要求稳定，抖动照样挡得住。
+    var firstLatch = !session.lastBoardFen;
+    // ★ 合法性闸门
+    //   真机抓屏偶尔会出几帧垃圾识别（满盘车、红帅变黑将之类）。
+    //   与其把垃圾显示出去，不如继续显示上一帧合法盘面 ——
+    //   你看到的永远是「一盘真棋」，不会是乱码盘。
+    var legalNow = cls.codes && codesLegal(session.flipped ? flipCodes(cls.codes) : cls.codes);
+    if (!legalNow) {
+      session.legalStreak = 0;
+      session.illegalStreak = (session.illegalStreak || 0) + 1;
+      // 连续 12 帧都不合法 → 清掉旧局面，让下一帧合法识别重新落地（别卡死在一个错盘面上）
+      if (session.illegalStreak > 12) {
+        session.lastBoardFen = '';
+        session.lastRawFen = '';
+        session.lastResult = null;
+        session.illegalStreak = 0;
+      }
+    } else {
+      session.illegalStreak = 0;
+      session.legalStreak = (session.legalStreak || 0) + 1;
+    }
+
+    if (legalNow && (firstLatch || codesSettled) && cls.codes && codesUsable(cls.codes)) {
+      // 两套 FEN，别再混用：
+      //   rawFen = 屏幕原样（给浮窗显示，必须跟你眼睛看到的一模一样）
+      //   engFen = 引擎内部坐标（红永远在下，给算棋用）
+      // 你执黑时这两套是上下相反的。之前只存了一套、还按屏幕方向去算棋，
+      // 引擎会把黑方当红方，着法自然全错。
+      var rawFen = codesToBoardFen(cls.codes);
+      var engCodes = session.flipped ? flipCodes(cls.codes) : cls.codes;
+      var boardFen = codesToBoardFen(engCodes);
+      // 局面更新限流：最多每 700ms 换一次。
+      // 识别偶尔抖动时，靠这道闸门挡住「一秒内连换五个着法」的情况。
+      var nowMs = Date.now();
+      // 实时模式（录屏浮窗）不限流：棋盘一变就要立刻反映出来。
+      // 照片模式保留 700ms 限流，防止识别抖动时界面乱换。
+      var canUpdate = liveMode || (!session.lastFenUpdateTime) || (nowMs - session.lastFenUpdateTime > 700);
+
+      session.lastRawFen = rawFen;
+
+      if (boardFen !== session.lastBoardFen && canUpdate) {
+        session.lastBoardFen = boardFen;
+        session.lastFenUpdateTime = nowMs;
+        out.moveDetected = true;
+        session.lastResult = null;    // 强制重算
+        session.stableCodes = mergedCodes.slice();
+      } else if (!session.lastBoardFen) {
+        // 第一次进来先落地，不占用限流
+        session.lastBoardFen = boardFen;
+        session.lastFenUpdateTime = nowMs;
+        out.moveDetected = true;
+        session.lastResult = null;
+        session.stableCodes = mergedCodes.slice();
+      }
+      // 局面没变也要更新「上一稳定值」，这样高置信度的格子能持续收敛
+      if (!session.stableCodes) session.stableCodes = mergedCodes.slice();
+      codesOk = true;
+
+      // FEN 的走子方一律取「我方」。
+      // 之前绕了一个 session.sideToMoveNow 变量，它和 mySide 会不同步，
+      // 结果就是「显示我执红、却一直说等对方走」。
+      // 你的诉求是「告诉我我该走哪步」，所以引擎永远站在我方算。
+      directFen = session.lastBoardFen + ' ' +
+        (mySideDetected === 'red' ? 'w' : 'b') + ' - - 0 1';
+      // 浮窗显示用「屏幕原样」的 FEN：你执黑时它就是黑在下，
+      // 跟你眼睛看到的完全一致。算棋用的是 directFen（内部坐标，红永远在下）。
+      out.fen = (session.lastRawFen || session.lastBoardFen) + ' ' +
+        (mySideDetected === 'red' ? 'w' : 'b') + ' - - 0 1';
+      out.recognized = 1;
+      out.conf90 = session.recognizer.lastConf || null;
+      out.tops90 = session.recognizer.lastRanked || null;
+      out.engineFen = directFen;
+      out.sideToMove = mySideDetected;
+      try { session.tracker.pos.setFen(directFen); } catch (e) {}
+    } else {
+      // 还在等识别稳定，沿用上一次的结论
+      // 【别再拿「开局盘面」冒充识别结果】
+      //   以前这里兜底成 session.tracker.fen（= 开局 FEN），
+      //   于是识别彻底失败时界面会显示一盘完整的开局、还说「识别完成 · 32 个子」。
+      //   现在没有识别结果就返回空串，让上层明确报「没认出来」。
+      out.fen = session.lastRawFen || session.lastBoardFen || '';
+      out.recognized = out.fen ? 1 : 0;
+      if (isStable) {
+        var mv2 = session.tracker.tryAdvance(grid, 1);
+        if (mv2 && !mv2.fail) {
+          out.moveDetected = true;
+          out.move = mv2.ucci;
+          out.moveChinese = mv2.chinese;
+        }
+      }
+    }
+    out.codesValid = codesOk ? 1 : 0;
+    out.codesSettled = codesSettled ? 1 : 0;
+
+    // 2) 到了我方走 → 算棋
+    var analyzeFen = directFen || session.tracker.fen;
+    if (out.moveDetected || !session.lastResult || session.lastFen !== analyzeFen) {
+      var t0 = Date.now();
+      // 开局库：命中就照谱走，一眼出着、也不算棋（跟鹏飞「库:」一样）
+      var bookHit = BOOK.lookup(analyzeFen);
+      var res = bookHit
+        ? { bestmove: bookHit.ucci, score: 0, winrate: 0.5, depth: 0, nodes: 0, pv: [bookHit.ucci] }
+        : ENG.analyze(analyzeFen, { timeMs: opts.timeMs || 800 });
+      var pos = new POS.Position(analyzeFen);
+      var mv = C.ucciToMv(res.bestmove);
+
+      // 完整缓存：中文着法、起止格、分值、胜率、深度、走子方
+      // 否则下一帧走缓存分支时，着法就丢了，浮窗会退回「识别中…」
+      session.lastFen = analyzeFen;
+      session.lastResult = {
+        bestmove: res.bestmove,
+        chinese: res.bestmove ? NOTE.mvToChinese(pos.board, mv, pos.side) : '',
+        from: res.bestmove ? C.mvFrom(mv) : -1,
+        to: res.bestmove ? C.mvTo(mv) : -1,
+        score: res.score,
+        scoreText: (res.score >= 0 ? '+' : '') + (res.score / 100).toFixed(2),
+        winrate: Math.round(res.winrate * 1000) / 10,
+        depth: res.depth,
+        pv: res.pv,
+        nodes: res.nodes,
+        mate: res.mate,
+        sideToMove: pos.side === C.RED ? 'red' : 'black',
+        book: bookHit ? 1 : 0
+      };
+
+      var c = session.lastResult;
+      out.suggest = c.bestmove;
+      out.suggestChinese = c.chinese;
+      out.from = c.from;
+      out.to = c.to;
+      out.score = c.score;
+      out.scoreText = c.scoreText;
+      out.winrate = c.winrate;
+      out.depth = c.depth;
+      out.pv = c.pv;
+      out.nodes = c.nodes;
+      out.elapsed = Date.now() - t0;
+      out.sideToMove = c.sideToMove;
+      out.mate = c.mate;
+    } else {
+      // 局面没变：直接把上一次的完整结论端出来，不要清空
+      var c2 = session.lastResult || {};
+      out.suggest = c2.bestmove || '';
+      out.suggestChinese = c2.chinese || '';
+      out.from = (c2.from === undefined) ? -1 : c2.from;
+      out.to = (c2.to === undefined) ? -1 : c2.to;
+      out.score = c2.score || 0;
+      out.scoreText = c2.scoreText || '+0.00';
+      out.winrate = (c2.winrate === undefined) ? 50 : c2.winrate;
+      out.depth = c2.depth || 0;
+      out.sideToMove = c2.sideToMove || 'red';
+      out.mate = c2.mate || 0;
+    }
+
+    return out;
+  },
+
+  /** 直接分析一个 FEN（不走视觉） */
+  /**
+   * 多候选着法：界面上的「思考列表」
+   * 返回 {bestmove, score, depth, nodes, ms, rows:[{move, chinese, score, winrate, depth}]}
+   */
+  analyzeTop: function (fen, opts) {
+    try {
+      return ENG.analyzeTop(fen, opts || {});
+    } catch (e) {
+      return { bestmove: '', score: 0, depth: 0, nodes: 0, ms: 0, rows: [] };
+    }
+  },
+  analyzeFen: function (fen, timeMs) {
+    var res = ENG.analyze(fen, { timeMs: timeMs || 1000 });
+    var pos = new POS.Position(fen);
+    var mv = C.ucciToMv(res.bestmove);
+    return {
+      bestmove: res.bestmove,
+      chinese: res.bestmove ? NOTE.mvToChinese(pos.board, mv, pos.side) : '',
+      score: res.score,
+      scoreText: (res.score >= 0 ? '+' : '') + (res.score / 100).toFixed(2),
+      winrate: Math.round(res.winrate * 1000) / 10,
+      depth: res.depth,
+      pv: res.pv,
+      nodes: res.nodes,
+      mate: res.mate,
+      from: res.bestmove ? C.mvFrom(mv) : -1,
+      to: res.bestmove ? C.mvTo(mv) : -1
+    };
+  },
+
+  /** 当前局面 */
+  currentFen: function () { return session.tracker ? session.tracker.fen : C.START_FEN; },
+
+  /** 手动修正局面（识别错了的时候用） */
+  forceSetFen: function (fen) {
+    session.tracker = new TRK.MoveTracker(fen);
+    session.lastFen = fen;
+    session.lastResult = null;
+    return session.tracker.fen;
+  },
+
+  /** 调试：把一个 FEN 渲染成 90 格三分类（验证追踪逻辑） */
+  fenToGrid: function (fen) {
+    var pos = new POS.Position(fen);
+    return Array.prototype.slice.call(TRK.boardToGrid(pos.board));
+  },
+
+  /** 棋盘 → 每个交叉点在该帧中的像素坐标，给 UI 画箭头用 */
+  gridPoints: function () {
+    if (!session.recognizer) return [];
+    var pts = session.recognizer.gridPoints();
+    var out = [];
+    for (var i = 0; i < 90; i++) out.push([pts[i * 2], pts[i * 2 + 1]]);
+    return out;
+  }
+};
+
+global.JJEngine = JJEngine;
+if (typeof module !== 'undefined' && module.exports) module.exports = JJEngine;
+
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+`;
+
+fs.mkdirSync(OUT_DIR, { recursive: true });
+const outFile = path.join(OUT_DIR, 'engine.js');
+fs.writeFileSync(outFile, out, 'utf8');
+
+const stat = fs.statSync(outFile);
+console.log('打包完成');
+console.log('  模块数 :', sources.size);
+console.log('  输出   :', outFile);
+console.log('  体积   :', (stat.size / 1024).toFixed(1), 'KB');
+console.log('  模块列表:');
+for (const id of sources.keys()) console.log('    -', id);

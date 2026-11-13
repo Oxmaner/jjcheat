@@ -1,0 +1,159 @@
+name: build-ios-app
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios/app/**'
+      - 'src/**'
+      - 'dist/**'
+      - '.github/workflows/build-ios-app.yml'
+
+jobs:
+  build:
+    # 必须 Xcode 16：新版 XcodeGen 生成 objectVersion 77，Xcode 15 读不了
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 选择 Xcode 16
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16'
+
+      - name: 查看工具链版本
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          swift --version
+
+      - name: 安装 XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen --version
+
+      - name: 打包引擎脚本
+        run: |
+          node tools/bundle.js
+          mkdir -p ios/app/JJCheatApp/Resources
+          cp dist/engine.js ios/app/JJCheatApp/Resources/engine.js
+          ls -la ios/app/JJCheatApp/Resources/
+
+      # 象眼（ElephantEye）：纯 C++ 经典引擎，不依赖数据文件，静态链接最稳。
+      - name: 编译象眼静态库
+        continue-on-error: true
+        run: |
+          set -e
+          mkdir -p ios/native
+          if [ ! -d ios/native/eleeye ]; then
+            git clone --depth 1 https://github.com/xqbase/eleeye.git ios/native/eleeye
+          fi
+          # 源码注释是 GBK，clang 按 UTF-8 读会报错 —— 先转码
+          find ios/native/eleeye -name '*.cpp' -o -name '*.h' | while read f; do
+            iconv -f GBK -t UTF-8 "$f" > "$f.u8" 2>/dev/null && mv "$f.u8" "$f" || rm -f "$f.u8"
+          done
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          cd ios/native/eleeye/eleeye
+          mkdir -p obj
+          ok=0
+          for f in *.cpp; do
+            [ "$f" = "eleeye.cpp" ] && continue   # 它自带 main()，不要
+            if xcrun --sdk iphoneos clang++ -arch arm64 -isysroot "$SDK" -mios-version-min=16.0 \
+                 -std=c++11 -O2 -fPIC -DNDEBUG -I. -I../base -c "$f" -o "obj/${f%.cpp}.o"; then ok=$((ok+1)); else echo "FAILED $f"; fi
+          done
+          # base/pipe.cpp 提供 PipeStruct::LineInput（ucci.cpp 要用）
+          if xcrun --sdk iphoneos clang++ -arch arm64 -isysroot "$SDK" -mios-version-min=16.0 \
+               -std=c++11 -O2 -fPIC -DNDEBUG -I. -I../base -c ../base/pipe.cpp -o obj/base_pipe.o; then ok=$((ok+1)); else echo "FAILED base_pipe"; fi
+          if xcrun --sdk iphoneos clang++ -arch arm64 -isysroot "$SDK" -mios-version-min=16.0 \
+               -std=c++11 -O2 -fPIC -DNDEBUG -I. -I../base -c ../../ee_bridge.cpp -o obj/ee_bridge.o; then ok=$((ok+1)); else echo "FAILED ee_bridge"; fi
+          echo "象眼编译成功 $ok 个"
+          if [ -f obj/ee_bridge.o ]; then
+            xcrun libtool -static -o libeleeye.a obj/*.o || true
+            ls -la libeleeye.a
+          else
+            echo "ee_bridge.o 没编出来，这次不出静态库，交给下一步放空库"
+            rm -f libeleeye.a
+          fi
+          nm -gU libeleeye.a 2>/dev/null | grep -E 'ee_bestmove|_ee_' | head -5 || true
+          # 开局库随包：BOOK.DAT（96KB）会落在 .app 根目录，跟可执行文件同级
+          if [ -f ../BOOK/BOOK.DAT ]; then
+            cp ../BOOK/BOOK.DAT ../../../app/JJCheatApp/Resources/BOOK.DAT
+            ls -la ../../../app/JJCheatApp/Resources/BOOK.DAT
+          else
+            echo "!! 没找到 BOOK/BOOK.DAT，开局库这次不随包"
+          fi
+
+      - name: 象眼没编成时放个空库
+        run: |
+          LIB=ios/native/eleeye/eleeye/libeleeye.a
+          if [ ! -f "$LIB" ]; then
+            echo "象眼没编成，放空库"
+            mkdir -p "$(dirname "$LIB")"
+            xcrun libtool -static -o "$LIB" /dev/null 2>/dev/null || ar rcs "$LIB"
+          fi
+          ls -la "$LIB"
+
+      - name: 生成 Xcode 工程
+        run: |
+          cd ios/app
+          xcodegen generate
+          echo "--- 生成的工程 ---"
+          ls -la
+          echo "--- objectVersion ---"
+          grep -m1 objectVersion JJCheat.xcodeproj/project.pbxproj || true
+          echo "--- schemes ---"
+          ls -la JJCheat.xcodeproj/xcshareddata/xcschemes/ || true
+          echo "--- 确认 engine.js 在 pbxproj 里被引用 ---"
+          grep -c "engine.js" JJCheat.xcodeproj/project.pbxproj || true
+
+      - name: 编译（免签名）
+        run: |
+          cd ios/app
+          set -o pipefail
+          # 构建标记：UTC 时间 + 短提交号，每次编译都不一样，界面上会显示
+          BUILD_TAG="$(date -u '+%m%d-%H%M')-$(git rev-parse --short HEAD)"
+          echo "BUILD_TAG=$BUILD_TAG"
+          xcodebuild \
+            -project JJCheat.xcodeproj \
+            -scheme JJCheatApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            CURRENT_PROJECT_VERSION="$BUILD_TAG" \
+            MARKETING_VERSION="1.0.0" \
+            build
+
+      - name: 打未签名 ipa
+        run: |
+          APP=$(find "$RUNNER_TEMP/dd/Build/Products" -name "JJCheatApp.app" -maxdepth 3 | head -1)
+          echo "app = $APP"
+          test -d "$APP"
+          echo "--- app 内容 ---"
+          ls -la "$APP"
+          echo "--- 硬性校验 ---"
+          test -f "$APP/engine.js"                       || (echo "!!! engine.js 没打进去" && exit 1)
+          test -f "$APP/Info.plist"                      || (echo "!!! 缺 Info.plist" && exit 1)
+          echo "engine.js  = $(wc -c < "$APP/engine.js") 字节"
+          echo "主程序     = $(wc -c < "$APP/JJCheatApp") 字节"
+          cd "$RUNNER_TEMP"
+          rm -rf Payload JJCheat-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry JJCheat-unsigned.ipa Payload
+          ls -la JJCheat-unsigned.ipa
+          echo "--- ipa 内容 ---"
+          unzip -l JJCheat-unsigned.ipa
+
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: JJCheat-ipa
+          path: ${{ runner.temp }}/JJCheat-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
