@@ -11,7 +11,8 @@ JJCheat_FILES = Tweak.xm \
                 JJScreenGrabber.m \
                 JJHUDWindow.m
 
-JJCheat_CFLAGS = -fobjc-arc -O2 -Wno-deprecated-declarations -Wno-unused-variable
+JJCheat_CFLAGS = -fobjc-arc -O2 -Wno-deprecated-declarations -Wno-unused-variable \
+                 -I$(THEOS_PROJECT_DIR)/include
 JJCheat_FRAMEWORKS = UIKit Foundation QuartzCore CoreGraphics JavaScriptCore \
                      IOSurface CoreVideo OpenGLES Metal MetalKit
 JJCheat_PRIVATE_FRAMEWORKS = 
