@@ -33,6 +33,15 @@ jobs:
         run: |
           export THEOS=$HOME/theos
           git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
+          # Linux 的 iOS 工具链：缺了它 make 会去 $THEOS/toolchain/linux/iphone/bin/clang 找不到编译器
+          # 这份就是 theos 官方 install-theos 脚本给 Linux x86_64 下载的同一个包
+          sudo apt-get install -y libtinfo6
+          mkdir -p $THEOS/toolchain
+          curl -sL --retry 3 --retry-delay 5 \
+            https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
+            | tar -xJf - -C $THEOS/toolchain/
+          test -x $THEOS/toolchain/linux/iphone/bin/clang
+          $THEOS/toolchain/linux/iphone/bin/clang --version | head -1
           mkdir -p $THEOS/sdks
           curl -L -o /tmp/sdks.tar.gz https://github.com/theos/sdks/archive/refs/heads/master.tar.gz
           tar -xzf /tmp/sdks.tar.gz -C /tmp
