@@ -1,39 +1,20 @@
 //
-//  IOSurface.h  （最小私有头文件）
+//  IOSurface.h  （转发头）
 //  JJCheat
 //
-//  IOSurface 是私有框架：iPhoneOS SDK 里只有二进制，没有头文件。
-//  这里只声明 JJScreenGrabber.m 实际用到的 5 个函数和 1 个常量，
-//  签名照真机 ABI 写，避免引入整套 runtime headers。
+//  iOS SDK 里 IOSurface 是私有框架：framework/Headers 下只提供
+//  IOSurfaceBase.h / IOSurfaceTypes.h / IOSurfaceRef.h / IOSurfaceObjC.h，
+//  没有惯用的 IOSurface.h 伞形头，所以 #import <IOSurface/IOSurface.h> 会报
+//  “file not found”。这里只做一层转发，不重复声明任何东西——枚举
+//  kIOSurfaceLockReadOnly 等由 SDK 的 IOSurfaceTypes.h 定义，函数的声明
+//  由 IOSurfaceRef.h 给出，重复定义会被 -Werror 直接拦下。
 //
 
 #ifndef JJ_IOSURFACE_H
 #define JJ_IOSURFACE_H
 
-#include <CoreFoundation/CoreFoundation.h>
-#include <mach/mach.h>
-#include <stdint.h>
-#include <stddef.h>
-
-typedef struct __IOSurface *IOSurfaceRef;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-enum {
-    kIOSurfaceLockReadOnly  = 0x00000001,
-    kIOSurfaceLockAvoidSync = 0x00000002,
-};
-
-IOSurfaceRef  IOSurfaceCreate(CFDictionaryRef properties);
-kern_return_t IOSurfaceLock(IOSurfaceRef buffer, uint32_t options, uint32_t *seed);
-kern_return_t IOSurfaceUnlock(IOSurfaceRef buffer, uint32_t options, uint32_t *seed);
-size_t        IOSurfaceGetBytesPerRow(IOSurfaceRef buffer);
-void         *IOSurfaceGetBaseAddress(IOSurfaceRef buffer);
-
-#ifdef __cplusplus
-}
-#endif
+#include <IOSurface/IOSurfaceBase.h>
+#include <IOSurface/IOSurfaceTypes.h>
+#include <IOSurface/IOSurfaceRef.h>
 
 #endif /* JJ_IOSURFACE_H */
