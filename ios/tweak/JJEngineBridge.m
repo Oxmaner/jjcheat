@@ -7,6 +7,12 @@
 #import "JJConfig.h"
 #import <JavaScriptCore/JavaScriptCore.h>
 
+// roothide 适配：jbroot 每次越狱都会换一个随机路径，必须在运行时解析。
+// 非 roothide 构建（rootful/rootless）不引这个头，避免多出 libroothide 依赖。
+#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
+#import <roothide.h>
+#endif
+
 @interface JJEngineBridge ()
 @property (nonatomic, strong) JSContext *ctx;
 @property (nonatomic, strong) dispatch_queue_t engineQueue;
@@ -36,13 +42,27 @@
 
 - (NSString *)locateEngineScript {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *candidates = @[
-        JJ_ENGINE_PATH_ROOTLESS,
-        JJ_ENGINE_PATH,
-        [[NSBundle mainBundle] pathForResource:@"engine" ofType:@"js"],
-    ];
+    NSMutableArray<NSString *> *candidates = [NSMutableArray arrayWithCapacity:4];
+
+    // ① roothide 正统路径：jbroot() -> <jbroot>/Library/Application Support/JJCheat/engine.js
+    //    deb 里的 engine.js 就装在这里，不受 App 更新 / 关开注入开关影响
+#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
+    [candidates addObject:jbroot(@"/Library/Application Support/JJCheat/engine.js")];
+#endif
+    // ② rootless（Dopamine 等）的固定 /var/jb
+    [candidates addObject:JJ_ENGINE_PATH_ROOTLESS];
+    // ③ rootful / 未做路径改写的 jbroot 字面量
+    [candidates addObject:JJ_ENGINE_PATH];
+    // ④ 兜底：目标 App 的 .app 里那份（postinst / jjcheat-fix 写入）
+    NSString *appRes = [[NSBundle mainBundle] pathForResource:@"engine" ofType:@"js"];
+    if (appRes.length) [candidates addObject:appRes];
+
     for (NSString *p in candidates) {
-        if (p && [fm fileExistsAtPath:p]) return p;
+        if (p.length && [fm fileExistsAtPath:p]) {
+            NSLog(@"[JJCheat] engine.js 命中: %@", p);
+            return p;
+        }
+        NSLog(@"[JJCheat] engine.js 未命中: %@", p.length ? p : @"(nil)");
     }
     return nil;
 }
@@ -51,7 +71,7 @@
     if (self.loaded) return YES;
     NSString *path = [self locateEngineScript];
     if (!path) {
-        NSLog(@"[JJCheat] 找不到 engine.js，请检查 %@", JJ_ENGINE_PATH);
+        NSLog(@"[JJCheat] 找不到 engine.js（jbroot / /var/jb / /Library / .app 四条都未命中）");
         return NO;
     }
     NSError *err = nil;
