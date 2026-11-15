@@ -15,7 +15,7 @@
 | 位置 | 改动 | 原因 |
 |---|---|---|
 | `ios/tweak/Makefile` | 新增 `THEOS_PACKAGE_SCHEME = roothide` | roothide 的 dylib 必须用 `@loader_path/.jbroot/...` 作为 install_name；没有这一行编出来的包在 roothide 上 dyld 直接找不到依赖 |
-| `ios/tweak/Makefile` | `TARGET := iphone:clang:latest:14.0` | 跟着 runner 的 Xcode SDK 走，不再锁 16.5 |
+| `ios/tweak/Makefile` | `TARGET := iphone:clang:16.5:14.0`（沿用上游）+ 保留 `-I$(THEOS_PROJECT_DIR)/include` | CI 里补了 theos 的 16.5 SDK，和上游编译环境一致；`include/IOSurface` 是手写的最小私有头（iOS SDK 只有二进制没有头文件） |
 | `ios/tweak/Makefile` | `DISABLE_ROOTLESS_COMPAT_WARNING = 1` | 消掉 roothide/theos 的 rootless 兼容告警（本工程不用 `/var/jb` 宏） |
 | `ios/tweak/control` | `Architecture: iphoneos-arm64e`，`Version: 1.0.1` | roothide 的包架构名；版本号区分上游 rootful 包 |
 | `ios/tweak/JJCheat.plist` | 过滤列表加入 `cn.jj.chinachess` | 你的 JJ象棋 实际包名 |
