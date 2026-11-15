@@ -1,0 +1,91 @@
+#!/bin/sh
+# ============================================================
+#  jjcheat-fix  —  JJCheat roothide 资源修复脚本
+#
+#  roothide 下 /Library、/var/jb 都不在系统根目录里，Tweak 里
+#  写死的 engine.js 路径找不到文件；Tweak 自带的第三条回退是
+#  [[NSBundle mainBundle] pathForResource:@"engine" ofType:@"js"]，
+#  也就是目标 App 的 .app 根目录。所以这里把 engine.js 复制进 .app。
+#
+#  什么时候需要重跑：
+#    - App Store 更新 / 重装 JJ象棋 之后（.app 被替换，engine.js 丢了）
+#    - 装完本 deb 时 App 还没装（postinst 没找到 App）
+#
+#  用法:  jjcheat-fix        正常修复
+#         jjcheat-fix -v     打印扫描过程
+# ============================================================
+
+VERBOSE=0
+[ "$1" = "-v" ] && VERBOSE=1
+
+ENGINE="/Library/Application Support/JJCheat/engine.js"
+ROOTFS="${JJ_ROOTFS:-/rootfs}"
+APPS="$ROOTFS/var/containers/Bundle/Application"
+
+# 目标 App 的 Bundle ID（cn.jj.chinachess 为主，其余为兼容旧包名）
+IDS="cn.jj.chinachess com.jj.jjchess com.jjgame.jjchess com.jj.jjgame cn.jj.jjchess"
+
+log() { echo "[jjcheat-fix] $*"; }
+vlog() { [ "$VERBOSE" = "1" ] && echo "[jjcheat-fix] $*"; return 0; }
+
+if [ ! -f "$ENGINE" ]; then
+    log "!! 找不到 $ENGINE"
+    log "   说明 deb 里的 engine.js 没装好，重装一次 deb。"
+    exit 1
+fi
+
+if [ ! -d "$APPS" ]; then
+    log "!! 看不到 App 容器目录: $APPS"
+    log "   确认这条命令是在越狱环境的 shell 里跑的（roothide 的 root 是 jbroot）。"
+    exit 1
+fi
+
+engine_size=$(wc -c < "$ENGINE" 2>/dev/null | tr -d ' ')
+log "engine.js = $ENGINE (${engine_size} 字节)"
+
+patched=0
+for app in "$APPS"/*/*.app; do
+    [ -d "$app" ] || continue
+    plist="$app/Info.plist"
+    [ -f "$plist" ] || continue
+
+    hit=""
+    for id in $IDS; do
+        if grep -aq "$id" "$plist" 2>/dev/null; then
+            hit="$id"
+            break
+        fi
+    done
+
+    if [ -z "$hit" ]; then
+        vlog "跳过 $app"
+        continue
+    fi
+
+    # 如果 App 原本就自带一个不同的 engine.js，先备份一次
+    if [ -f "$app/engine.js" ] && ! cmp -s "$ENGINE" "$app/engine.js"; then
+        if [ ! -f "$app/engine.js.jjcheat-orig" ]; then
+            cp -f "$app/engine.js" "$app/engine.js.jjcheat-orig" 2>/dev/null
+            vlog "已备份原始 engine.js"
+        fi
+    fi
+
+    if cp -f "$ENGINE" "$app/engine.js" 2>/dev/null; then
+        chmod 0644 "$app/engine.js" 2>/dev/null
+        chown 0:0 "$app/engine.js" 2>/dev/null
+        log "已写入 $app/engine.js  (匹配 $hit)"
+        patched=$((patched + 1))
+    else
+        log "!! 写入失败: $app/engine.js （权限或容器路径不对）"
+    fi
+done
+
+if [ "$patched" -eq 0 ]; then
+    log "没有找到目标 App。请确认 JJ象棋 已安装（Bundle ID: cn.jj.chinachess），"
+    log "然后重新执行: jjcheat-fix"
+    exit 2
+fi
+
+log "完成，共处理 $patched 个 App。"
+log "下一步：进 Bootstrap 的 App List 打开 JJ象棋 的注入开关，再启动游戏。"
+exit 0
