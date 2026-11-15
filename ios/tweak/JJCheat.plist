@@ -1,6 +1,7 @@
 {
   Filter = {
     Bundles = (
+      "cn.jj.chinachess",
       "com.jj.jjchess",
       "com.jjgame.jjchess",
       "com.jj.jjgame",
