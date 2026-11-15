@@ -30,7 +30,10 @@ JJCheat_FILES = Tweak.xm \
                 JJHUDWindow.m
 
 # include/ 里放了手写的 IOSurface 最小私有头（iOS SDK 只有二进制没有头）
+# -Wno-error=int-to-void-pointer-cast: JJScreenGrabber 里 (void *)s_serverPort 这类
+#   指针/整数互转告警，Xcode 16 的 clang 默认按 error 处理；降级成 warning，不改源码
 JJCheat_CFLAGS = -fobjc-arc -O2 -Wno-deprecated-declarations -Wno-unused-variable \
+                 -Wno-error=int-to-void-pointer-cast -Wno-error=void-pointer-to-int-cast \
                  -I$(THEOS_PROJECT_DIR)/include
 
 JJCheat_FRAMEWORKS = UIKit Foundation QuartzCore CoreGraphics JavaScriptCore \
