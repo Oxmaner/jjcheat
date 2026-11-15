@@ -1,4 +1,4 @@
-# JJCheat · roothide 适配版
+﻿# JJCheat · roothide 适配版
 
 上游工程：[lichengyang51/jjcheat](https://github.com/lichengyang51/jjcheat) → `ios/tweak/`（越狱 Tweak 路线）
 
@@ -19,8 +19,8 @@
 | `ios/tweak/Makefile` | `DISABLE_ROOTLESS_COMPAT_WARNING = 1` | 消掉 roothide/theos 的 rootless 兼容告警（本工程不用 `/var/jb` 宏） |
 | `ios/tweak/control` | `Architecture: iphoneos-arm64e`，`Version: 1.0.1` | roothide 的包架构名；版本号区分上游 rootful 包 |
 | `ios/tweak/JJCheat.plist` | 过滤列表加入 `cn.jj.chinachess` | 你的 JJ象棋 实际包名 |
-| `ios/tweak/postinst` + `layout/usr/bin/jjcheat-fix` | 新增 | 解决 engine.js 在 roothide 里找不到的问题（见第二节） |
-| `ios/tweak/prerm` | 新增 | 卸载时把塞进 .app 的 engine.js 撤掉 |
+| `ios/tweak/layout/DEBIAN/postinst` + `layout/usr/bin/jjcheat-fix` | 新增 | 解决 engine.js 在 roothide 里找不到的问题（见第二节）；modern theos 只从 `layout/DEBIAN/` 收维护脚本 |
+| `ios/tweak/layout/DEBIAN/prerm` | 新增 | 卸载时把塞进 .app 的 engine.js 撤掉 |
 | `.github/workflows/build-roothide-deb.yml` | 新增 | macOS runner + roothide/theos 云编译 |
 
 引擎内核 `src/` 与打包器 `tools/bundle.js` 原样搬过来，CI 里用 `node tools/bundle.js` 生成 `dist/engine.js`（这一步是上游原有流程）。
