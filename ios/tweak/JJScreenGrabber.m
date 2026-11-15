@@ -71,8 +71,8 @@ static BOOL                           s_apiUsable      = NO;
         s_serverPort = s_getServerPort(MACH_PORT_NULL);
         s_apiUsable = (s_serverPort != MACH_PORT_NULL);
     }
-    NSLog(@"[JJCheat] CARenderServer: render=%p port=%u usable=%d",
-          s_renderDisplay, (unsigned int)s_serverPort, s_apiUsable);
+    NSLog(@"[JJCheat] CARenderServer: render=%p port=%p usable=%d",
+          s_renderDisplay, (void *)s_serverPort, s_apiUsable);
 }
 
 - (void)start {
