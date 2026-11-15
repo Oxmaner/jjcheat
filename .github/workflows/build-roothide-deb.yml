@@ -1,16 +1,10 @@
-﻿name: build-roothide-deb
+name: build-roothide-deb
 
 # roothide 专用云编译：macOS runner + roothide/theos（THEOS_PACKAGE_SCHEME=roothide）
-# 产物：iphoneos-arm64e 的 .deb（已内含 engine.js），可直接用 Sileo/Filza 安装
+# 产物：iphoneos-arm64e 的 .deb（已内含 engine.js + postinst/prerm），可直接用 Sileo/Filza 安装
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'ios/tweak/**'
-      - 'src/**'
-      - 'tools/bundle.js'
-      - '.github/workflows/build-roothide-deb.yml'
 
 permissions:
   contents: write
@@ -62,7 +56,7 @@ jobs:
           set -eux
           # Contents API 上传的文件默认 644，这里补可执行位
           chmod +x ios/tweak/layout/usr/bin/jjcheat-fix
-          chmod +x ios/tweak/postinst ios/tweak/prerm
+          chmod +x ios/tweak/layout/DEBIAN/postinst ios/tweak/layout/DEBIAN/prerm
           node tools/bundle.js
           mkdir -p "ios/tweak/layout/Library/Application Support/JJCheat"
           cp dist/engine.js "ios/tweak/layout/Library/Application Support/JJCheat/engine.js"
@@ -92,8 +86,10 @@ jobs:
           cd ios/tweak
           DEB=$(ls packages/*.deb | head -1)
           echo "DEB=$DEB" >> "$GITHUB_ENV"
-          echo "--- control ---"
+          echo "--- control 字段 ---"
           dpkg-deb -f "$DEB"
+          echo "--- control 归档（必须含 postinst / prerm）---"
+          dpkg-deb -I "$DEB"
           echo "--- 包内文件 ---"
           dpkg-deb -c "$DEB"
           echo "--- 解包检查 ---"
@@ -108,6 +104,8 @@ jobs:
           otool -D "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib"
           echo "--- 架构 ---"
           lipo -info "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib"
+          echo "--- 签名 ---"
+          ldid -e "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib" || true
 
       - name: 上传 artifact
         uses: actions/upload-artifact@v4
@@ -125,15 +123,16 @@ jobs:
           if-no-files-found: error
 
       - name: 发布 Release（手机直接下 deb）
-        if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: roothide-build-${{ github.run_number }}
           name: JJCheat roothide build #${{ github.run_number }}
           body: |
             roothide 适配构建（THEOS_PACKAGE_SCHEME=roothide，iphoneos-arm64e）
-            - Tweak: `/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib`（jbroot 内）
+
+            - Tweak: `/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib`（roothide 的 jbroot 内）
             - 目标 App: `cn.jj.chinachess`
-            - engine.js: 包内一份 + postinst 复制进 .app（App 更新后重跑 `jjcheat-fix`）
+            - engine.js：包内一份 + `postinst` 自动复制进 .app；App 更新后执行 `jjcheat-fix` 重做
+            - 安装后记得在 Bootstrap → App List 打开 JJ象棋 的注入开关
           files: ios/tweak/packages/*.deb
           fail_on_unmatched_files: true
