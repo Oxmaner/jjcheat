@@ -102,6 +102,9 @@ jobs:
           grep -q "cn.jj.chinachess" "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.plist"
           echo "--- install_name（roothide 应为 @loader_path/.jbroot/...）---"
           otool -D "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib"
+          echo "--- 依赖（必须含 libroothide，否则 jbroot() 运行时解析不了）---"
+          otool -L "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib" | tee /tmp/deps.txt
+          grep -q "libroothide.dylib" /tmp/deps.txt || (echo "!! libroothide 没链上" && exit 1)
           echo "--- 架构 ---"
           lipo -info "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib"
           echo "--- 签名 ---"
