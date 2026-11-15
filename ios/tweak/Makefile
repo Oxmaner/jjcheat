@@ -10,7 +10,7 @@
 #  依赖: roothide/theos  (https://github.com/roothide/theos)
 # ============================================================
 
-TARGET := iphone:clang:latest:14.0
+TARGET := iphone:clang:16.5:14.0
 ARCHS = arm64 arm64e
 
 # roothide 打包方案（关键）
@@ -29,7 +29,10 @@ JJCheat_FILES = Tweak.xm \
                 JJScreenGrabber.m \
                 JJHUDWindow.m
 
-JJCheat_CFLAGS = -fobjc-arc -O2 -Wno-deprecated-declarations -Wno-unused-variable
+# include/ 里放了手写的 IOSurface 最小私有头（iOS SDK 只有二进制没有头）
+JJCheat_CFLAGS = -fobjc-arc -O2 -Wno-deprecated-declarations -Wno-unused-variable \
+                 -I$(THEOS_PROJECT_DIR)/include
+
 JJCheat_FRAMEWORKS = UIKit Foundation QuartzCore CoreGraphics JavaScriptCore \
                      IOSurface CoreVideo OpenGLES Metal MetalKit
 JJCheat_PRIVATE_FRAMEWORKS =
