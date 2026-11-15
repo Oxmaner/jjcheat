@@ -40,6 +40,15 @@ JJCheat_FRAMEWORKS = UIKit Foundation QuartzCore CoreGraphics JavaScriptCore \
                      IOSurface CoreVideo OpenGLES Metal MetalKit
 JJCheat_PRIVATE_FRAMEWORKS =
 
+# roothide: jbroot() 来自 libroothide
+#   install-name = @loader_path/.jbroot/usr/lib/libroothide.dylib
+#   stub 在 roothide/theos/vendor/lib/iphone/roothide/libroothide.tbd
+# 开了 clang modules 时 modulemap 里的 link "roothide" 会自动链；这里显式再写一遍，
+# USE_MODULES=0 或 modulemap 没生效时也不会漏
+ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
+JJCheat_LIBRARIES = roothide
+endif
+
 include $(THEOS_MAKE_PATH)/tweak.mk
 
 after-install::
