@@ -2,9 +2,22 @@
 //  JJEngineBridge.m
 //  JJCheat
 //
+//  engine.js 定位（方案 B）：
+//    ① App 沙箱内 <容器>/Library/Application Support/JJCheat/engine.js
+//       —— App 进程自己的目录，永远可读写，不受 jbroot 随机路径和跨容器沙箱限制，
+//          而且可以热改（Filza 直接改这个文件，重启 App 生效）
+//    ② roothide 的 jbroot()
+//    ③ rootless 的 /var/jb
+//    ④ rootful 的 /Library
+//    ⑤ 目标 App 的 .app 内（老方案残留，兼容）
+//    ⑥ 全部落空 → 用编进 dylib 的内嵌副本（JJEngineScript.c）
+//
+//  首次载入时会把内嵌副本写进 ① 的位置，之后一直读文件，方便改参数。
+//
 
 #import "JJEngineBridge.h"
 #import "JJConfig.h"
+#import "JJEngineScript.h"
 #import <JavaScriptCore/JavaScriptCore.h>
 
 // roothide 适配：jbroot 每次越狱都会换一个随机路径，必须在运行时解析。
@@ -40,20 +53,61 @@
     return self;
 }
 
+/* ============================================================
+ *  App 沙箱内的 engine.js 路径
+ *  注入后本进程就是 JJ象棋，所以 NSApplicationSupportDirectory /
+ *  NSDocumentDirectory 指向的是这个 App 自己的容器 —— 沙箱放行。
+ * ============================================================ */
+static NSString *JJContainerEnginePath(void) {
+    static NSString *cached = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray<NSString *> *paths =
+            NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES);
+        if (paths.count == 0) return;
+        NSString *dir = [paths[0] stringByAppendingPathComponent:@"JJCheat"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:NULL];
+        cached = [dir stringByAppendingPathComponent:@"engine.js"];
+    });
+    return cached;
+}
+
+/* 首次运行把内嵌副本落到 App 容器；已经存在就不动（保留用户热改的版本） */
+- (BOOL)seedEngineIntoContainer {
+    NSString *dst = JJContainerEnginePath();
+    if (!dst.length) return NO;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:dst]) return YES;
+
+    NSData *data = [NSData dataWithBytes:JJEngineScript length:(NSUInteger)JJEngineScriptLength];
+    if (data.length == 0) return NO;
+
+    NSError *err = nil;
+    BOOL ok = [data writeToFile:dst options:NSDataWritingAtomic error:&err];
+    NSLog(@"[JJCheat] engine.js 释放到容器: %@ ok=%d %@",
+          dst, ok, ok ? @"" : (err.localizedDescription ?: @""));
+    return ok;
+}
+
 - (NSString *)locateEngineScript {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSMutableArray<NSString *> *candidates = [NSMutableArray arrayWithCapacity:4];
+    NSMutableArray<NSString *> *candidates = [NSMutableArray arrayWithCapacity:6];
 
-    // ① roothide 正统路径：jbroot() -> <jbroot>/Library/Application Support/JJCheat/engine.js
-    //    deb 里的 engine.js 就装在这里，不受 App 更新 / 关开注入开关影响
+    // ① App 沙箱内（主路径）
+    NSString *container = JJContainerEnginePath();
+    if (container.length) [candidates addObject:container];
+
+    // ② roothide 正统路径：jbroot() -> <jbroot>/Library/Application Support/JJCheat/engine.js
 #ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
     [candidates addObject:jbroot(@"/Library/Application Support/JJCheat/engine.js")];
 #endif
-    // ② rootless（Dopamine 等）的固定 /var/jb
+    // ③ rootless（Dopamine 等）的固定 /var/jb
     [candidates addObject:JJ_ENGINE_PATH_ROOTLESS];
-    // ③ rootful / 未做路径改写的 jbroot 字面量
+    // ④ rootful / 未做路径改写的 jbroot 字面量
     [candidates addObject:JJ_ENGINE_PATH];
-    // ④ 兜底：目标 App 的 .app 里那份（postinst / jjcheat-fix 写入）
+    // ⑤ 兜底：目标 App 的 .app 里那份（老方案 jjcheat-fix 写的，兼容用）
     NSString *appRes = [[NSBundle mainBundle] pathForResource:@"engine" ofType:@"js"];
     if (appRes.length) [candidates addObject:appRes];
 
@@ -69,17 +123,37 @@
 
 - (BOOL)loadEngine {
     if (self.loaded) return YES;
+
+    // 先把内嵌副本落到容器（仅当容器里还没有），让 ① 可用
+    [self seedEngineIntoContainer];
+
+    NSString *src = nil;
     NSString *path = [self locateEngineScript];
-    if (!path) {
-        NSLog(@"[JJCheat] 找不到 engine.js（jbroot / /var/jb / /Library / .app 四条都未命中）");
+    NSURL *sourceURL = nil;
+
+    if (path) {
+        NSError *err = nil;
+        src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+        if (!src.length) {
+            NSLog(@"[JJCheat] 读取 engine.js 失败: %@", err);
+        } else {
+            sourceURL = [NSURL fileURLWithPath:path];
+        }
+    }
+
+    // 兜底：文件全都读不到就用内嵌副本，引擎照样能起
+    if (!src.length) {
+        src = [[NSString alloc] initWithBytes:JJEngineScript
+                                       length:(NSUInteger)JJEngineScriptLength
+                                     encoding:NSUTF8StringEncoding];
+        sourceURL = [NSURL URLWithString:@"jjcheat-embedded://engine.js"];
+        NSLog(@"[JJCheat] engine.js 用内嵌副本（%lu 字节）", (unsigned long)JJEngineScriptLength);
+    }
+    if (!src.length) {
+        NSLog(@"[JJCheat] engine.js 不可用（文件与内嵌副本都读不出来）");
         return NO;
     }
-    NSError *err = nil;
-    NSString *src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
-    if (!src) {
-        NSLog(@"[JJCheat] 读取 engine.js 失败: %@", err);
-        return NO;
-    }
+
     dispatch_sync(self.engineQueue, ^{
         self.ctx = [[JSContext alloc] init];
         __weak typeof(self) weakSelf = self;
@@ -91,7 +165,7 @@
         self.ctx[@"__nativeLog"] = ^(JSValue *msg) {
             NSLog(@"[JJCheat/js] %@", [msg toString]);
         };
-        [self.ctx evaluateScript:src withSourceURL:[NSURL fileURLWithPath:path]];
+        [self.ctx evaluateScript:src withSourceURL:sourceURL];
         JSValue *engine = self.ctx[@"JJEngine"];
         self.loaded = !engine.isUndefined && !engine.isNull;
         NSLog(@"[JJCheat] engine.js 加载%@", self.loaded ? @"成功" : @"失败");

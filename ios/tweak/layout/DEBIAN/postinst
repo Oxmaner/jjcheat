@@ -1,12 +1,18 @@
 #!/bin/sh
 # JJCheat roothide postinst
-# 只做一件事：把 engine.js 放进目标 App 的 .app（Tweak 的第三条查找路径）
+#
+# 方案 B：engine.js 已经编进 tweak 的 dylib，Tweak 首次运行会自动把它释放到
+# 目标 App 自己的沙箱目录（<容器>/Library/Application Support/JJCheat/engine.js），
+# 所以安装脚本不再需要往 .app 里搬文件（那样会破坏 App 的代码签名）。
+#
+# jjcheat-fix 保留着，仅供手动排查用（可选，不调用）。
 set +e
-echo "[JJCheat] postinst: 安装后修复资源路径 (roothide)"
-if [ -x /usr/bin/jjcheat-fix ]; then
-    /usr/bin/jjcheat-fix
-    echo "[JJCheat] postinst: jjcheat-fix 退出码 $?"
+ENGINE="/Library/Application Support/JJCheat/engine.js"
+if [ -f "$ENGINE" ]; then
+    echo "[JJCheat] postinst: $ENGINE 就位（$(wc -c < "$ENGINE" 2>/dev/null | tr -d ' ') 字节）"
 else
-    echo "[JJCheat] postinst: 没找到 /usr/bin/jjcheat-fix"
+    echo "[JJCheat] postinst: 包内 engine.js 缺失，但 dylib 内嵌副本仍可工作"
 fi
+echo "[JJCheat] postinst: 完成 —— 记得到 Bootstrap 的 App List 打开 JJ象棋 注入开关"
+killall -9 SpringBoard 2>/dev/null || true
 exit 0

@@ -27,7 +27,12 @@ JJCheat_FILES = Tweak.xm \
                 JJController.m \
                 JJEngineBridge.m \
                 JJScreenGrabber.m \
-                JJHUDWindow.m
+                JJHUDWindow.m \
+                JJEngineScript.c
+
+# JJEngineScript.c 由 tools/gen-engine-c.py 从 dist/engine.js 生成（构建流水线里自动跑），
+# 编进 dylib 作为 engine.js 的兜底副本 —— roothide 下 jbroot 路径随机 + App 沙箱跨容器限制，
+# 只靠文件路径不可靠。
 
 # include/ 里放了手写的 IOSurface 最小私有头（iOS SDK 只有二进制没有头）
 # -Wno-error=int-to-void-pointer-cast: JJScreenGrabber 里 (void *)s_serverPort 这类

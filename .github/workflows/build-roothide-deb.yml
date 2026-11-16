@@ -60,7 +60,9 @@ jobs:
           node tools/bundle.js
           mkdir -p "ios/tweak/layout/Library/Application Support/JJCheat"
           cp dist/engine.js "ios/tweak/layout/Library/Application Support/JJCheat/engine.js"
-          ls -l dist/engine.js "ios/tweak/layout/Library/Application Support/JJCheat/engine.js"
+          # 同步生成内嵌副本：方案 B 的兜底（编进 dylib，文件全读不到也能起引擎）
+          python3 tools/gen-engine-c.py dist/engine.js ios/tweak/JJEngineScript.c ios/tweak/JJEngineScript.h
+          ls -l dist/engine.js "ios/tweak/layout/Library/Application Support/JJCheat/engine.js" ios/tweak/JJEngineScript.c
 
       - name: 编译 deb（roothide 方案）
         run: |
@@ -107,6 +109,11 @@ jobs:
           grep -q "libroothide.dylib" /tmp/deps.txt || (echo "!! libroothide 没链上" && exit 1)
           echo "--- 架构 ---"
           lipo -info "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib"
+          echo "--- dylib 内嵌 engine.js（方案 B 兜底）---"
+          nm -gU "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib" \
+            | grep -q "_JJEngineScript" || (echo "!! 内嵌 engine.js 没链进去" && exit 1)
+          nm -gU "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib" \
+            | grep -E "_JJEngineScript" | head -4
           echo "--- 签名 ---"
           ldid -e "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib" || true
 
