@@ -106,11 +106,11 @@ esac
 [ -s pikafish.nnue ] || die "缺 pikafish.nnue"
 NET_SIZE="$(wc -c < pikafish.nnue | tr -d ' ')"
 [ "$NET_SIZE" -gt 20000000 ] || die "pikafish.nnue 只有 $NET_SIZE 字节，下载不完整"
-SIZE="$(wc -c < pikafish | tr -d ' ')"
-log "可执行 : $SIZE 字节"
 log "权重   : $NET_SIZE 字节"
 
 # ---------- 签名 ----------
+# 放在量体积之前：ldid 会往 Mach-O 里追加签名段（约 10KB），
+# 先量后签会让日志里的数字和 deb 里的实际大小对不上。
 if command -v ldid >/dev/null; then
     ldid -S pikafish
     log "已 ad-hoc 签名（ldid -S）"
@@ -119,6 +119,9 @@ else
     codesign -f -s - pikafish
 fi
 codesign -dv pikafish 2>&1 | sed 's/^/    /' || true
+
+SIZE="$(wc -c < pikafish | tr -d ' ')"
+log "可执行 : $SIZE 字节（含签名）"
 
 # ---------- 落盘 ----------
 mkdir -p "$DEST_DIR"

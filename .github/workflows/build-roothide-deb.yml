@@ -160,10 +160,13 @@ jobs:
           lipo -info "$DYLIB"
           echo "--- dylib 内嵌 engine.js（兜底副本）---"
           nm -gU "$DYLIB" | grep -q "_JJEngineScript" || (echo "!! 内嵌 engine.js 没链进去" && exit 1)
-          echo "--- 2.1.0 新增符号（引擎与编解码必须都在）---"
+          echo "--- 2.1.0 新增符号（引擎类 + 编解码 C 函数必须都在）---"
+          # JJMoveCodec 是纯 C 函数模块（无 @interface），所以查 _JJMoveChinese，
+          # 别写成 _OBJC_CLASS_$_JJMoveCodec —— 那个符号本来就不存在
           for sym in _OBJC_CLASS_\$_JJPikafish _OBJC_CLASS_\$_JJPikafishInstaller \
-                     _OBJC_CLASS_\$_JJMoveCodec _OBJC_CLASS_\$_JJGameController \
-                     _OBJC_CLASS_\$_JJCalibrator _JJMoveChinese; do
+                     _OBJC_CLASS_\$_JJGameController _OBJC_CLASS_\$_JJCalibrator \
+                     _OBJC_CLASS_\$_JJBallWindow _OBJC_CLASS_\$_JJHUDWindow \
+                     _JJMoveChinese _JJSqFromICCS; do
             nm -gU "$DYLIB" | grep -q "$sym" || (echo "!! 缺符号 $sym"; exit 1)
           done
           echo "符号齐全"
