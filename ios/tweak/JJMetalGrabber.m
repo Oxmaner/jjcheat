@@ -33,6 +33,15 @@ static int gSurfaceMiss = 0;
 static BOOL gHooksInstalled = NO;
 static IMP gOrigNextDrawable = NULL;
 
+/* 抓帧按时间节流：读一次 = 14MB 拷贝 + 全帧 BGRA→RGBA，跑在游戏的渲染调用栈里。
+   固定 5 fps（覆盖 JJ_SCAN_FPS 的 4 帧需求并留余量），不用「每 N 帧」——
+   游戏帧率一变，读数就跟着失控。 */
+static CFTimeInterval gLastReadTs = 0;
+static const CFTimeInterval kJJReadInterval = 0.20;
+
+/* 只统计 nextDrawable→IOSurface 这条路径出的帧，用来关掉重复的 present blit */
+static int gSurfaceReadCount = 0;
+
 /* 上一帧的 drawable surface，等下一次 nextDrawable 时读 */
 static IOSurfaceRef gPendingSurface = NULL;
 static int gPendingW = 0;
@@ -97,11 +106,15 @@ static void JJReadSurface(IOSurfaceRef s, int w, int h) {
     }
     IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
 
-    /* IOSurface 是 BGRA，转 RGBA */
-    for (size_t i = 0; i + 3 < need; i += 4) {
-        uint8_t b = dst[i];
-        dst[i] = dst[i + 2];
-        dst[i + 2] = b;
+    /* IOSurface 是 BGRA，转 RGBA。
+       用 32 位整字一次交换 R/B，比逐字节循环少 2/3 的内存访问：
+       arm64 小端下 BGRA 内存序 B,G,R,A 读成 uint32 = A<<24|R<<16|G<<8|B。
+       NSMutableData 的缓冲区按 16 字节对齐，need 一定是 4 的倍数。 */
+    uint32_t *p32 = (uint32_t *)dst;
+    size_t n32 = need / 4;
+    for (size_t i = 0; i < n32; i++) {
+        uint32_t v = p32[i];
+        p32[i] = (v & 0xFF00FF00u) | ((v & 0x000000FFu) << 16) | ((v & 0x00FF0000u) >> 16);
     }
 
     os_unfair_lock_lock(&gLock);
@@ -111,13 +124,19 @@ static void JJReadSurface(IOSurfaceRef s, int w, int h) {
     gFrameTs = CACurrentMediaTime();
     os_unfair_lock_unlock(&gLock);
     gCaptureCount++;
+    gSurfaceReadCount++;
 }
 
 #pragma mark - blit 兜底（present 路径真的存在时才有用）
 
 static void JJMetalCapture(id drawable) {
     if (!drawable) return;
-    if ((gPresentCount++ % 8) != 0) return;
+    int seq = gPresentCount++;
+    /* nextDrawable 的 IOSurface 路径已稳定出帧后，present blit 纯属重复劳动：
+       又要 GPU→CPU 同步读回 14MB，直接卡住渲染管线。只在 IOSurface 还没出过帧时
+       保留它当兜底（某些设备 nextDrawable 拿不到 surface）。 */
+    if (gSurfaceReadCount > 3) return;
+    if ((seq % 8) != 0) return;
 
     id<MTLTexture> tex = [(id<CAMetalDrawable>)drawable texture];
     if (!tex) { gCaptureFail++; return; }
@@ -189,11 +208,14 @@ static IMP JJFindOrig(id self, SEL _cmd) {
 
 static id JJNextDrawable(id self, SEL _cmd) {
     int idx = gNextDrawableCount;
+    CFTimeInterval now = CACurrentMediaTime();
 
-    /* 先把上一帧的 surface 读掉（每 8 帧读一次，其余只释放） */
+    /* 先把上一帧的 surface 读掉（按时间节流，其余只释放）。
+       不再用 idx%8：游戏掉帧/锁帧时那个计数会跟着乱，读帧频率不可控。 */
     if (gPendingSurface) {
-        if ((idx % 8) == 0) {
+        if (now - gLastReadTs >= kJJReadInterval) {
             JJReadSurface(gPendingSurface, gPendingW, gPendingH);
+            gLastReadTs = now;
         }
         CFRelease(gPendingSurface);
         gPendingSurface = NULL;

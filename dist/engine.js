@@ -1,7 +1,7 @@
 /* ============================================================
  *  JJ象棋 辅助引擎内核 —— 单文件打包
  *  目标运行环境: iOS JavaScriptCore / Node / 浏览器
- *  生成时间: 2026-11-16T03:29:48.806Z
+ *  生成时间: 2026-11-16T04:02:18.974Z
  *  模块数: 9
  * ============================================================ */
 (function (global) {
@@ -3075,7 +3075,7 @@ class BoardRecognizer {
     this.lastStats = { pts, cell, radius, gain };
     // 浮窗（画中画）会一起被截进截图里，盖住的那几格读出来一定是浮窗自己的画面，
     // 所以整格作废（保留上一帧的值），而不是拿去识别。
-    this.pipRect = findPipRect(pixels, w, h);
+    this.pipRect = findPipRect(pixels, w, h, pts);
     this.occluded = new Uint8Array(90);
     let occN = 0;
     if (this.pipRect) {
@@ -3797,11 +3797,39 @@ class BoardRecognizer {
  * 这种颜色在棋盘、棋子、JJ象棋界面上都不存在，认出来就是 100% 确定；
  * 认不出来就返回 null，等于「没有浮窗」，绝不会误伤棋盘。
  */
-function findPipRect(pixels, w, h) {
+/**
+ * 找浮窗（画中画）的洋红边框。
+ * @param {Uint8ClampedArray} pixels RGBA 帧
+ * @param {number} w 帧宽
+ * @param {number} h 帧高
+ * @param {Float64Array|Array<number>} [pts] 90 个格点的扁平坐标 [x0,y0,x1,y1,...]。
+ *   传入时只扫棋盘外接矩形：浮窗要影响识别必然盖在棋盘上，
+ *   棋盘外的像素扫了也没用。真机 1284x2778 全帧扫一次约 89 万次采样，
+ *   限定 ROI 后约 33 万次，是每帧最贵的单点循环之一。
+ */
+function findPipRect(pixels, w, h, pts) {
+  let sx0 = 0, sy0 = 0, sx1 = w - 1, sy1 = h - 1;
+  if (pts && pts.length >= 180) {
+    let minX = w, minY = h, maxX = -1, maxY = -1;
+    for (let k = 0; k < 90; k++) {
+      const gx = pts[k * 2], gy = pts[k * 2 + 1];
+      if (gx < minX) minX = gx;
+      if (gx > maxX) maxX = gx;
+      if (gy < minY) minY = gy;
+      if (gy > maxY) maxY = gy;
+    }
+    // 外扩半格，覆盖边框压在棋盘边线上的情况
+    const pad = Math.max(24, (maxX - minX) / 8 * 0.6);
+    sx0 = Math.max(0, Math.floor(minX - pad));
+    sy0 = Math.max(0, Math.floor(minY - pad));
+    sx1 = Math.min(w - 1, Math.ceil(maxX + pad));
+    sy1 = Math.min(h - 1, Math.ceil(maxY + pad));
+  }
+
   let x0 = w, y0 = h, x1 = -1, y1 = -1, n = 0;
-  for (let y = 0; y < h; y += 2) {
+  for (let y = sy0; y <= sy1; y += 2) {
     const base = y * w;
-    for (let x = 0; x < w; x += 2) {
+    for (let x = sx0; x <= sx1; x += 2) {
       const i = (base + x) * 4;
       const R = pixels[i], G = pixels[i + 1], B = pixels[i + 2];
       if (R > 175 && G < 105 && B > 175) {
