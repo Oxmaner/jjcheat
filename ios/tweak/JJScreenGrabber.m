@@ -25,6 +25,7 @@ static BOOL                           s_apiUsable      = NO;
 static int                            s_glHookFrames   = 0;
 static int                            s_grabLogCount   = 0;
 static int                            s_rsFailStreak   = 0;
+static int                            s_blackFrames    = 0;
 
 @interface JJScreenGrabber () {
     IOSurfaceRef   _surface;
@@ -258,21 +259,68 @@ static void swapRB(uint32_t *p, size_t count) {
     NSLog(@"[JJCheat] 抓帧来源=%@ %dx%d 中心像素=(%d,%d,%d)", src, w, h, r, g, b);
 }
 
+
+/* 抽样判断是不是纯黑帧。
+   roothide 下 CARenderServer 会「成功」返回一张全黑图（端口拿到了、长度也对），
+   必须验内容，否则永远不会回退到 GL。 */
+static BOOL JJFrameIsBlack(NSData *d, int w, int h) {
+    if (!d.length || w <= 0 || h <= 0) return YES;
+    const uint8_t *p = (const uint8_t *)d.bytes;
+    NSUInteger len = d.length;
+    int sampled = 0, lit = 0;
+    for (int gy = 1; gy <= 8; gy++) {
+        for (int gx = 1; gx <= 6; gx++) {
+            int x = w * gx / 7;
+            int y = h * gy / 9;
+            NSUInteger o = ((NSUInteger)y * (NSUInteger)w + (NSUInteger)x) * 4;
+            if (o + 2 >= len) continue;
+            sampled++;
+            if (p[o] > 8 || p[o + 1] > 8 || p[o + 2] > 8) lit++;
+        }
+    }
+    return (sampled > 0 && lit == 0);
+}
+
 - (NSData *)grabRGBAWithWidth:(int *)outW height:(int *)outH {
-    NSData *d = [self grabViaRenderServerWithWidth:outW height:outH];
-    if (d.length) {
-        s_rsFailStreak = 0;
+    int w = 0, h = 0;
+    NSData *d = nil;
+
+    /* ① GL-hook 优先：在进程内读游戏自己的 framebuffer，不受 roothide 沙箱影响 */
+    d = [self grabViaGLCacheWithWidth:&w height:&h];
+    if (d.length && !JJFrameIsBlack(d, w, h)) {
+        if (outW) *outW = w;
+        if (outH) *outH = h;
+        [self logGrabSource:@"GL-hook" data:d w:outW h:outH];
+        return d;
+    }
+    if (d.length && (s_blackFrames++ % 20) == 0) {
+        NSLog(@"[JJCheat] GL-hook 帧全黑（读像素时机不对，或游戏不是 GL 渲染）");
+    }
+
+    /* ② CARenderServer：roothide 下常常静默返回全黑，验内容后不可用就关掉 */
+    w = 0; h = 0;
+    d = [self grabViaRenderServerWithWidth:&w height:&h];
+    if (d.length && !JJFrameIsBlack(d, w, h)) {
+        if (outW) *outW = w;
+        if (outH) *outH = h;
         [self logGrabSource:@"CARenderServer" data:d w:outW h:outH];
         return d;
     }
-    if (s_apiUsable && ++s_rsFailStreak >= 3) {
+    if (d.length) {
         s_apiUsable = NO;
-        NSLog(@"[JJCheat] CARenderServer 连续 3 次失败，永久降级（roothide 下 App 沙箱常见）");
+        if ((s_blackFrames++ % 20) == 0) {
+            NSLog(@"[JJCheat] CARenderServer 返回全黑帧（沙箱静默失败）→ 关闭该路");
+        }
     }
-    d = [self grabViaGLCacheWithWidth:outW height:outH];
-    if (d.length) { [self logGrabSource:@"GL-hook" data:d w:outW h:outH]; return d; }
-    d = [self grabViaLayerWithWidth:outW height:outH];
-    if (d.length) [self logGrabSource:@"CALayer" data:d w:outW h:outH];
+
+    /* ③ CALayer 兜底：对 GL/Metal 渲染的游戏基本也是黑的，只能保底给尺寸 */
+    w = 0; h = 0;
+    d = [self grabViaLayerWithWidth:&w height:&h];
+    if (d.length) {
+        if (outW) *outW = w;
+        if (outH) *outH = h;
+        [self logGrabSource:@"CALayer" data:d w:outW h:outH];
+    }
     return d;
 }
 

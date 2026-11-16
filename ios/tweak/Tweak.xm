@@ -32,18 +32,32 @@ static void JJStartOnce(void) {
  * ============================================================ */
 %hook EAGLContext
 
-- (BOOL)presentRenderbuffer:(NSUInteger)target {
-    BOOL ret = %orig;
+/* 抓帧统一入口：在 %orig 之前读，此时 renderbuffer 还是刚渲染完的内容；
+   放在 %orig 之后的话，present 已经把 buffer 换走，读出来就是黑的。 */
+static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
     static unsigned int sThrottle = 0;
-    // 每 4 帧抓一次，避免拖慢游戏
-    if (((sThrottle++) & 3u) == 0u) {
-        @try {
-            [[JJScreenGrabber shared] captureGLContext:self target:target];
-        } @catch (NSException *e) {
-            // 静默
-        }
+    if (((sThrottle++) & 3u) != 0u) return;   /* 每 4 帧抓一次 */
+    @try {
+        [[JJScreenGrabber shared] captureGLContext:ctx target:target];
+    } @catch (NSException *e) {
+        /* 静默 */
     }
-    return ret;
+}
+
+- (BOOL)presentRenderbuffer:(NSUInteger)target {
+    JJCaptureThrottled(self, target);
+    return %orig;
+}
+
+/* cocos2d-x 3.x 起常用这两个带时间的变体，只 hook 上一个会永远不触发 */
+- (BOOL)presentRenderbuffer:(NSUInteger)target atTime:(double)timestamp {
+    JJCaptureThrottled(self, target);
+    return %orig;
+}
+
+- (BOOL)presentRenderbuffer:(NSUInteger)target afterMinimumDuration:(double)duration {
+    JJCaptureThrottled(self, target);
+    return %orig;
 }
 
 %end
