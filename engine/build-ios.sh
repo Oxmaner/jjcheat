@@ -57,7 +57,7 @@ if [ ! -d "$SRC/.git" ]; then
 else
     CUR="$(git -C "$SRC" describe --tags --always 2>/dev/null || echo unknown)"
     if [ "$CUR" != "$TAG" ] && [ "$NFORCE" != "1" ]; then
-        log "已有源码是 $CUR，切换不到 $TAG 时请 PIKA_FORCE=1 重来"
+        log "已有源码是 ${CUR}，切换不到 $TAG 时请 PIKA_FORCE=1 重来"
     fi
     log "复用已有源码: $CUR"
 fi
@@ -79,7 +79,7 @@ if [ -f pikafish ] && [ "$NFORCE" != "1" ] && [ pikafish -nt pikafish.nnue ]; th
     log "已存在可执行文件且比网络新，跳过编译（PIKA_FORCE=1 可强制重编）"
 else
     JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-    log "编译中（-j$JOBS，LTO 首次约 8~15 分钟）"
+    log "编译中（-j${JOBS}，LTO 首次约 8~15 分钟）"
     # CXXFLAGS/LDFLAGS 走环境变量：Makefile 在 MAKELEVEL=0 时把它们存进 ENV_*，
     # 命令行传同名变量会被它的赋值覆盖掉。
     if ! env CXXFLAGS="$TARGET_FLAGS" LDFLAGS="$TARGET_FLAGS" \

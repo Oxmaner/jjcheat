@@ -72,7 +72,7 @@ for d in $DIRS; do
 done
 
 if [ -z "$FILES" ]; then
-    echo "!! 没有找到源文件（模块: $DIRS）" >&2
+    echo "!! 没有找到源文件（模块: ${DIRS}）" >&2
     exit 2
 fi
 
