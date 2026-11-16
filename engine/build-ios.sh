@@ -90,8 +90,14 @@ log "权重   : $NET_SIZE 字节"
 #  -DUSE_PTHREADS    引擎内部多线程
 #  不编 main.cpp     入口由 jjpika_shim.cpp 提供
 CXXSTD="-std=c++17"
-CFLAGS_COMMON="$TARGET_FLAGS $CXXSTD -O3 -DNDEBUG -fno-exceptions -fPIC -funroll-loops \
+# 注意：不能带 -target/-mios-version-min，各架构要分别拼
+CFLAGS_BASE="$CXXSTD -O3 -DNDEBUG -fno-exceptions -fPIC -funroll-loops \
  -DIS_64BIT -DUSE_NEON=8 -DUSE_PTHREADS -fno-strict-aliasing"
+
+# theos 的 TARGET 是 iphone:clang:16.5:14.0 + ARCHS="arm64 arm64e"，
+# 最终 dylib 是双架构 fat；静态库只有 arm64 的话 arm64e 那片会整个被 ld 忽略，
+# 报一堆 Undefined symbols for architecture arm64e。所以两个架构都要编，最后 lipo 合并。
+ARCH_LIST="arm64 arm64e"
 
 needs_build() {
     [ "$NFORCE" = "1" ] && return 0
@@ -100,71 +106,87 @@ needs_build() {
     [ "$LIB_OUT" -nt "$SHIM_SRC" ] || return 0
     # 库存在但桥接符号缺失（上次编到一半）→ 重编
     nm -g "$LIB_OUT" 2>/dev/null | grep -q " T _jjpika_start$" || return 0
+    # 只有单架构（旧产物）也要重编
+    lipo -info "$LIB_OUT" 2>/dev/null | grep -q "arm64e" || return 0
     return 1
 }
 
 if ! needs_build; then
     log "静态库已是最新，跳过编译（PIKA_FORCE=1 可强制重编）"
 else
-    log "编译中（共 $(find . -name '*.cpp' ! -name 'main.cpp' ! -path './universal/*' | wc -l | tr -d ' ') 个引擎文件 + 1 个桥接层）"
+    SRC_LIST="$WORK/sources.txt"
+    find . -name '*.cpp' ! -name 'main.cpp' ! -path './universal/*' | sort > "$SRC_LIST"
+    ENGINE_COUNT="$(wc -l < "$SRC_LIST" | tr -d ' ')"
+    log "编译中（$ENGINE_COUNT 个引擎文件 + 1 个桥接层，架构: $ARCH_LIST）"
     rm -rf "$OBJ"
     mkdir -p "$OBJ"
 
-    # 逐个编译，不用 xargs + export -f：非交互 bash 下函数导出的行为不稳，
-    # 而且顺序编译更容易在日志里定位是哪个文件出的问题（总计约 30~60s）。
-    IDX=0
-    FAILED=0
-    while IFS= read -r f; do
+    for arch in $ARCH_LIST; do
+        ARCH_FLAGS="-target $arch-apple-ios$MIN_IOS -isysroot $SDK -mios-version-min=$MIN_IOS"
+        mkdir -p "$OBJ/$arch"
+        log "  [$arch] 编译引擎"
+        IDX=0
+        FAILED=0
+        while IFS= read -r f; do
+            IDX=$((IDX + 1))
+            obj="$OBJ/$arch/$(printf '%03d' "$IDX").o"
+            if ! "$CLANGXX" $ARCH_FLAGS $CFLAGS_BASE -c "$f" -o "$obj" 2>"$obj.log"; then
+                echo "!! [$arch] 编译失败: $f"
+                grep -E "error:" "$obj.log" | head -6 || head -20 "$obj.log"
+                FAILED=$((FAILED + 1))
+                continue
+            fi
+            rm -f "$obj.log"
+        done < "$SRC_LIST"
+        [ "$FAILED" -eq 0 ] || die "[$arch] $FAILED 个文件编译失败"
+
         IDX=$((IDX + 1))
-        obj="$OBJ/$(printf '%03d' "$IDX").o"
-        if ! "$CLANGXX" $CFLAGS_COMMON -c "$f" -o "$obj" 2>"$obj.log"; then
-            echo "!! 编译失败: $f"
-            grep -E "error:" "$obj.log" | head -6 || cat "$obj.log" | head -20
-            FAILED=$((FAILED + 1))
-            continue
+        SHIM_OBJ="$OBJ/$arch/$(printf '%03d' "$IDX").o"
+        if ! "$CLANGXX" $ARCH_FLAGS $CFLAGS_BASE -I"$SRC/src" \
+                -c "$SHIM_SRC" -o "$SHIM_OBJ" 2>"$WORK/shim-$arch.log"; then
+            echo "!! [$arch] 桥接层编译失败"
+            grep -E "error:" "$WORK/shim-$arch.log" | head -10 || head -40 "$WORK/shim-$arch.log"
+            die "桥接层编译失败（日志: $WORK/shim-$arch.log）"
         fi
-        rm -f "$obj.log"
-    done < <(find . -name '*.cpp' ! -name 'main.cpp' ! -path './universal/*' | sort)
-    [ "$FAILED" -eq 0 ] || die "$FAILED 个文件编译失败"
 
-    # 桥接层单独编（要额外加引擎源码目录进 include path）
-    log "编译桥接层 jjpika_shim.cpp"
-    IDX=$((IDX + 1))
-    SHIM_OBJ="$OBJ/$(printf '%03d' "$IDX").o"
-    if ! "$CLANGXX" $CFLAGS_COMMON -I"$SRC/src" -c "$SHIM_SRC" -o "$SHIM_OBJ" 2>"$WORK/shim.log"; then
-        grep -E "error:" "$WORK/shim.log" | head -10 || cat "$WORK/shim.log" | head -40
-        die "桥接层编译失败（日志: $WORK/shim.log）"
-    fi
+        OBJ_COUNT="$(ls "$OBJ/$arch"/*.o 2>/dev/null | wc -l | tr -d ' ')"
+        log "  [$arch] 目标文件 $OBJ_COUNT 个"
+        [ "$OBJ_COUNT" -ge 30 ] || die "[$arch] 只产出 $OBJ_COUNT 个 .o，明显不对"
 
-    OBJ_COUNT="$(ls "$OBJ"/*.o 2>/dev/null | wc -l | tr -d ' ')"
-    log "目标文件: $OBJ_COUNT 个"
-    [ "$OBJ_COUNT" -ge 30 ] || die "只产出 $OBJ_COUNT 个 .o，明显不对"
+        /usr/bin/libtool -static -o "$WORK/libpikafish-$arch.a" "$OBJ/$arch"/*.o \
+            || die "[$arch] libtool 归档失败"
+    done
 
-    log "归档 libpikafish.a"
+    log "合并双架构静态库"
     mkdir -p "$LIB_OUT_DIR"
     rm -f "$LIB_OUT"
-    /usr/bin/libtool -static -o "$LIB_OUT" "$OBJ"/*.o \
-        || die "libtool 归档失败"
+    ARCH_LIBS=""
+    for arch in $ARCH_LIST; do ARCH_LIBS="$ARCH_LIBS $WORK/libpikafish-$arch.a"; done
+    # shellcheck disable=SC2086
+    lipo -create $ARCH_LIBS -output "$LIB_OUT" || die "lipo 合并失败"
 fi
 
 [ -s "$LIB_OUT" ] || die "没有产出 $LIB_OUT"
 LIB_SIZE="$(wc -c < "$LIB_OUT" | tr -d ' ')"
 log "静态库 : $LIB_SIZE 字节"
+log "架构   : $(lipo -info "$LIB_OUT" 2>/dev/null | sed 's/.*are: //')"
 
-# 桥接层符号必须在库里（缺一个就说明桥接层没编进来）
+# 桥接层符号必须在每个架构里都存在（缺一个就说明桥接层没编进去）
 MISSING=0
-for sym in jjpika_start jjpika_stop jjpika_send jjpika_recv jjpika_running; do
-    if ! nm -g "$LIB_OUT" 2>/dev/null | grep -q " T _${sym}$"; then
-        echo "!! 静态库里缺符号 _${sym}"
-        MISSING=$((MISSING + 1))
-    fi
+for arch in $ARCH_LIST; do
+    for sym in jjpika_start jjpika_stop jjpika_send jjpika_recv jjpika_running; do
+        if ! nm -g -arch "$arch" "$LIB_OUT" 2>/dev/null | grep -q " T _${sym}$"; then
+            echo "!! [$arch] 静态库里缺符号 _${sym}"
+            MISSING=$((MISSING + 1))
+        fi
+    done
 done
 if [ "$MISSING" -ne 0 ]; then
-    echo "--- 库里前 20 个外部符号 ---"
-    nm -g "$LIB_OUT" 2>/dev/null | grep " T " | head -20
+    echo "--- 库里前 20 个外部符号（arm64）---"
+    nm -g -arch arm64 "$LIB_OUT" 2>/dev/null | grep " T " | head -20
     die "桥接层符号不全（缺 $MISSING 个）"
 fi
-log "符号齐全: jjpika_start/stop/send/recv/running"
+log "符号齐全: jjpika_start/stop/send/recv/running（arm64 + arm64e）"
 
 # ---------- 落盘 ----------
 mkdir -p "$DEST_DIR"
