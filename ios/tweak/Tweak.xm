@@ -12,6 +12,7 @@
 #import "JJScreenGrabber.h"
 #import "JJHUDWindow.h"
 #import "JJEngineBridge.h"
+#import "JJMetalGrabber.h"
 
 static BOOL gJJStarted = NO;
 
@@ -90,6 +91,13 @@ static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
     %init;
 
     NSLog(@"[JJCheat] tweak 已加载 (pid=%d)", getpid());
+
+    /* Metal 抓帧：确认是不是 Metal 渲染 + 装 presentDrawable hook */
+    JJMetalInstallHooks();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        JJMetalInstallHooks();   /* Metal 懒加载的话这里再试一次 */
+    });
 
     // 抓帧链路自检：GL hook 装不上就只能掉到 CALayer，而 CALayer 抓 GL/Metal 游戏恒为黑
     Class eagl = NSClassFromString(@"EAGLContext");

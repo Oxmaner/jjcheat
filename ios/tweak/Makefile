@@ -28,7 +28,8 @@ JJCheat_FILES = Tweak.xm \
                 JJEngineBridge.m \
                 JJScreenGrabber.m \
                 JJHUDWindow.m \
-                JJEngineScript.c
+                JJEngineScript.c \
+                JJMetalGrabber.m
 
 # JJEngineScript.c 由 tools/gen-engine-c.py 从 dist/engine.js 生成（构建流水线里自动跑），
 # 编进 dylib 作为 engine.js 的兜底副本 —— roothide 下 jbroot 路径随机 + App 沙箱跨容器限制，

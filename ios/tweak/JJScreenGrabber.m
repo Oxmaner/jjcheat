@@ -5,6 +5,7 @@
 
 #import "JJScreenGrabber.h"
 #import "JJConfig.h"
+#import "JJMetalGrabber.h"
 #import <IOSurface/IOSurface.h>
 #import <QuartzCore/QuartzCore.h>
 #import <OpenGLES/ES3/gl.h>
@@ -216,6 +217,12 @@ static void swapRB(uint32_t *p, size_t count) {
     return f;
 }
 
+- (NSData *)grabViaMetalWithWidth:(int *)outW height:(int *)outH {
+    NSData *d = JJMetalFrameCopy(outW, outH);
+    if (d.length) self.activeMethod = @"Metal";
+    return d;
+}
+
 - (NSData *)grabViaLayerWithWidth:(int *)outW height:(int *)outH {
     UIWindow *win = nil;
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
@@ -295,6 +302,16 @@ static BOOL JJFrameIsBlack(NSData *d, int w, int h) {
     }
     if (d.length && (s_blackFrames++ % 20) == 0) {
         NSLog(@"[JJCheat] GL-hook 帧全黑（读像素时机不对，或游戏不是 GL 渲染）");
+    }
+
+    /* ② Metal：present 之前 blit 读回 drawable 的 texture（GL 游戏不会走到这里） */
+    w = 0; h = 0;
+    d = [self grabViaMetalWithWidth:&w height:&h];
+    if (d.length && !JJFrameIsBlack(d, w, h)) {
+        if (outW) *outW = w;
+        if (outH) *outH = h;
+        [self logGrabSource:@"Metal" data:d w:outW h:outH];
+        return d;
     }
 
     /* ② CARenderServer：roothide 下常常静默返回全黑，验内容后不可用就关掉 */
