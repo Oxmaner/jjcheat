@@ -6,10 +6,12 @@
  * ============================================================ */
 
 /* 每步搜索思考时长（毫秒）。越大越强，越费电。
-   1.1.42 起改为运行时可在悬浮球菜单里修改（不再编译期写死）。
-   默认 200ms：真机实测 350ms 在识别未收敛时会让 JS 队列长期满载。 */
-#define JJ_THINK_MS_DEFAULT     200
-#define JJ_THINK_MS_MIN         50
+   1.1.42 起可在悬浮球菜单里改（不再编译期写死）。
+   2.1.0 换成独立进程 Pikafish 后默认 800ms：48MB 的 NNUE 大网络，
+   旧 JS 时代的 200ms 连置换表都填不满，纯属白瞎这颗引擎。
+   下限 100ms（再短不如直接看棋谱），上限 3000ms（手机发烫的临界）。 */
+#define JJ_THINK_MS_DEFAULT     800
+#define JJ_THINK_MS_MIN         100
 #define JJ_THINK_MS_MAX         3000
 
 /* 2.0.0：tick 只做「帧序号 + 稀疏指纹」两件极轻的检查，真正重活由新帧触发。
@@ -76,6 +78,9 @@
 #define JJ_KEY_CALIBRATED       @"JJCheat.calibrated"
 #define JJ_KEY_HUD_VISIBLE      @"JJCheat.hudVisible"
 #define JJ_KEY_THINK_MS         @"JJCheat.thinkMs"
+/* 思考时间的一次性迁移标记：2.0.x 存下来的 200ms 是给 JS 引擎调的值，
+   对 Pikafish 太短，首次启动时抬到新默认值，只做一次。 */
+#define JJ_KEY_THINK_MS_V2      @"JJCheat.thinkMsV2"
 
 /* 插件图标：随 deb 落到 jbroot 下，悬浮球优先用它，读不到回退文字「象棋」 */
 #define JJ_LOGO_REL_PATH        @"Library/Application Support/JJCheat/logo.png"

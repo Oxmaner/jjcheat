@@ -12,6 +12,8 @@
 #import <signal.h>
 #import <errno.h>
 #import <unistd.h>
+#import <os/lock.h>
+#import <sys/wait.h>
 
 static NSString *const kPikaLog = @"[JJCheat][Pika]";
 
@@ -49,9 +51,27 @@ static NSString *const kPikaLog = @"[JJCheat][Pika]";
 @property (nonatomic, assign) NSInteger failCount;
 @property (nonatomic, assign) NSTimeInterval backoffBefore;
 @property (nonatomic, assign) BOOL wantRunning;
+/* 实际跑起来的二进制路径（诊断/取同目录权重用，不一定是容器副本） */
+@property (nonatomic, copy) NSString *launchedBin;
+/* 被系统拒掉的路径（exec 返回 0 但子进程立刻死 = 签名/沙盒拒绝）：
+   下次 spawn 直接跳过，别在同一条路径上反复撞墙 */
+@property (nonatomic, strong) NSMutableSet<NSString *> *badBins;
+@property (nonatomic, assign) NSTimeInterval lastSpawnTs;
+@property (nonatomic, assign) BOOL sawReadyok;
 @end
 
 @implementation JJPikafish
+
+/* 如果 getter 与 setter 都由我们实现，clang 就不会自动合成 _state 这个 ivar。
+   init 里要写 _state，所以这里显式 @synthesize 一次。 */
+@synthesize state = _state;
+
+/* 状态用自旋锁保护，**绝不能**用 dispatch_sync 回到 _pikaQueue：
+   start / analyzeFen 的 block 本身就跑在 _pikaQueue 上，串行队列同步等自己
+   就是死锁；队列一卡死，主线程随后读状态也会被一起拖住，几秒后被系统
+   看门狗杀掉。2.1.50 真机「activate 后 6 秒进程重启、[Pika] 一条日志都没有」
+   就是这条路径。（锁只保护一个 enum 的读写，纳秒级，不会阻塞主线程。） */
+static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
 
 + (instancetype)shared {
     static JJPikafish *s = nil;
@@ -72,14 +92,22 @@ static NSString *const kPikaLog = @"[JJCheat][Pika]";
         _stdoutFd = -1;
         _lineBuf = [NSMutableData data];
         _wantRunning = NO;
+        _badBins = [NSMutableSet set];
     }
     return self;
 }
 
 - (JJPikaState)state {
-    __block JJPikaState st = JJPikaStateIdle;
-    dispatch_sync(_pikaQueue, ^{ st = _state; });
+    os_unfair_lock_lock(&sPikaStateLock);
+    JJPikaState st = _state;
+    os_unfair_lock_unlock(&sPikaStateLock);
     return st;
+}
+
+- (void)setState:(JJPikaState)state {
+    os_unfair_lock_lock(&sPikaStateLock);
+    _state = state;
+    os_unfair_lock_unlock(&sPikaStateLock);
 }
 
 - (NSString *)stateText {
@@ -98,17 +126,46 @@ static NSString *const kPikaLog = @"[JJCheat][Pika]";
            st == JJPikaStateStarting;
 }
 
+/* 实际在用的可执行文件：优先报告真正 spawn 成功的那个，退回容器副本 */
+- (NSString *)enginePathInUse {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (self.launchedBin.length && [fm isExecutableFileAtPath:self.launchedBin]) {
+        return self.launchedBin;
+    }
+    return [JJPikafishInstaller enginePathInContainer];
+}
+
+/* 与二进制同目录的 NNUE 权重：Pikafish 就是按「二进制所在目录」找它。
+   从改 deb 源位直接启动时权重也在那儿，不必等容器复制完。 */
+- (NSString *)netPathInUse {
+    if (self.launchedBin.length) {
+        NSString *p = [[self.launchedBin stringByDeletingLastPathComponent]
+                       stringByAppendingPathComponent:JJ_PIKA_NET_NAME];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return p;
+    }
+    return [JJPikafishInstaller netPathInContainer];
+}
+
 #pragma mark - 生命周期
 
 - (void)start {
+    /* 先在调用线程把状态置为 Starting：首次激活要把 48MB 权重复制进容器，
+       这段时间状态点该是「黄 · 启动中」，不该是「红 · 不可用」。
+       真正的复制 / spawn / 握手仍全部在 _pikaQueue 上做，主线程不参与。 */
+    JJPikaState st = self.state;
+    if (st == JJPikaStateReady || st == JJPikaStateSearching ||
+        st == JJPikaStateStarting) {
+        return;
+    }
+    self.state = JJPikaStateStarting;
     dispatch_async(_pikaQueue, ^{
         self.wantRunning = YES;
-        if (self.state == JJPikaStateReady || self.state == JJPikaStateSearching ||
-            self.state == JJPikaStateStarting) {
-            return;
-        }
+        /* 二次确认：排队期间可能已经握上手了 */
+        JJPikaState cur = self.state;
+        if (cur == JJPikaStateReady || cur == JJPikaStateSearching) return;
         NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
         if (self.backoffBefore > now) {
+            self.state = JJPikaStateDead;
             NSLog(@"%@ 退避中，还剩 %.0fs", kPikaLog, self.backoffBefore - now);
             return;
         }
@@ -135,38 +192,37 @@ static NSString *const kPikaLog = @"[JJCheat][Pika]";
 
 #pragma mark - spawn / teardown
 
-/** 在 pikaQueue 上 spawn 引擎进程并开始握手 */
-- (void)spawnOnQueue {
-    self.state = JJPikaStateStarting;
+/* 候选可执行路径：按「沙盒最可能放行」排序。
+   只读的 deb 源位（bundle/.jbroot、jbroot()、/var/jb、/）优先——不少机型禁止
+   从可写容器 exec，而从安装目录直接跑既能过沙盒、又省掉 48MB 权重的一次性复制；
+   全都起不来时才退回容器副本（安装器自带 4 级源回退）。
+   无论从哪儿起，pikafish.nnue 就在二进制旁边，引擎按「二进制所在目录」找得到。 */
+- (NSArray<NSString *> *)binaryCandidatesOnQueue {
+    NSMutableArray<NSString *> *bins = [NSMutableArray array];
+    NSString *containerBin = [JJPikafishInstaller enginePathInContainer];
+    for (NSString *p in [JJPikafishInstaller candidateSources]) {
+        if (![p.lastPathComponent isEqualToString:JJ_PIKA_BIN_NAME]) continue;
+        /* 容器副本单独放最后兜底，不参与这一轮 */
+        if (containerBin.length && [p isEqualToString:containerBin]) continue;
+        if ([bins containsObject:p]) continue;
+        [bins addObject:p];
+    }
+    /* 之前被系统拒掉的路径先跳过；全都拒过就清空重来（可能是重装/重签了） */
+    if (self.badBins.count) {
+        NSMutableArray *keep = [NSMutableArray array];
+        for (NSString *p in bins) if (![self.badBins containsObject:p]) [keep addObject:p];
+        if (keep.count) bins = keep;
+        else [self.badBins removeAllObjects];
+    }
+    return bins;
+}
 
-    /* ① 确保容器里有引擎可执行文件 */
-    NSError *err = nil;
-    if (![JJPikafishInstaller ensureInstalledWithError:&err]) {
-        /* 安装失败但回退链里有源：直接用源路径 exec（只读也能 spawn） */
-        NSLog(@"%@ 容器安装失败（%@），尝试直接 exec 源路径", kPikaLog,
-              err.localizedDescription ?: @"?");
-    }
-    NSString *bin = [JJPikafishInstaller enginePathInContainer];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:bin] || ![fm isExecutableFileAtPath:bin]) {
-        /* 容器副本不可用 → 依次试回退链（spawn 只需要读+执行） */
-        NSArray *cands = [JJPikafishInstaller candidateSources];
-        for (NSUInteger i = 0; i < cands.count; i++) {
-            if ([fm isExecutableFileAtPath:cands[i]]) { bin = cands[i]; break; }
-        }
-    }
-    if (![fm isExecutableFileAtPath:bin]) {
-        NSLog(@"%@ 找不到可执行的 pikafish，放弃启动", kPikaLog);
-        [self noteFailureOnQueue];
-        return;
-    }
-
-    /* ② 管道：stdin / stdout+stderr 合流 */
+/** 起一个引擎进程并发出 uci（pikaQueue 上）。成功返回 YES，失败时管道已收拾干净。 */
+- (BOOL)spawnBinaryOnQueue:(NSString *)bin {
     int inPipe[2], outPipe[2];
     if (pipe(inPipe) != 0 || pipe(outPipe) != 0) {
         NSLog(@"%@ pipe 失败: %s", kPikaLog, strerror(errno));
-        [self noteFailureOnQueue];
-        return;
+        return NO;
     }
 
     posix_spawn_file_actions_t actions;
@@ -185,8 +241,11 @@ static NSString *const kPikaLog = @"[JJCheat][Pika]";
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
 
     char *argv[] = {(char *)bin.fileSystemRepresentation, NULL};
+    /* 给一个最小环境：空 envp 也能跑，但真机上缺 PATH 时 dyld 与
+       C++ 运行时的边角路径偶尔出意外，填上不改变任何行为。 */
+    char *envp[] = {(char *)"PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL};
     pid_t pid = -1;
-    int rc = posix_spawn(&pid, bin.fileSystemRepresentation, &actions, &attr, argv, NULL);
+    int rc = posix_spawn(&pid, bin.fileSystemRepresentation, &actions, &attr, argv, envp);
     posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attr);
     close(inPipe[0]);
@@ -194,22 +253,61 @@ static NSString *const kPikaLog = @"[JJCheat][Pika]";
     if (rc != 0) {
         close(inPipe[1]);
         close(outPipe[0]);
-        NSLog(@"%@ posix_spawn 失败 rc=%d: %s（bin=%@）", kPikaLog, rc, strerror(rc), bin);
-        [self noteFailureOnQueue];
-        return;
+        NSLog(@"%@ 无法执行 rc=%d: %s（bin=%@）", kPikaLog, rc, strerror(rc), bin);
+        return NO;
     }
 
     self.pid = pid;
     self.stdinFd = inPipe[1];
     self.stdoutFd = outPipe[0];
     self.sawUciok = NO;
+    self.sawReadyok = NO;
+    self.lastSpawnTs = [NSDate timeIntervalSinceReferenceDate];
     self.failCount = 0;
+    self.launchedBin = bin;
     [self.lineBuf setLength:0];
     NSLog(@"%@ 进程已启动 pid=%d bin=%@", kPikaLog, pid, bin);
 
-    /* ③ 读源 + 握手 */
     [self installReadSource];
     [self writeLine:@"uci"];
+    return YES;
+}
+
+- (void)spawnOnQueue {
+    self.state = JJPikaStateStarting;
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSString *launched = nil;
+    for (NSString *bin in [self binaryCandidatesOnQueue]) {
+        if (![bin length] || ![fm isExecutableFileAtPath:bin]) {
+            NSLog(@"%@ 跳过不可执行: %@", kPikaLog, bin.length ? bin : @"(nil)");
+            continue;
+        }
+        if ([self spawnBinaryOnQueue:bin]) { launched = bin; break; }
+    }
+
+    if (!launched) {
+        /* 源位全都 exec 不了 → 复制进可写容器再试一次（首次约 48MB，几秒） */
+        NSLog(@"%@ 源位都起不来，改走容器副本", kPikaLog);
+        NSError *err = nil;
+        if (![JJPikafishInstaller ensureInstalledWithError:&err]) {
+            NSLog(@"%@ 容器安装失败（%@）", kPikaLog, err.localizedDescription ?: @"?");
+        }
+        NSString *cbin = [JJPikafishInstaller enginePathInContainer];
+        if (cbin.length && [fm isExecutableFileAtPath:cbin] &&
+            [self spawnBinaryOnQueue:cbin]) {
+            launched = cbin;
+        }
+    }
+
+    if (!launched) {
+        NSLog(@"%@ 所有候选都启动失败，放弃本次（连续 %d 次后退避 %.0fs）",
+              kPikaLog, KIKA_FAIL_LIMIT, (double)KIKA_RESPAWN_BACKOFF);
+        [self noteFailureOnQueue];
+        return;
+    }
+
+    /* 握手计时器统一在这里挂：spawn 成功时 uci 已经写出去了 */
     self.handshakeTimer = dispatch_block_create(0, ^{
         if (self.state == JJPikaStateStarting) {
             NSLog(@"%@ 握手超时（%.0fs 无 uciok/readyok），杀掉重来", kPikaLog,
@@ -365,7 +463,7 @@ static NSString *const kPikaLog = @"[JJCheat][Pika]";
            里按默认名 pikafish.nnue 找。安装器把两个文件放在同一目录，
            理论上不设也能找到；这里再显式设一次绝对路径，把「spawn 时
            argv[0] 是相对路径 / 容器被重定向」这类边角情况一起堵掉。 */
-        NSString *netPath = [JJPikafishInstaller netPathInContainer];
+        NSString *netPath = [self netPathInUse];
         if (netPath.length) {
             [self writeLine:[NSString stringWithFormat:@"setoption name EvalFile value %@", netPath]];
         }
@@ -385,6 +483,7 @@ static NSString *const kPikaLog = @"[JJCheat][Pika]";
         if (self.state == JJPikaStateStarting) {
             NSLog(@"%@ 握手完成（uciok=%d），引擎就绪", kPikaLog, self.sawUciok);
         }
+        self.sawReadyok = YES;
         self.state = JJPikaStateReady;
         [self flushPendingOnQueue];
         return;
@@ -486,7 +585,29 @@ static NSString *const kPikaLog = @"[JJCheat][Pika]";
 /** 引擎进程退出（EOF 或写失败）—— pikaQueue 上 */
 - (void)handleEngineExitOnQueue {
     if (!self.wantRunning) return;   /* shutdown 主动关的，不用管 */
-    NSLog(@"%@ 引擎进程退出（pid=%d）", kPikaLog, self.pid);
+    /* 顺手收尸并打印退出方式：被内核以 SIGKILL 干掉（签名/权限被 amfi 拒）
+       和自身崩溃（SIGSEGV/SIGABRT）是完全两种病因，日志里必须分得清。 */
+    int status = 0;
+    pid_t wp = self.pid > 0 ? waitpid(self.pid, &status, WNOHANG) : -1;
+    if (wp == self.pid) {
+        if (WIFSIGNALED(status)) {
+            NSLog(@"%@ 引擎进程退出（pid=%d, 信号 %d: %s）", kPikaLog, self.pid,
+                  WTERMSIG(status), strsignal(WTERMSIG(status)));
+        } else {
+            NSLog(@"%@ 引擎进程退出（pid=%d, 退出码 %d）", kPikaLog, self.pid,
+                  WEXITSTATUS(status));
+        }
+        self.pid = -1;
+    } else {
+        NSLog(@"%@ 引擎进程退出（pid=%d）", kPikaLog, self.pid);
+    }
+    /* 起来不到 3 秒就死、还没握上手 → 这条路径被系统拒了（签名/沙盒），
+       记下来，下次 spawn 直接跳过，换下一条候选。 */
+    if (!self.sawReadyok && self.launchedBin.length &&
+        [NSDate timeIntervalSinceReferenceDate] - self.lastSpawnTs < 3.0) {
+        [self.badBins addObject:self.launchedBin];
+        NSLog(@"%@ 这条路径起不来，换候选：%@", kPikaLog, self.launchedBin);
+    }
     JJPikaResultBlock cb = self.searchingCb;
     JJPikaResultBlock pcb = self.pendingCb;
     self.searchingCb = nil;

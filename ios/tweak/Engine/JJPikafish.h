@@ -43,6 +43,9 @@ typedef void (^JJPikaResultBlock)(NSDictionary * _Nullable result);
 /** 状态简述（HUD / 悬浮球引擎状态点用） */
 - (NSString *)stateText;
 
+/** 实际在用的可执行文件路径（可能是 deb 源位，也可能是容器副本） */
+- (NSString *)enginePathInUse;
+
 /** 启动引擎：确保安装 → spawn → UCI 握手。幂等，可反复调用。 */
 - (void)start;
 

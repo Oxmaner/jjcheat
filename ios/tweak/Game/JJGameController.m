@@ -90,6 +90,13 @@ typedef NS_ENUM(NSInteger, JJGameState) {
         _enabled = [ud objectForKey:JJ_KEY_ENABLED] ? [ud boolForKey:JJ_KEY_ENABLED] : YES;
         _hudVisible = [ud objectForKey:JJ_KEY_HUD_VISIBLE] ? [ud boolForKey:JJ_KEY_HUD_VISIBLE] : YES;
         NSInteger savedMs = [ud integerForKey:JJ_KEY_THINK_MS];
+        if (![ud boolForKey:JJ_KEY_THINK_MS_V2]) {
+            /* 一次性迁移：2.0.x 的 200ms 是给 JS 引擎调的值，
+               Pikafish 吃 48MB NNUE，这个时长等于没思考。 */
+            if (savedMs > 0 && savedMs <= 250) savedMs = 0;
+            [ud setBool:YES forKey:JJ_KEY_THINK_MS_V2];
+            [ud synchronize];
+        }
         _thinkMs = savedMs > 0
             ? MIN(JJ_THINK_MS_MAX, MAX(JJ_THINK_MS_MIN, savedMs))
             : JJ_THINK_MS_DEFAULT;
@@ -275,7 +282,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
         if (!self2 || !alert) return;
         [self2 applyThinkMs:[alert.textFields.firstObject.text integerValue]];
     }]];
-    for (NSNumber *n in @[@(100), @(200), @(500), @(1000)]) {
+    for (NSNumber *n in @[@(300), @(800), @(1500), @(3000)]) {
         [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@ ms", n]
                                                style:UIAlertActionStyleDefault
                                              handler:^(UIAlertAction *action) {
@@ -295,16 +302,19 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSMutableString *msg = [NSMutableString string];
     [msg appendFormat:@"状态：%@\n", [pika stateText]];
-    [msg appendFormat:@"引擎目录：%@\n", [JJPikafishInstaller engineDirInContainer] ?: @"-"];
 
-    NSString *bin = [JJPikafishInstaller enginePathInContainer];
+    /* 报告「真正在用的那个」：可能是 deb 源位，也可能是容器副本。
+       权重必须与二进制同目录（引擎就是这么找的），按同一个目录去查。 */
+    NSString *bin = [pika enginePathInUse];
+    NSString *dir = [bin stringByDeletingLastPathComponent];
     NSDictionary *ba = [fm attributesOfItemAtPath:bin error:nil];
     [msg appendFormat:@"可执行：%@（%@ 字节）\n",
         ba ? @"已就位" : @"缺失", ba ? @([ba fileSize]) : @"-"];
-    NSString *net = [JJPikafishInstaller netPathInContainer];
+    NSString *net = dir.length ? [dir stringByAppendingPathComponent:JJ_PIKA_NET_NAME] : @"";
     NSDictionary *na = [fm attributesOfItemAtPath:net error:nil];
     [msg appendFormat:@"权重：%@（%@ 字节）\n",
         na ? @"已就位" : @"缺失", na ? @([na fileSize]) : @"-"];
+    if (dir.length) [msg appendFormat:@"目录：%@\n", dir];
 
     [msg appendFormat:@"线程 1 · 哈希 %d MB · 每步 %ld ms", JJ_PIKA_HASH_MB, (long)self.thinkMs];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"皮卡鱼引擎"
