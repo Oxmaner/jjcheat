@@ -278,6 +278,17 @@ static UIImage *JJLoadLogoImage(void) {
 @property (nonatomic, assign) NSTimeInterval processNotBefore;
 /* 自动标定：本轮学习采纳的精修四角要写回 JJ_KEY_CORNERS */
 @property (nonatomic, assign) BOOL autoCalibrating;
+/* 2.0.1 标定回滚快照：重标定失败时恢复上一次成功标定，绝不让中局画面
+   把已收敛的锚盘和四角冲掉（16:43 真机：中局点自动标定 → verifyDiff 4→50、
+   gotFen 乱码、skipReason=illegal 无限循环）。 */
+@property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *backupFinalCorners;
+@property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *backupPointCorners;
+@property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *backupGridPts;
+@property (nonatomic, assign) BOOL hasGoodCalibration;
+/* 本轮是「显式重标定」：必须学成（ok=1）才采纳，失败一律回滚 */
+@property (nonatomic, assign) BOOL calibrationPending;
+/* process 心跳：静态局面也要留低频日志，否则无法判断 JS 到底有没有在跑 */
+@property (nonatomic, assign) NSTimeInterval lastHeartbeatTs;
 
 - (void)showMenu;
 - (void)setPluginEnabled:(BOOL)on;
@@ -457,27 +468,106 @@ static UIImage *JJLoadLogoImage(void) {
     }
 }
 
+static double JJAbsD(double v) { return v < 0 ? -v : v; }
+
+/** 四角几何合法性（native 像素坐标）：必须近似一个覆盖棋盘的矩形。
+    16:44 真机日志里用户连点出 (486,2318)(388,1167)(591,1673)(614,1666)
+    这种聚成一小团 / 顺序错乱的四角，旧代码照单全收 → verifyDiff=50、
+    gotFen 整盘乱码、skipReason=illegal 无限循环。 */
+- (BOOL)cornersAreSane:(NSArray<NSArray<NSNumber *> *> *)c {
+    if (c.count != 4) return NO;
+    CGPoint p[4];
+    for (int i = 0; i < 4; i++) {
+        NSArray *xy = c[i];
+        if (![xy isKindOfClass:[NSArray class]] || xy.count < 2) return NO;
+        p[i] = CGPointMake([xy[0] doubleValue], [xy[1] doubleValue]);
+    }
+    double topW = JJAbsD(p[1].x - p[0].x), botW = JJAbsD(p[2].x - p[3].x);
+    double leftH = JJAbsD(p[3].y - p[0].y), rightH = JJAbsD(p[2].y - p[1].y);
+    /* 棋盘在 1284x2778 帧里约 1100x1200；留足余量兼容不同机型 / 缩放 */
+    if (topW < 600 || topW > 1500 || botW < 600 || botW > 1500) return NO;
+    if (leftH < 700 || leftH > 1700 || rightH < 700 || rightH > 1700) return NO;
+    if (JJAbsD(topW - botW) > 200 || JJAbsD(leftH - rightH) > 260) return NO;
+    /* 顺序必须是 左上 → 右上 → 右下 → 左下 */
+    if (!(p[1].x > p[0].x + 200 && p[3].y > p[0].y + 200 &&
+          p[2].x > p[3].x + 200 && p[2].y > p[1].y + 200)) return NO;
+    return YES;
+}
+
+/** 记下当前已成功标定，供重标定失败时完整回滚。 */
+- (void)snapshotGoodCalibration {
+    if (!self.learnedBoard) return;
+    self.backupFinalCorners = self.finalCorners;
+    self.backupPointCorners = self.pointCorners;
+    self.backupGridPts = self.gridPtsCache;
+    self.hasGoodCalibration = YES;
+}
+
+/** 重标定失败：恢复四角与运行态。
+    JS 锚盘天然保留 —— 2.0.1 起重标定不再调用 resetWithFen:nil。 */
+- (void)restoreGoodCalibration {
+    if (!self.hasGoodCalibration) return;
+    self.finalCorners = self.backupFinalCorners;
+    self.pointCorners = self.backupPointCorners;
+    self.gridPtsCache = self.backupGridPts;
+    self.lastFrameW = 0;
+    self.lastFrameH = 0;
+    NSArray *px = nil;
+    if (self.finalCorners.count == 4) {
+        px = self.finalCorners;
+    } else if (self.pointCorners.count == 4) {
+        CGSize pt = [UIScreen mainScreen].bounds.size;
+        CGRect nb = [UIScreen mainScreen].nativeBounds;
+        CGFloat sx = pt.width > 0 ? nb.size.width / pt.width : 1.0;
+        CGFloat sy = pt.height > 0 ? nb.size.height / pt.height : 1.0;
+        NSMutableArray *a = [NSMutableArray arrayWithCapacity:4];
+        for (NSArray *p in self.pointCorners)
+            [a addObject:@[@([p[0] doubleValue] * sx), @([p[1] doubleValue] * sy)]];
+        px = a;
+    }
+    if (px.count == 4) {
+        [[JJEngineBridge shared] setCorners:px];
+        self.gridPtsCache = [self gridPointsFromCorners:px];
+    }
+    self.refineDone = (self.finalCorners.count == 4);
+    self.learnedBoard = YES;
+    self.state = JJCtrlStateRunning;
+    self.calibrationPending = NO;
+    self.autoCalibrating = NO;
+    self.lastFingerprint = nil;
+    self.lastFrameSerial = 0;
+    self.processNotBefore = 0;
+    self.lastProcessTime = 0;
+    self.learnFailCount = 0;
+    [self startTimer];
+    [[JJHUDWindow shared] showStatus:@"标定未成功 · 已恢复上次标定"];
+    NSLog(@"[JJCheat] 重标定失败，回滚到上一次成功标定（JS 锚盘未清空）");
+}
+
 /** 自动标定：清掉旧精修四角，用当前开局画面重新跑 learnAndRefine，
-    采纳后的四角会写回 JJ_KEY_CORNERS，等价于一次自动四点标定。 */
+    采纳后的四角会写回 JJ_KEY_CORNERS，等价于一次自动四点标定。
+    2.0.1：先备份已成功标定；不再 resetWithFen，学不成就原样回滚。 */
 - (void)autoCalibrate {
     if (!self.enabled) {
         [[JJHUDWindow shared] showStatus:@"请先开启插件"];
         return;
     }
     if (!self.activated) [self activate];
+    [self snapshotGoodCalibration];
     self.finalCorners = nil;
     self.refineDone = NO;
     self.learnedBoard = NO;
     self.learnFailCount = 0;
     self.lastLearnAttempt = 0;
     self.lastFrameSerial = 0;
+    self.lastFingerprint = nil;
     self.processNotBefore = 0;
     self.autoCalibrating = YES;
+    self.calibrationPending = YES;
     self.state = JJCtrlStateWaitingBoard;
-    [[JJEngineBridge shared] resetWithFen:nil];
     [self startTimer];
-    [[JJHUDWindow shared] showStatus:@"自动标定中…请停在开局棋盘画面"];
-    NSLog(@"[JJCheat] 自动标定棋盘：清除精修四角，重新学习");
+    [[JJHUDWindow shared] showStatus:@"自动标定中…请停在【开局】棋盘画面"];
+    NSLog(@"[JJCheat] 自动标定棋盘：备份旧标定，重新学习（不清空 JS 锚盘）");
 }
 
 /** 手动标定：沿用原来的四点触摸标定 */
@@ -550,6 +640,7 @@ static UIImage *JJLoadLogoImage(void) {
 }
 
 - (void)recalibrate {
+    [self snapshotGoodCalibration];
     [self.timer invalidate];
     self.timer = nil;
     self.learnedBoard = NO;
@@ -578,6 +669,22 @@ static UIImage *JJLoadLogoImage(void) {
         [pxCorners addObject:@[@(p.x * sx), @(p.y * sy)]];
         [saved addObject:@[@(p.x), @(p.y)]];
     }
+
+    /* 2.0.1 四角几何校验：不接受「点歪了 / 聚成一团 / 顺序反了」的标定。
+       校验失败时保留上一次成功标定，绝不写盘、绝不清 JS 锚盘。 */
+    if (![self cornersAreSane:pxCorners]) {
+        [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
+        if (self.hasGoodCalibration) {
+            [self restoreGoodCalibration];
+            [[JJHUDWindow shared] showStatus:@"四角无效 · 已恢复上次标定"];
+        } else {
+            self.state = JJCtrlStateWaitingBoard;
+            [self startTimer];
+            [[JJHUDWindow shared] showStatus:@"四角无效 · 请按左上→右上→右下→左下重标"];
+        }
+        NSLog(@"[JJCheat] 手动标定四角不合理，已拒绝：%@", pxCorners);
+        return;
+    }
     [[NSUserDefaults standardUserDefaults] setObject:saved forKey:JJ_KEY_CORNERS];
     [[NSUserDefaults standardUserDefaults] setBool:YES forKey:JJ_KEY_CALIBRATED];
     [[NSUserDefaults standardUserDefaults] synchronize];
@@ -588,11 +695,13 @@ static UIImage *JJLoadLogoImage(void) {
     self.refineDone = NO;
     self.finalCorners = nil;
     self.lastFrameSerial = 0;
+    self.lastFingerprint = nil;
     self.lastLearnAttempt = 0;
     self.learnFailCount = 0;
+    self.calibrationPending = YES;
     [[JJEngineBridge shared] setCorners:pxCorners];
-    [[JJEngineBridge shared] resetWithFen:nil];
-    self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
+    /* 本地算 90 个交叉点，不再同步问 JS；也不再 resetWithFen（保留锚盘） */
+    self.gridPtsCache = [self gridPointsFromCorners:pxCorners];
 
     self.state = JJCtrlStateWaitingBoard;
     self.processNotBefore = 0;
@@ -604,9 +713,19 @@ static UIImage *JJLoadLogoImage(void) {
 }
 
 - (void)resetToStartPosition {
+    /* 用户显式「重置到开局」：这里才真正清空 JS 锚盘，重标定路径不会走这里 */
     self.learnedBoard = NO;
+    self.calibrationPending = NO;
+    self.autoCalibrating = NO;
+    self.finalCorners = nil;
+    self.lastFingerprint = nil;
+    self.lastFrameSerial = 0;
+    self.processNotBefore = 0;
+    self.lastProcessTime = 0;
+    self.learnFailCount = 0;
     [[JJEngineBridge shared] resetWithFen:nil];
     self.state = JJCtrlStateWaitingBoard;
+    [self startTimer];
     [[JJHUDWindow shared] showStatus:@"已重置 · 等开局画面"];
 }
 
@@ -838,6 +957,13 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
                 if (self.lastFingerprint.length == sizeof(sample) &&
                     JJFrameFingerprintDiff((const int32_t *)self.lastFingerprint.bytes,
                                            sample) < JJ_FRAME_DIFF_THRESHOLD) {
+                    /* 2.0.1 心跳：静态局面被短路时也留一条低频日志。
+                       16:40:26→16:43:12 日志整整 2 分 46 秒空白，
+                       无法区分「JS 正常跑但没走法」和「链路卡死」。 */
+                    if (now - self.lastHeartbeatTs >= JJ_HEARTBEAT_GAP) {
+                        self.lastHeartbeatTs = now;
+                        NSLog(@"[JJCheat] 画面静止 · 跳过本帧（静态零开销）");
+                    }
                     return;
                 }
                 self.lastFingerprint = [NSData dataWithBytes:sample length:sizeof(sample)];
@@ -880,37 +1006,68 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
                 [[JJHUDWindow shared] showStatus:@"正在学习棋盘…请停留在开局画面"];
                 return;
             }
-            BOOL accepted = [info[@"ok"] boolValue];
-            /* 校验没过最多再学 2 次；之后仍进 Running，但 JS 侧 skipAnalyze 会在
-               盘面不可信时直接短路，不会拿开局 FEN 空转算棋（1.1.41 的卡顿点）。 */
-            if (!accepted && self2.learnFailCount < 2) {
+            BOOL accepted = [info[@"ok"] boolValue] &&
+                [info[@"verifyDiff"] integerValue] <= JJ_LEARN_MAX_DIFF;
+            if (!accepted) {
+                /* 2.0.1：校验没过绝不进 Running。
+                   16:43 真机：中局点自动标定 → verifyDiff 18→50、gotFen 乱码，
+                   旧代码重试 2 次后照样 learnedBoard=YES，还把 finalCorners
+                   换成中局精修的错四角，于是 skipReason=illegal 无限循环。 */
                 self2.learnFailCount++;
-                NSLog(@"[JJCheat] 学习校验未通过（verifyDiff=%@），第 %ld 次重试",
-                      info[@"verifyDiff"], (long)self2.learnFailCount);
+                NSLog(@"[JJCheat] 学习校验未通过 verifyDiff=%@ ok=%@（第 %ld 次）",
+                      info[@"verifyDiff"], info[@"ok"] ?: @"-", (long)self2.learnFailCount);
                 [self2 dumpSamplesWithPixels:rgba width:w height:h];
-                [[JJHUDWindow shared] showStatus:@"学习未完成 · 请停在开局棋盘画面"];
+                if (self2.calibrationPending && self2.hasGoodCalibration &&
+                    self2.learnFailCount >= JJ_CALIB_ROLLBACK_FAILS) {
+                    [self2 restoreGoodCalibration];
+                    return;
+                }
+                if (self2.learnFailCount >= JJ_LEARN_MAX_FAIL) {
+                    if (self2.hasGoodCalibration) {
+                        [self2 restoreGoodCalibration];
+                    } else {
+                        [self2.timer invalidate];
+                        self2.timer = nil;
+                        [[JJHUDWindow shared] showStatus:@"学习失败 · 请停在开局画面再点自动标定"];
+                        NSLog(@"[JJCheat] 学习连续失败 %ld 次，已暂停重试（未进入识别）",
+                              (long)self2.learnFailCount);
+                    }
+                    return;
+                }
+                [[JJHUDWindow shared] showStatus:@"学习未完成 · 请停在【开局】棋盘画面"];
                 return;
             }
             self2.learnedBoard = YES;
             self2.state = JJCtrlStateRunning;
-            /* 学习阶段的画面不作数：清掉指纹，保证学成后第一帧一定进 process */
-            self2.lastFingerprint = nil;
+            self2.calibrationPending = NO;
             NSArray *fc = info[@"finalCorners"];
-            if ([fc isKindOfClass:[NSArray class]] && fc.count == 4) {
+            if ([fc isKindOfClass:[NSArray class]] && fc.count == 4 &&
+                [self2 cornersAreSane:fc]) {
                 self2.finalCorners = fc;
                 self2.gridPtsCache = [self2 gridPointsFromCorners:fc];
                 if (self2.autoCalibrating) {
                     [self2 saveAutoCalibratedCorners:fc width:w height:h];
                 }
             } else {
-                self2.gridPtsCache = [[JJEngineBridge shared] gridPoints];
+                /* 精修四角不可信：沿用原四角，别把 90 个采样点拉歪 */
+                NSArray *keep = self2.finalCorners.count == 4
+                    ? self2.finalCorners : [self2 cornersForWidth:w height:h];
+                self2.gridPtsCache = [self2 gridPointsFromCorners:keep];
+                NSLog(@"[JJCheat] 精修四角几何不合理，已沿用原四角");
             }
-            NSLog(@"[JJCheat] 棋盘学习完成 %@", info);
-            if (!accepted) {
-                NSLog(@"[JJCheat] 学习校验未通过（verifyDiff=%@），交给 JS 合法性闸门兜底",
-                      info[@"verifyDiff"]);
-                [[JJHUDWindow shared] showStatus:@"识别未收敛 · 请确认棋盘完整可见"];
-            }
+            [self2 snapshotGoodCalibration];
+            self2.autoCalibrating = NO;
+            /* 学成这一帧不算数：清指纹 + 清帧序号 + 清所有退避，
+               保证下一张 Metal 帧一定进 process，HUD 立刻出建议。
+               16:39 日志里学成后 2 分 46 秒没有任何结果日志，就是这里没强制。 */
+            self2.lastFingerprint = nil;
+            self2.lastFrameSerial = 0;
+            self2.processNotBefore = 0;
+            self2.lastProcessTime = 0;
+            self2.lastHeartbeatTs = 0;
+            self2.learnFailCount = 0;
+            NSLog(@"[JJCheat] 棋盘学习完成 verifyDiff=%@ ok=1 · 下一帧立即出建议",
+                  info[@"verifyDiff"]);
         }];
         return;
     }
@@ -953,6 +1110,17 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
         }
 
         [[JJHUDWindow shared] showResult:result gridPoints:self2.gridPtsCache fen:result[@"fen"] ?: @""];
+
+        /* 2.0.1 心跳：每 30s 一条盘面摘要，静态 / 等待 / 新局都能一眼判读 */
+        NSTimeInterval hb = [[NSDate date] timeIntervalSince1970];
+        if (hb - self2.lastHeartbeatTs >= JJ_HEARTBEAT_GAP) {
+            self2.lastHeartbeatTs = hb;
+            NSLog(@"[JJCheat] 盘面心跳 ply=%@ turn=%@ wait=%@ newGame=%@ suggest=%@ rejected=%@ reseat=%@ skip=%@",
+                  result[@"ply"] ?: @"-", result[@"turn"] ?: @"-",
+                  result[@"waitingOpponent"] ?: @"-", result[@"newGame"] ?: @"-",
+                  result[@"suggest"] ?: @"-", result[@"anchorRejected"] ?: @"-",
+                  result[@"reseat"] ?: @"-", result[@"skipReason"] ?: @"-");
+        }
 
         if (moved) {
             NSLog(@"[JJCheat] 检测到走法 %@ %@ → FEN %@ | suggest=%@ legalNow=%@ repaired=%@ diff=%@ rejected=%@ reseat=%@ ply=%@ wait=%@ anchor=%@",

@@ -1,7 +1,7 @@
 /* ============================================================
  *  JJ象棋 辅助引擎内核 —— 单文件打包
  *  目标运行环境: iOS JavaScriptCore / Node / 浏览器
- *  生成时间: 2026-11-16T08:33:41.515Z
+ *  生成时间: 2026-11-16T09:13:43.992Z
  *  模块数: 9
  * ============================================================ */
 (function (global) {
@@ -4505,7 +4505,7 @@ var session = {
 };
 
 var JJEngine = {
-  version: '2.0.0',
+  version: '2.0.1',
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
@@ -4568,6 +4568,13 @@ var JJEngine = {
   learnBoard: function (pixels, w, h) {
     if (!session.recognizer) throw new Error('未标定');
 
+    /* 2.0.1：一次失败的重标定（在中局画面点自动标定 / 四角点歪）不能污染
+       已经收敛的会话。16:43 真机日志：verifyDiff 18→50 的失败学习照样改了
+       session.flipped 和 recognizer.bgModel，把开局锚定的判据带偏，
+       随后 legalNow=0 / skipReason=illegal 无限循环。 */
+    var prevFlipped = session.flipped;
+    var prevBgModel = session.recognizer.bgModel;
+
     var stats = session.recognizer.sampleAll(pixels, w, h, true);
     session.recognizer.learnBackground(stats, []);
 
@@ -4629,6 +4636,13 @@ var JJEngine = {
       verifyDiff = compare(got, startMap);
     }
     var ok = (verifyDiff <= 8);
+    /* 失败时把朝向与背景模型原样还回去：锚盘 / openingAnchor / movePly
+       本来就只在 ok 分支里写，这里补上另外两个会被顺手改掉的字段。 */
+    var calibRejected = ok ? 0 : 1;
+    if (!ok) {
+      session.flipped = prevFlipped;
+      session.recognizer.bgModel = prevBgModel;
+    }
 
     // ---- 诊断：verifyDiff 到底错在哪几格 ----
     // 只改 engine.js 就能生效（App 容器里的那份可热替换），不用重新编译 dylib。
@@ -4698,6 +4712,7 @@ var JJEngine = {
       verifyDiff: verifyDiff,
       ok: ok,
       isOpening: ok,
+      calibRejected: calibRejected,
       flipped: session.flipped ? 1 : 0,
       mySide: session.flipped ? 'black' : 'red',
       diffNormal: verifyDiff,
@@ -5235,10 +5250,14 @@ var JJEngine = {
     /* 判据必须看「占位」而不是兵种：开局走两步后与标准开局也只差 4 格，
        用 countCodesDiff<=4 会把正常走子误判成新局（离线回归 A4 实测）。
        真新局的 32 枚棋子位置全对，占位差为 0，只有兵种可能被模板认错。
-       另一个条件保证不会在「本来就是开局」时每帧重复重置。 */
+       2.0.1：还必须同时满足「锚盘已离开开局」且「当前帧相对锚盘明显回退」。
+       16:39 回归实测：只走一步（占位差恰好 2）时，旧判据的 movePly>0
+       会让之后每一帧静止画面都 hit <=2 → newGame=1、锚盘退回开局、ply 归零，
+       表现就是「走第一步后再也不跟着走」。 */
     if (session.openingAnchor && anchor && codesLegal(engCodes) &&
         countOccupancyDiff(session.openingAnchor, engCodes) <= 2 &&
-        (session.movePly > 0 || countOccupancyDiff(anchor, session.openingAnchor) > 0)) {
+        countOccupancyDiff(anchor, session.openingAnchor) > 0 &&
+        countOccupancyDiff(anchor, engCodes) >= 2) {
       session.newGame = 1;
       anchor = session.openingAnchor.slice();
       session.anchorCodes = anchor;

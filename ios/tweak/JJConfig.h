@@ -39,6 +39,15 @@
 #define JJ_LEARN_RETRY_GAP      3.0
 /* 学习连续失败上限：超过就停下来提示用户切回开局画面，不再无限重试 */
 #define JJ_LEARN_MAX_FAIL       6
+/* 学习校验允许的最大错格数，必须与 engine.js 里 learnBoard 的 ok 判据一致。
+   2.0.1：重标定只有 verifyDiff <= 这个值才算成功，中局画面（真机 18~50）
+   一律拒绝，避免把已收敛的锚盘冲成乱码。 */
+#define JJ_LEARN_MAX_DIFF       8
+/* 重标定失败几次后回滚到上一次成功标定 */
+#define JJ_CALIB_ROLLBACK_FAILS 2
+/* 低频心跳日志间隔（秒）：静态局面被帧差短路时也要留痕，
+   否则日志里几十分钟空白，无法判断 JS 到底有没有在跑。 */
+#define JJ_HEARTBEAT_GAP        30.0
 
 /* 连续多少帧识别一致才认为局面稳定（防手抖/动画中间帧） */
 #define JJ_STABLE_FRAMES        2

@@ -25,8 +25,9 @@
    那份）。启动时自检，缺标记就自动用编进 dylib 的内嵌副本覆盖升级。
    1.1.40 = learnAndRefine；1.1.42 = skipAnalyze；1.1.43 = skipReason；
    1.1.44 = anchorCodes（开局锚定 + 一步棋状态机）；
-   2.0.0  = waitingOpponent（红先黑后真实轮次 + 新局重锚 + 超时兜底）。 */
-static NSString * const kJJEngineFeatureMark = @"waitingOpponent";
+   2.0.0  = waitingOpponent（红先黑后真实轮次 + 新局重锚 + 超时兜底）；
+   2.0.1  = calibRejected（失败的重标定不污染已收敛会话）。 */
+static NSString * const kJJEngineFeatureMark = @"calibRejected";
 
 // roothide 适配：jbroot 每次越狱都会换一个随机路径，必须在运行时解析。
 // 非 roothide 构建（rootful/rootless）不引这个头，避免多出 libroothide 依赖。

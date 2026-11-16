@@ -52,6 +52,11 @@ NSString *JJMetalStatus(void);
     待机、插件关闭时调用，避免每帧在游戏渲染线程上白烧 14MB 拷贝。 */
 void JJMetalSetCaptureEnabled(BOOL enabled);
 
+/** 抓帧开关当前是否打开。JJScreenGrabber 据此判断「Metal 已接管」：
+    即使第一帧还没读回来，也绝不回退 CARenderServer / CALayer 全黑重活
+    （16:39 真机日志：启动首帧 CALayer 全黑 → 第一次学习 verifyDiff=32）。 */
+BOOL JJMetalCaptureEnabled(void);
+
 #ifdef __cplusplus
 }
 #endif

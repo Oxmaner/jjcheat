@@ -1,6 +1,6 @@
 Package: com.fujiang.jjcheat
 Name: JJCheat
-Version: 2.0.0
+Version: 2.0.1
 Architecture: iphoneos-arm64e
 Description: JJ象棋 实时辅助（roothide 适配版）— 识别棋盘、引擎推演、屏幕标注
 Maintainer: fujiang

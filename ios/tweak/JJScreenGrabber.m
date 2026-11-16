@@ -363,8 +363,12 @@ static BOOL JJFrameIsBlack(NSData *d, int w, int h) {
     }
     /* 只要 Metal 曾经出过有效帧，就永远不再走 CARenderServer / CALayer：
        roothide 下前者静默全黑，后者要在主线程全屏 renderInContext（14MB 位图），
-       是 1.1.44 之前「间歇性卡顿」最重的一块。缓存过期宁可空一轮等下一张 Metal 帧。 */
-    if (s_lastGoodMetal.length) return nil;
+       是 1.1.44 之前「间歇性卡顿」最重的一块。缓存过期宁可空一轮等下一张 Metal 帧。
+       2.0.1：抓帧开关已开 = Metal 已接管，首帧未到时也直接返回 nil。
+       16:39 日志里启动第一帧正是走了 CALayer 全黑回退（中心像素 0,0,0），
+       导致首次学习 verifyDiff=32、RGB dump 全 0，白等 10 秒才用真 Metal 帧学成。
+       实测开关打开后 0.8s 内 Metal 首帧就到，没必要再碰这两条死路。 */
+    if (JJMetalCaptureEnabled() || s_lastGoodMetal.length) return nil;
 
     /* Metal 从未出过有效帧时才轮到重回退，且 1.5s 内最多一次。 */
     CFTimeInterval fallbackNow = CACurrentMediaTime();

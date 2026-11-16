@@ -8,6 +8,7 @@
  *   A 执红：红先手 / 走子轮次 / 噪声门槛 / 静止缓存 / 新局重锚
  *   B 执黑：开局必须等红方先走，对方落子后才出建议
  *   C 中途进对局：连续 3 帧稳定后换局重锚
+ *   D 中局误点自动标定：失败的学习不得污染已收敛锚盘（16:43 真机日志）
  *
  * 这些场景全部来自真机日志里踩过的坑，改状态机时务必保持全绿。
  */
@@ -110,19 +111,24 @@ function makeFixture(src, blackBottom) {
     return r;
   }
 
-  /** 学习开局（noisy 模仿真机 4 格兵种认错） */
-  function learn(noisy) {
-    const c = S0.slice();
-    if (noisy) { c[5] = 11; c[6] = 12; c[7] = 14; c[8] = 10; }
+  /** 学习开局（noisy 模仿真机 4 格兵种认错；custom 可指定任意盘面） */
+  function learn(noisy, custom) {
+    const c = custom ? custom.slice() : S0.slice();
+    if (noisy && !custom) { c[5] = 11; c[6] = 12; c[7] = 14; c[8] = 10; }
     engCodes = c;
-    const r = JJ.learnBoard(new Uint8ClampedArray(4), 1, 1);
+    return JJ.learnBoard(new Uint8ClampedArray(4), 1, 1);
+  }
+  /** 成功学习开局后打印基线（供 A/B/C 用） */
+  function learnOpening(noisy) {
+    const r = learn(noisy);
     console.log('学习: ok=%s verifyDiff=%s %s 锚盘=标准开局:%s ply=%s',
       r.ok, r.verifyDiff, S.flipped ? '执黑' : '执红',
       S.anchorFen === START ? 'YES' : 'NO', S.movePly);
     if (!r.ok || S.anchorFen !== START) throw new Error('学习未锚定标准开局');
   }
 
-  return { JJ, S, C, START, S0, frame, learn };
+  return { JJ, S, C, START, S0, frame, learn, learnOpening,
+           setCodes: c => { engCodes = c.slice(); } };
 }
 
 function main() {
@@ -130,7 +136,7 @@ function main() {
 
   console.log('========== A. 执红：红先手 + 走子轮次 + 噪声门槛 ==========');
   const A = makeFixture(src, false);
-  A.learn(true);
+  A.learnOpening(true);
   A.frame('A1 开局静止', A.S0.slice(), r => {
     if (r.waitingOpponent) throw new Error('执红开局应轮到我');
     if (!r.suggest) throw new Error('执红开局应出建议');
@@ -150,6 +156,10 @@ function main() {
     if (!r.waitingOpponent) throw new Error('我方走完应轮到对方');
     if (r.suggest) throw new Error('轮到对方不该出建议');
     if (r.elapsed !== undefined) throw new Error('轮到对方仍在跑引擎搜索');
+  });
+  A.frame('A3b 走一步后静止', step1.slice(), r => {
+    if (r.newGame) throw new Error('走一步后的静止帧不该被判成新局');
+    if (r.ply !== 1) throw new Error('静止帧轮次被重置');
   });
   const step2 = step1.slice(); step2[27] = 0; step2[36] = 14;  // 黑卒进一
   A.frame('A4 对方走子', step2, r => {
@@ -171,7 +181,7 @@ function main() {
   console.log('');
   console.log('========== B. 执黑：必须等对方（红）先走 ==========');
   const B = makeFixture(src, true);
-  B.learn(false);
+  B.learnOpening(false);
   B.frame('B1 执黑开局', B.S0.slice(), r => {
     if (!r.waitingOpponent) throw new Error('执黑开局必须等红方先走');
     if (r.suggest) throw new Error('执黑开局不该给建议');
@@ -188,7 +198,7 @@ function main() {
   console.log('');
   console.log('========== C. 中途进对局：3 帧稳定换局重锚 ==========');
   const D = makeFixture(src, false);
-  D.learn(false);
+  D.learnOpening(false);
   const mid = D.S0.slice();
   for (let c = 0; c < 9; c += 2) { mid[27 + c] = 0; mid[36 + c] = 14; }
   let last;
@@ -201,8 +211,47 @@ function main() {
   if (!last.moveDetected) throw new Error('重锚后没落地新局面');
 
   console.log('');
+  console.log('========== D. 中局误点自动标定：失败学习不污染锚盘 ==========');
+  const E = makeFixture(src, false);
+  E.learnOpening(true);
+  const openingSnapshot = E.S.openingAnchor.slice();
+  const flippedBefore = E.S.flipped;
+  const s1 = E.S0.slice(); s1[54] = 0; s1[45] = 7;   // 红兵进一
+  E.frame('D1 红兵进一', s1, r => {
+    if (!r.moveDetected) throw new Error('走子丢失');
+  });
+  const anchorAfterMove = E.S.anchorFen;
+  const plyAfterMove = E.S.movePly;
+  /* 模仿真机 16:43：在已经走过棋的中局画面点「自动标定棋盘」，
+     学习校验必然失败（真机 verifyDiff=18~50）。 */
+  const midCodes = E.S0.slice();
+  for (let c = 0; c < 9; c += 2) { midCodes[27 + c] = 0; midCodes[36 + c] = 14; }
+  E.setCodes(midCodes);
+  const bad = E.JJ.learnBoard(new Uint8ClampedArray(4), 1, 1);
+  console.log('中局重标定: ok=%s verifyDiff=%s calibRejected=%s',
+    bad.ok, bad.verifyDiff, bad.calibRejected);
+  if (bad.ok) throw new Error('中局画面不该被判成开局');
+  if (bad.calibRejected !== 1) throw new Error('缺少 calibRejected 诊断字段');
+  if (E.S.anchorFen !== anchorAfterMove) throw new Error('失败的重标定改掉了锚盘');
+  if (E.S.movePly !== plyAfterMove) throw new Error('失败的重标定改掉了轮次');
+  if (E.S.flipped !== flippedBefore) throw new Error('失败的重标定改掉了朝向');
+  if (E.S.openingAnchor.join(',') !== openingSnapshot.join(','))
+    throw new Error('openingAnchor 被污染');
+  E.frame('D2 回到真实局面（静止）', s1, r => {
+    if (r.newGame) throw new Error('静止帧被误判成新局');
+    if (r.ply !== plyAfterMove) throw new Error('静止帧轮次被重置');
+    if (r.skipAnalyze) throw new Error('失败重标定不该导致 skipAnalyze');
+  });
+  const s2 = s1.slice(); s2[27] = 0; s2[36] = 14;   // 对方黑卒进一
+  E.frame('D3 对方走子', s2, r => {
+    if (!r.suggest) throw new Error('失败重标定后应能继续出建议');
+    if (r.skipAnalyze) throw new Error('失败重标定不该导致 skipAnalyze');
+    if (r.ply !== 2) throw new Error('失败重标定后轮次未推进');
+  });
+
+  console.log('');
   console.log('全部通过 OK  engine.js = %d 字节, mark=%s',
-    fs.statSync(ENGINE).size, /waitingOpponent/.test(src) ? 'waitingOpponent OK' : 'MISSING');
+    fs.statSync(ENGINE).size, /calibRejected/.test(src) ? 'calibRejected OK' : 'MISSING');
 }
 
 main();

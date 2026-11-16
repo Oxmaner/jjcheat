@@ -285,6 +285,10 @@ void JJMetalSetCaptureEnabled(BOOL enabled) {
     NSLog(@"[JJCheat] Metal 抓帧开关=%@", enabled ? @"开" : @"关");
 }
 
+BOOL JJMetalCaptureEnabled(void) {
+    return gCaptureEnabled ? YES : NO;
+}
+
 /** hook 已由 Logos 的 %init 注册；这里只做一次启动诊断。 */
 void JJMetalInstallHooks(void) {
     static BOOL logged = NO;
