@@ -231,6 +231,7 @@
 
         // 顶部信息面板
         CGFloat panelW = self.bounds.size.width - 16.0;
+        // 真正的位置在 layoutTopPanel 里按安全区算，这里的 8 只是初值
         _topPanel = [[UIView alloc] initWithFrame:CGRectMake(8, 8, panelW, JJ_HUD_TOP_HEIGHT)];
         _topPanel.backgroundColor = JJ_COLOR_PANEL_BG;
         _topPanel.layer.cornerRadius = 10;
@@ -263,8 +264,34 @@
 
         _topPanel.hidden = YES;
         _calibPoints = [NSMutableArray array];
+        [self layoutTopPanel];
     }
     return self;
+}
+
+/**
+ 顶部面板贴安全区下沿。
+ iPhone 14 Pro Max 的顶部安全区约 59pt（灵动岛），原来固定 y=8 会被整块盖住；
+ 这里按 safeAreaInsets 动态下移，老机型（20pt）也不会顶进状态栏。
+ 面板高度不变，只挪位置，不改布局逻辑。
+ */
+- (void)layoutTopPanel {
+    if (!_topPanel) return;
+    CGFloat safeTop = self.safeAreaInsets.top;
+    if (safeTop < 20.0) safeTop = 20.0;
+    CGFloat panelW = self.bounds.size.width - 16.0;
+    if (panelW < 200.0) panelW = 200.0;
+    _topPanel.frame = CGRectMake(8, safeTop + 4.0, panelW, JJ_HUD_TOP_HEIGHT);
+
+    CGFloat scoreW = 96.0;
+    _lineMain.frame = CGRectMake(12, 6, panelW - 24 - scoreW - 6, 26);
+    _lineScore.frame = CGRectMake(panelW - 12 - scoreW, 6, scoreW, 26);
+    _lineSub.frame = CGRectMake(12, 32, panelW - 24, 18);
+}
+
+- (void)safeAreaInsetsDidChange {
+    [super safeAreaInsetsDidChange];
+    [self layoutTopPanel];
 }
 
 - (void)attach {
@@ -280,6 +307,8 @@
     // 只用 hidden=NO 显示，不调 makeKeyAndVisible ——
     // 抢 key window 会把 JJ象棋 的触摸吃掉。
     self.hidden = NO;
+    // windowScene 定下来之后 safeAreaInsets 才准，这里再摆一次面板
+    [self layoutTopPanel];
 }
 
 - (void)setMode:(JJHUDMode)mode {
@@ -387,6 +416,7 @@ static NSString *JJFormatNodes(NSInteger nodes) {
     }
     self.lineSub.text = sub;
 
+    if (self.topPanel.hidden) [self layoutTopPanel];   // 首次显示时保险再摆一次
     self.topPanel.hidden = NO;
     [self.hudView setNeedsDisplay];
 }
@@ -396,6 +426,7 @@ static NSString *JJFormatNodes(NSInteger nodes) {
     self.lineMain.text = text;
     self.lineScore.text = @"";
     self.lineSub.text = @"";
+    if (self.topPanel.hidden) [self layoutTopPanel];
     self.topPanel.hidden = NO;
 }
 

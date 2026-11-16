@@ -631,8 +631,20 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
               info[@"flipped"] ?: @"-", info[@"redN"] ?: @"-", info[@"blkN"] ?: @"-",
               info[@"bottomRed"] ?: @"-", info[@"bottomBlack"] ?: @"-",
               info[@"topRed"] ?: @"-", info[@"topBlack"] ?: @"-");
+        /* 2.1.57：亮度三峰模型。空格必须落在 [loTh, hiTh] 之内，
+           暗子 < loTh、亮子 > hiTh；有子数 occludedN 应等于当前盘面子数（开局 32）。 */
+        NSLog(@"[JJCheat] 亮度模型 盘面L=%@ 空格区间=[%@,%@] mad=%@ 判有子=%@",
+              info[@"boardL"] ?: @"-", info[@"loTh"] ?: @"-",
+              info[@"hiTh"] ?: @"-", info[@"mad"] ?: @"-",
+              info[@"occludedN"] ?: @"-");
+        /* 2.1.57：占位差 ≤4 才会现场裁模板；bootMade=1 说明这一帧的模板
+           与真机像素同源，之后 score 才有意义。 */
+        NSLog(@"[JJCheat] 模板自举 尝试=%@ 占位差=%@ 成功=%@ 模板数=%@",
+              info[@"bootTried"] ?: @"-", info[@"bootOccDiff"] ?: @"-",
+              info[@"bootMade"] ?: @"-", info[@"tplCount"] ?: @"-");
         NSLog(@"[JJCheat] 墨迹图 i=%@", info[@"diagI"] ?: @"-");
         NSLog(@"[JJCheat] 暖色图 w=%@", info[@"diagW"] ?: @"-");
+        NSLog(@"[JJCheat] 亮度图 l=%@（36 进制，一位 = L/10）", info[@"diagL"] ?: @"-");
         NSLog(@"[JJCheat] 模板分 s=%@", info[@"diagS"] ?: @"-");
         NSLog(@"[JJCheat] 识别值 c=%@ gotFen=%@", info[@"codes36"] ?: @"-",
               info[@"gotFen"] ?: @"-");

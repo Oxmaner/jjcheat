@@ -479,7 +479,7 @@ var JJEngine = {
      为什么必须变：JJVisionBridge 只在「容器里那份 engine.js 缺这个标记」时才覆盖升级，
      标记不变 = 用户容器里 253886 字节的旧脚本永远不会被换掉，新识别逻辑根本跑不到。
      新标记必须包含旧标记作为子串之外的前缀（旧脚本里没有 pikafishNative2156）。 */
-  featureMark: 'pikafishNative2156',
+  featureMark: 'pikafishNative2157',
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
@@ -546,9 +546,14 @@ var JJEngine = {
        随后 legalNow=0 / skipReason=illegal 无限循环。 */
     var prevFlipped = session.flipped;
     var prevBgModel = session.recognizer.bgModel;
+    var prevTemplates = session.recognizer.templates;   // 自举失败要能退回去
 
     var stats = session.recognizer.sampleAll(pixels, w, h, true);
     session.recognizer.learnBackground(stats, []);
+    /* 诊断快照：失败分支会把 bgModel 回滚成 prevBgModel（通常是 null），
+       直接读就成了 -1，看不出这一帧到底算出了什么阈值。
+       真机日志里 warmTh=-1 就是这么来的，害得「背景模型没学到」看起来像根因。 */
+    var bgSnap = session.recognizer.bgModel ? Object.assign({}, session.recognizer.bgModel) : null;
 
     var startMap = TRK.startPieceMap();
 
@@ -593,14 +598,47 @@ var JJEngine = {
     }
     session.flipped = flipped;
 
-    // ★ 不再用第一帧去学模板。
-    //   原来的做法是把第一帧当成标准开局，用开局棋子位置给模板贴标签；
-    //   用户中途进对局时第一帧就是中局，标签全错（车被标成马、炮被标成兵），
-    //   于是识别出来的 FEN 永远是开局 rnbakabnr/9/1c5c1/...。
-    //   现在模板是离线从已知正确盘面生成、内置在引擎里的，和当前帧无关。
-    //   这里只做校验，不改模板。
+    /* ★★ 2.1.57 模板自举：只在这一帧确实是标准开局时才裁模板 ★★
+     *
+     * 历史包袱：2.1.x 之前试过「用第一帧当标准开局贴标签」，用户中途进中局时
+     * 标签全错（车标成马、炮标成兵），于是 FEN 永远是开局 —— 所以后来改成
+     * 「模板离线从参考截图生成、内置进引擎，和当前帧无关」。
+     * 但这条路的代价是：模板与真机像素不同源（象牙白 (243,203,149) vs 木色棋盘
+     * (199,167,112)，抗锯齿/色温/缩放全不同），模板分恒低，整盘棋子被丢空。
+     *
+     * 参考 64922/xiangqi-advisor 的解法：标准开局恰好含全部 14 种棋子且位置已知，
+     * 所以模板完全可以现场裁 —— 同源像素，归一化后自动对齐亮度和色调。
+     * 它绕开「标签全错」的办法是加一道闸门：先确认这一帧就是开局。
+     *
+     * 我们的闸门不依赖兵种，只比「哪些格有子」：用刚算出的亮度模型得到占位图，
+     * 和标准开局的 32 个位置逐格比对，差 ≤4 格才贴标签。判错了就什么都不改，
+     * 沿用旧模板（宁可不出箭头，也不能乱认）。 */
+    var bootTried = 0, bootOccDiff = -1, bootMade = 0;
+    if (colorCls && colorCls.grid && session.recognizer.calibrateBoardLevel) {
+      bootTried = 1;
+      var openingMap = TRK.startPieceMap();
+      var pieceAtScreen = new Array(90);
+      var occDiff = 0;
+      for (var bi = 0; bi < 90; bi++) {
+        var stdIdx = flipped ? ((9 - ((bi / 9) | 0)) * 9 + (8 - (bi % 9))) : bi;
+        var lbl = openingMap[stdIdx] || 0;
+        pieceAtScreen[bi] = lbl;
+        var hasOnScreen = (colorCls.grid[bi] !== 0);
+        var hasInOpening = (lbl !== 0);
+        if (hasOnScreen !== hasInOpening) occDiff++;
+      }
+      bootOccDiff = occDiff;
+      /* 只差 4 格以内才认：允许高亮圈、被手指压住、渲染抖动这类局部误差。
+         开局有 32 子 / 58 空，中局占位差一定会远超 4，闸门足够严。 */
+      if (occDiff <= 4) {
+        try {
+          session.recognizer.learnTemplates(stats, pieceAtScreen);
+          bootMade = 1;
+        } catch (eBoot) { bootMade = 0; }
+      }
+    }
 
-    // 验证：用刚学到的模板识别同一帧，和标准开局比（翻转时先翻回标准坐标）
+    // 验证：用（可能刚自举的）模板识别同一帧，和标准开局比（翻转时先翻回标准坐标）
     var clsV = session.recognizer.classify(stats);
     var verifyDiff = 999;
     if (clsV && clsV.codes) {
@@ -614,6 +652,9 @@ var JJEngine = {
     if (!ok) {
       session.flipped = prevFlipped;
       session.recognizer.bgModel = prevBgModel;
+      /* 自举出来的模板同样要退回去：只有「自举完还认不对」说明这次贴的标签
+         有问题（占位差 ≤4 但确实不是开局），继续用它只会把后面的帧全带错。 */
+      if (bootMade) session.recognizer.templates = prevTemplates;
     }
 
     // ---- 诊断：verifyDiff 到底错在哪几格 ----
@@ -648,8 +689,8 @@ var JJEngine = {
       return sum;
     }
 
-    var learned = session.recognizer.bgModel ? 1 : 0;
-    var warmTh = session.recognizer.bgModel ? session.recognizer.bgModel.warmThreshold : -1;
+    var learned = bgSnap ? 1 : 0;
+    var warmTh = bgSnap ? bgSnap.warmThreshold : -1;
 
     /* ---- 2.1.56 诊断：把 90 格的「墨迹 / 暖色 / 模板分 / 识别值」压成一条串 ----
      * 真机 verifyDiff=32 恰好等于开局子数，说明整盘棋子被判空。仅凭这一点
@@ -662,15 +703,20 @@ var JJEngine = {
      */
     var ls = session.recognizer.lastStats || {};
     var dConf = (clsV && clsV.conf) ? clsV.conf : null;
-    var diagI = '', diagW = '', diagS = '', codes36 = '';
+    var diagI = '', diagW = '', diagS = '', diagL = '', codes36 = '';
     for (var dq = 0; dq < 90; dq++) {
       var ds = stats[dq];
       var dCode = chkCodes ? chkCodes[dq] : (gotCodes ? gotCodes[dq] : 0);
       codes36 += (dCode || 0).toString(36);
-      if (!ds || !ds.n) { diagI += '·'; diagW += '·'; diagS += '·'; continue; }
+      if (!ds || !ds.n) { diagI += '·'; diagW += '·'; diagS += '·'; diagL += '·'; continue; }
       var vI = Math.min(9, Math.round((ds.inkR || 0) * 20));
       var vW = Math.min(9, Math.round((ds.warmR || 0) * 10));
       var vS = dConf ? Math.min(9, Math.round((dConf[dq] || 0) * 2)) : 0;
+      /* 2.1.57：亮度图，一格一字符 = meanL/10（36 进制，0~35 即 L 0~350）。
+         判据现在全靠它：暗子约 8~9、木色棋盘约 15~18、亮子约 20~23。
+         若棋盘格和棋子挤在同一段数字里，说明这对皮肤对比度不够，得换判据。 */
+      var vL = Math.max(0, Math.min(35, Math.round((ds.meanL || 0) / 10)));
+      diagL += vL.toString(36);
       diagI += String(vI); diagW += String(vW); diagS += String(vS);
     }
     /* 棋盘外接框的宽高比：标准河盘 8 列 9 行 = 0.889。
@@ -735,9 +781,23 @@ var JJEngine = {
         return c ? t / c : 0;
       })()),
       gridAspect: gridAspect,
+      /* 2.1.57 亮度三峰模型：boardL 是棋盘底色中位亮度，[loTh, hiTh] 之间为空格。
+         判读：暗子应 < loTh、亮子应 > hiTh；如果棋子都落在区间内，说明阈值不对。 */
+      boardL: bgSnap ? Math.round(bgSnap.boardL) : -1,
+      hiTh: bgSnap ? Math.round(bgSnap.hiTh) : -1,
+      loTh: bgSnap ? Math.round(bgSnap.loTh) : -1,
+      mad: bgSnap && bgSnap.mad ? Math.round(bgSnap.mad * 10) / 10 : -1,
+      occludedN: redN + blkN,
+      /* 2.1.57 模板自举：bootOccDiff 是与标准开局的占位数差（≤4 才会自举），
+         bootMade=1 表示这一帧成功裁出了同源模板。 */
+      bootTried: bootTried,
+      bootOccDiff: bootOccDiff,
+      bootMade: bootMade,
+      tplCount: session.recognizer.templateCount || 0,
       diagI: diagI,
       diagW: diagW,
       diagS: diagS,
+      diagL: diagL,
       codes36: codes36,
       bottomRed: bRed,
       bottomBlack: bBlk,

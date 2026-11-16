@@ -1091,7 +1091,7 @@ class BoardRecognizer {
    */
   sampleCell(pixels, w, h, cx, cy, radius, wantPatch, gain) {
     const g = (typeof gain === 'number' && gain > 0) ? gain : 1;
-    let n = 0, sumL = 0, red = 0, dark = 0, bright = 0, warm = 0, skipped = 0;
+    let n = 0, sumL = 0, red = 0, dark = 0, bright = 0, warm = 0, face = 0, skipped = 0;
     let ink = 0, redInk = 0, darkInk = 0;
     let coreN = 0, coreInk = 0, coreRedInk = 0, coreDarkInk = 0;
     const PW = PATCH_W;
@@ -1134,7 +1134,7 @@ class BoardRecognizer {
           const rr = Math.sqrt(du * du + dv * dv);
           const inCore = (py >= 6 && py <= 17 && px >= 6 && px <= 17);
           let okN = 0, wN = 0, rN = 0, iN = 0, riN = 0, diN = 0;
-          let lSum = 0, redN = 0, darkN = 0, brightN = 0, warmN = 0;
+          let lSum = 0, redN = 0, darkN = 0, brightN = 0, warmN = 0, faceN = 0;
           for (let si = 0; si < 4; si++) {
             const sx = Math.round(bx + ((si === 0 || si === 2) ? -subOff : subOff));
             const sy = Math.round(by + (si < 2 ? -subOff : subOff));
@@ -1159,8 +1159,14 @@ class BoardRecognizer {
             lSum += L;
             if (rb > 22 && R > 80) { warmN++; wN++; }
             if (R > 85 && (R - G) > 45 && rb > 45) { redN++; rN++; }
-            if (L < 72) darkN++;
+            // 暗色盘面阈值原来是 L<72，真机实测黑子是 (88,78,65)=79.5、(112,79,69)=87，
+            // 整类黑子从这个判据里漏掉，"暗色通道"等于不存在。放到 100 才装得下。
+            if (L < 100) darkN++;
             if (L > 178) brightN++;
+            // 亮盘面：象牙白棋子 (243,203,149)=209，木色棋盘 (199,167,112)=170，
+            // 差 ~40 是这对皮肤里最稳的一条界线。最终阈值由 calibrateBoardLevel 按
+            // 全盘中位亮度自适应，这里只提供原始计数。
+            if (L >= 186 && rb > 20) faceN++;
             // ---- 墨迹特征（核心判据）----
             // 棋子上的「字」是深色或红色，而棋子盘面、棋盘、绿点、高亮圈都是亮的。
             // 区分「红字」和「暖色盘面」靠绿通道：
@@ -1188,6 +1194,7 @@ class BoardRecognizer {
           dark += darkN * inv;
           bright += brightN * inv;
           warm += warmN * inv;
+          face += faceN * inv;
           ink += iN * inv;
           redInk += riN * inv;
           darkInk += diN * inv;
@@ -1224,9 +1231,10 @@ class BoardRecognizer {
           sumL += L; n++;
           const rb = R - B;
           if (R > 85 && (R - G) > 45 && rb > 45) red++;
-          if (L < 72) dark++;
+          if (L < 100) dark++;
           if (L > 178) bright++;
           if (rb > 26 && R > 85) warm++;
+          if (L >= 186 && rb > 20) face++;
 
           const isRedInk = (R > 95 && G < 115 && (R - G) > 55 && (R - B) > 65);
           const isDarkInk = (L < 85) && !isRedInk;
@@ -1300,6 +1308,7 @@ class BoardRecognizer {
       darkR: dark / denom,
       brightR: bright / denom,
       warmR: warm / denom,
+      faceR: face / denom,
       inkR: ink / denom,
       redInkR: redInk / denom,
       darkInkR: darkInk / denom,
@@ -1508,14 +1517,16 @@ class BoardRecognizer {
    * @param {number[]} emptySquares 兼容旧调用，现在不依赖它
    */
   learnBackground(stats, emptySquares) {
+    const lv = this.calibrateBoardLevel(stats);
+
+    // ---- 暖色 Otsu（保留作兼容与诊断，不再用于判占位）----
     const vals = [];
     for (let i = 0; i < stats.length; i++) {
       const s = stats[i];
       if (s && s.n > 0) vals.push(s.warmR);
     }
-    if (vals.length < 10) return null;
+    if (vals.length < 10) return lv ? (this.bgModel = Object.assign({}, lv)) : null;
 
-    // ---- Otsu 双峰分割 ----
     const BINS = 64;
     const hist = new Array(BINS).fill(0);
     for (let i = 0; i < vals.length; i++) {
@@ -1555,12 +1566,11 @@ class BoardRecognizer {
     }
     const avg = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
 
-    this.bgModel = {
+    this.bgModel = Object.assign({
       warmThreshold: th,
       meanWarm: avg(vals),
       meanRed: avg(reds),
       meanDark: avg(darks),
-      // 保留旧字段，别的代码可能还在读
       meanL: 0,
       stdL: 1,
       meanBright: 0,
@@ -1569,8 +1579,40 @@ class BoardRecognizer {
       stdRed: 0.01,
       meanDarkRaw: avg(darks),
       stdDark: 0.01
-    };
+    }, lv || {});
     return this.bgModel;
+  }
+
+  /**
+   * 从整盘 90 格的中位亮度反推「棋盘底色」，据此定出有子 / 无子的上下界。
+   *
+   * 为什么不能用暖色占比判占位（2026-11-16 真机日志推翻了这个前提）：
+   *   木色棋盘 (199,167,112) 的 R-B=87，同样满足 warm 判据（R-B>22 && R>80），
+   *   于是 90 格的 warmR 全落在 0.7~0.9；交叉点上的深色网格线又让 inkR 到 0.1~0.25。
+   *   两个条件都过 → 整盘 81 格被判有子（实际只有 32 个），verifyDiff 直接飙到 73。
+   *
+   * 真正稳定的信号是亮度，同一帧里三峰分明：
+   *   暗棋子盘面 L≈80~95 / 木色棋盘 L≈145~180 / 亮棋子盘面 L≈200~230。
+   * 而任何局面下空格都占多数（90 格最多 32 子，中局更少），所以 meanL 的中位数
+   * 一定落在「棋盘底色」那一峰上 —— 拿它当基准，上下各放一个由 MAD 自适应的裕度，
+   * 偏离裕度就是有子。整套判据不含任何绝对颜色值，换皮肤、调亮度都不用重标。
+   */
+  calibrateBoardLevel(stats) {
+    const ls = [];
+    for (let i = 0; i < stats.length; i++) {
+      const s = stats[i];
+      if (s && s.n > 0 && s.meanL > 0) ls.push(s.meanL);
+    }
+    if (ls.length < 20) return null;
+    ls.sort((a, b) => a - b);
+    const med = ls[ls.length >> 1];
+    const dev = ls.map(v => Math.abs(v - med)).sort((a, b) => a - b);
+    const mad = dev[dev.length >> 1] || 0;
+    // 木纹起伏大时自动放宽；同时保底 16/18 的绝对余量，
+    // 免得低对比皮肤把「棋盘格自己」判成棋子。
+    const hiTh = med + Math.max(16, 3 * mad);
+    const loTh = med - Math.max(18, 3 * mad);
+    return { boardL: med, mad: mad, hiTh: hiTh, loTh: loTh, levelN: ls.length };
   }
 
   /**
@@ -1656,8 +1698,17 @@ class BoardRecognizer {
     }
     const warmRatio = warmCount / (validCount || PW);
 
-    // 暖色像素占比太低 → 一定是空棋盘，直接判空
-    if (warmRatio < 0.18) return { key: 'E', score: warmRatio, warmRatio };
+    /* 2.1.57：空格预筛改用亮度。
+       warmRatio 在木色棋盘上恒约 0.8（木色 R-B=87 也算暖），原来这条 0.18 的
+       判断一次都不会命中，空格照样全部进模板比对 —— 这是「81 格有子」的另一半原因。 */
+    const bgm = this.bgModel;
+    if (bgm && typeof bgm.hiTh === 'number' && typeof bgm.loTh === 'number') {
+      const Lc = stats.meanL || 0;
+      if (Lc <= bgm.hiTh && Lc >= bgm.loTh) return { key: 'E', score: 0, warmRatio };
+    } else if (warmRatio < 0.18) {
+      // 没有 boardLevel 模型时退回旧判据
+      return { key: 'E', score: warmRatio, warmRatio };
+    }
 
     const n = PW;
     // 按像素有效性过滤后的权重：高亮圈 / 绿点 / 白边占掉的格直接不参与比对
@@ -1785,6 +1836,9 @@ class BoardRecognizer {
     const margins = new Float32Array(90);
     let hiddenCount = 0;
     let tplFail = 0;
+    // 有亮度三峰模型就优先用它判「有没有子」（2.1.57）
+    const bgT = this.bgModel;
+    const lvOK = !!(bgT && typeof bgT.hiTh === 'number' && typeof bgT.loTh === 'number');
 
     for (let sq = 0; sq < 90; sq++) {
       const s = stats[sq];
@@ -1805,7 +1859,13 @@ class BoardRecognizer {
       //   这条路走不通，直接去掉：格子一律按正常流程识别。
 
       const hasInk = (inkR >= inkTh);
-      const hasFace = (warmR >= 0.28);
+      /* 2.1.57：盘面判据换成「偏离棋盘底色亮度」。
+         原来 hasFace = warmR >= 0.28，而木色棋盘 warmR≈0.8 —— 空格全过这一关，
+         只能靠下面 score<0.10 兜底；一旦模板与真机像素不同源（当前正是如此），
+         score 恒 0，整盘棋子被丢空，verifyDiff 恰好等于开局子数。 */
+      const hasFace = lvOK
+        ? ((s.meanL > bgT.hiTh) || (s.meanL < bgT.loTh))
+        : (warmR >= 0.28);
       if (!hasInk && !hasFace) {
         grid[sq] = EMPTY;
         codes[sq] = 0;
@@ -2031,6 +2091,8 @@ class BoardRecognizer {
 
     const bg = this.bgModel;
     const warmTh = bg && typeof bg.warmThreshold === 'number' ? bg.warmThreshold : o.warmTh;
+    // 有 boardLevel 模型就优先用亮度判占位（2.1.57 起）
+    const lvOK = !!(bg && typeof bg.hiTh === 'number' && typeof bg.loTh === 'number');
 
     const grid = new Int8Array(90);
     const conf = new Float32Array(90);
@@ -2047,9 +2109,21 @@ class BoardRecognizer {
       const hasInkStats = typeof s.inkR === 'number';
 
       // 暖色 / 大片暗色只说明「有东西」，还要有墨迹才认作棋子（挡住木色背景）
-      const occupied = (warmR >= warmTh || darkR >= o.darkFace) &&
-        (inkR >= o.inkMin || darkR >= o.darkMin || redInkR >= o.redInkMin);
-      conf[sq] = warmTh > 0 ? warmR / warmTh : 0;
+      /* 2.1.57：占位判据换成「偏离棋盘底色亮度」（真机日志推翻暖色判据的证据见
+         calibrateBoardLevel 的注释）。暖色通道在木色棋盘上恒为真，交叉点网格线
+         又给出 inkR，两个条件一起把空格整片判成棋子 —— 真机 81/90 格有子。 */
+      let occupied;
+      if (lvOK) {
+        occupied = (s.meanL > bg.hiTh) || (s.meanL < bg.loTh);
+        const dHi = (s.meanL - bg.hiTh) / Math.max(1, bg.hiTh - bg.boardL);
+        const dLo = (bg.loTh - s.meanL) / Math.max(1, bg.boardL - bg.loTh);
+        conf[sq] = dHi > dLo ? dHi : dLo;
+        if (conf[sq] < 0) conf[sq] = 0;
+      } else {
+        occupied = (warmR >= warmTh || darkR >= o.darkFace) &&
+          (inkR >= o.inkMin || darkR >= o.darkMin || redInkR >= o.redInkMin);
+        conf[sq] = warmTh > 0 ? warmR / warmTh : 0;
+      }
       if (!occupied) { grid[sq] = EMPTY; continue; }
 
       const isRed = hasInkStats
