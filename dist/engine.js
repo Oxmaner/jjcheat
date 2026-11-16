@@ -1,7 +1,7 @@
 /* ============================================================
  *  JJ象棋 辅助引擎内核 —— 单文件打包
  *  目标运行环境: iOS JavaScriptCore / Node / 浏览器
- *  生成时间: 2026-10-30T10:54:04.207Z
+ *  生成时间: 2026-11-16T03:29:48.806Z
  *  模块数: 9
  * ============================================================ */
 (function (global) {
@@ -1790,6 +1790,16 @@ const PATCH_W = 24;
 const EMPTY = 0;
 const RED_PC = 1;
 const BLK_PC = 2;
+
+/** 颜色兜底判据（无模板时的三分类 / learnBoard 判朝向）。
+ *  红黑一律比较「红墨 vs 黑墨」，不用红色占比 redR：
+ *  redR 判据 (R>85 && R-G>45 && R-B>45) 会把木色背景里的偏红像素算成红，
+ *  真机上出现过顶行 9 个黑子被判成红子（topRed=9 / topBlack=0）。 */
+const COLOR_INK_MIN = 0.05;        // 有子所需的最小墨迹占比
+const COLOR_DARK_MIN = 0.20;       // 暗色棋子所需的最小暗像素占比
+const COLOR_DARK_FACE = 0.45;      // 纯黑子暖色低，靠暗像素占比认定有子
+const COLOR_RED_INK_MIN = 0.01;    // 红墨绝对下限，防噪点误判
+const COLOR_RED_INK_RATIO = 0.30;  // 红墨 / 黑墨 的最小比值
 
 /** 三线性透视变换：由四角求任意 (u,v) 的图像坐标 */
 function bilinear(p00, p10, p11, p01, u, v) {
@@ -3707,14 +3717,21 @@ class BoardRecognizer {
   }
 
   /**
-   * 颜色版三分类（仅在还没采到模板时使用）
-   * 有子：暖色度（棋子棕黄、棋盘灰绿）
-   * 红黑：只看红色占比（黑字永远不发红）
+   * 颜色版三分类（无模板兜底 + learnBoard 判朝向）。
+   *
+   * 有子：暖色盘面或大片暗色，且必须真的有墨迹 / 暗像素 —— 纯木色背景判空。
+   * 红黑：比较红墨与黑墨占比；旧版用红色占比 redR，木色偏红像素会把黑子判成红子。
+   * 老 stats 没有墨迹字段时，才退回 redR 阈值，保持向后兼容。
    */
   classifyByColor(stats, opts) {
     const o = Object.assign({
       warmTh: 0.20,
       redTh: 0.012,
+      inkMin: COLOR_INK_MIN,
+      darkMin: COLOR_DARK_MIN,
+      darkFace: COLOR_DARK_FACE,
+      redInkMin: COLOR_RED_INK_MIN,
+      redInkRatio: COLOR_RED_INK_RATIO,
     }, opts || {});
 
     const bg = this.bgModel;
@@ -3726,10 +3743,24 @@ class BoardRecognizer {
     for (let sq = 0; sq < 90; sq++) {
       const s = stats[sq];
       if (!s || s.n === 0) { grid[sq] = EMPTY; continue; }
-      const occupied = s.warmR >= warmTh;
-      conf[sq] = warmTh > 0 ? s.warmR / warmTh : 0;
+
+      const warmR = s.warmR || 0;
+      const darkR = s.darkR || 0;
+      const inkR = typeof s.inkR === 'number' ? s.inkR : 0;
+      const redInkR = typeof s.redInkR === 'number' ? s.redInkR : 0;
+      const darkInkR = typeof s.darkInkR === 'number' ? s.darkInkR : 0;
+      const hasInkStats = typeof s.inkR === 'number';
+
+      // 暖色 / 大片暗色只说明「有东西」，还要有墨迹才认作棋子（挡住木色背景）
+      const occupied = (warmR >= warmTh || darkR >= o.darkFace) &&
+        (inkR >= o.inkMin || darkR >= o.darkMin || redInkR >= o.redInkMin);
+      conf[sq] = warmTh > 0 ? warmR / warmTh : 0;
       if (!occupied) { grid[sq] = EMPTY; continue; }
-      grid[sq] = (s.redR > o.redTh) ? RED_PC : BLK_PC;
+
+      const isRed = hasInkStats
+        ? (redInkR > o.redInkMin && redInkR > darkInkR * o.redInkRatio)
+        : ((s.redR || 0) > o.redTh);
+      grid[sq] = isRed ? RED_PC : BLK_PC;
     }
     return { grid, conf };
   }
@@ -4352,6 +4383,38 @@ var JJEngine = {
     }
     var ok = (verifyDiff <= 8);
 
+    // ---- 诊断：verifyDiff 到底错在哪几格 ----
+    // 只改 engine.js 就能生效（App 容器里的那份可热替换），不用重新编译 dylib。
+    // mismatch 格式 "格号:识别值/开局应有值"，用来区分「判空」「红黑反」「兵种错」。
+    var gotCodes = clsV && clsV.codes ? clsV.codes : null;
+    var chkCodes = gotCodes ? (flipped ? flipCodes(gotCodes) : gotCodes) : null;
+    var mismatch = [];
+    if (chkCodes) {
+      for (var mi = 0; mi < 90; mi++) {
+        if (chkCodes[mi] !== startMap[mi]) mismatch.push(mi + ':' + chkCodes[mi] + '/' + startMap[mi]);
+      }
+    }
+    var gotFen = chkCodes ? codesToBoardFen(chkCodes) : '';
+    var redN = 0, blkN = 0;
+    if (gotCodes) {
+      for (var ci = 0; ci < 90; ci++) {
+        var cv = gotCodes[ci];
+        if (cv >= 1 && cv <= 7) redN++; else if (cv >= 8) blkN++;
+      }
+    }
+    /** 某一行 9 格的像素特征均值：区分「采样网格偏了」和「颜色判据错」 */
+    function rowProbe(row) {
+      var sum = { warm: 0, red: 0, dark: 0, ink: 0, redInk: 0, darkInk: 0 };
+      for (var c2 = 0; c2 < 9; c2++) {
+        var st = stats[row * 9 + c2];
+        if (!st) continue;
+        sum.warm += st.warmR || 0; sum.red += st.redR || 0; sum.dark += st.darkR || 0;
+        sum.ink += st.inkR || 0; sum.redInk += st.redInkR || 0; sum.darkInk += st.darkInkR || 0;
+      }
+      for (var k in sum) sum[k] = Math.round(sum[k] / 9 * 1000) / 1000;
+      return sum;
+    }
+
     var learned = session.recognizer.bgModel ? 1 : 0;
     var warmTh = session.recognizer.bgModel ? session.recognizer.bgModel.warmThreshold : -1;
 
@@ -4369,7 +4432,14 @@ var JJEngine = {
       bottomRed: bRed,
       bottomBlack: bBlk,
       topRed: tRed,
-      topBlack: tBlk
+      topBlack: tBlk,
+      gotFen: gotFen,
+      redN: redN,
+      blkN: blkN,
+      mismatchCount: mismatch.length,
+      mismatch: mismatch.join(' '),
+      topProbe: rowProbe(0),
+      bottomProbe: rowProbe(9)
     };
   },
 

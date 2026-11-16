@@ -22,6 +22,16 @@ const EMPTY = 0;
 const RED_PC = 1;
 const BLK_PC = 2;
 
+/** 颜色兜底判据（无模板时的三分类 / learnBoard 判朝向）。
+ *  红黑一律比较「红墨 vs 黑墨」，不用红色占比 redR：
+ *  redR 判据 (R>85 && R-G>45 && R-B>45) 会把木色背景里的偏红像素算成红，
+ *  真机上出现过顶行 9 个黑子被判成红子（topRed=9 / topBlack=0）。 */
+const COLOR_INK_MIN = 0.05;        // 有子所需的最小墨迹占比
+const COLOR_DARK_MIN = 0.20;       // 暗色棋子所需的最小暗像素占比
+const COLOR_DARK_FACE = 0.45;      // 纯黑子暖色低，靠暗像素占比认定有子
+const COLOR_RED_INK_MIN = 0.01;    // 红墨绝对下限，防噪点误判
+const COLOR_RED_INK_RATIO = 0.30;  // 红墨 / 黑墨 的最小比值
+
 /** 三线性透视变换：由四角求任意 (u,v) 的图像坐标 */
 function bilinear(p00, p10, p11, p01, u, v) {
   const a = (1 - u) * (1 - v), b = u * (1 - v), c = u * v, d = (1 - u) * v;
@@ -1938,14 +1948,21 @@ class BoardRecognizer {
   }
 
   /**
-   * 颜色版三分类（仅在还没采到模板时使用）
-   * 有子：暖色度（棋子棕黄、棋盘灰绿）
-   * 红黑：只看红色占比（黑字永远不发红）
+   * 颜色版三分类（无模板兜底 + learnBoard 判朝向）。
+   *
+   * 有子：暖色盘面或大片暗色，且必须真的有墨迹 / 暗像素 —— 纯木色背景判空。
+   * 红黑：比较红墨与黑墨占比；旧版用红色占比 redR，木色偏红像素会把黑子判成红子。
+   * 老 stats 没有墨迹字段时，才退回 redR 阈值，保持向后兼容。
    */
   classifyByColor(stats, opts) {
     const o = Object.assign({
       warmTh: 0.20,
       redTh: 0.012,
+      inkMin: COLOR_INK_MIN,
+      darkMin: COLOR_DARK_MIN,
+      darkFace: COLOR_DARK_FACE,
+      redInkMin: COLOR_RED_INK_MIN,
+      redInkRatio: COLOR_RED_INK_RATIO,
     }, opts || {});
 
     const bg = this.bgModel;
@@ -1957,10 +1974,24 @@ class BoardRecognizer {
     for (let sq = 0; sq < 90; sq++) {
       const s = stats[sq];
       if (!s || s.n === 0) { grid[sq] = EMPTY; continue; }
-      const occupied = s.warmR >= warmTh;
-      conf[sq] = warmTh > 0 ? s.warmR / warmTh : 0;
+
+      const warmR = s.warmR || 0;
+      const darkR = s.darkR || 0;
+      const inkR = typeof s.inkR === 'number' ? s.inkR : 0;
+      const redInkR = typeof s.redInkR === 'number' ? s.redInkR : 0;
+      const darkInkR = typeof s.darkInkR === 'number' ? s.darkInkR : 0;
+      const hasInkStats = typeof s.inkR === 'number';
+
+      // 暖色 / 大片暗色只说明「有东西」，还要有墨迹才认作棋子（挡住木色背景）
+      const occupied = (warmR >= warmTh || darkR >= o.darkFace) &&
+        (inkR >= o.inkMin || darkR >= o.darkMin || redInkR >= o.redInkMin);
+      conf[sq] = warmTh > 0 ? warmR / warmTh : 0;
       if (!occupied) { grid[sq] = EMPTY; continue; }
-      grid[sq] = (s.redR > o.redTh) ? RED_PC : BLK_PC;
+
+      const isRed = hasInkStats
+        ? (redInkR > o.redInkMin && redInkR > darkInkR * o.redInkRatio)
+        : ((s.redR || 0) > o.redTh);
+      grid[sq] = isRed ? RED_PC : BLK_PC;
     }
     return { grid, conf };
   }

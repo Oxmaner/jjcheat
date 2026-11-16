@@ -382,6 +382,38 @@ var JJEngine = {
     }
     var ok = (verifyDiff <= 8);
 
+    // ---- 诊断：verifyDiff 到底错在哪几格 ----
+    // 只改 engine.js 就能生效（App 容器里的那份可热替换），不用重新编译 dylib。
+    // mismatch 格式 "格号:识别值/开局应有值"，用来区分「判空」「红黑反」「兵种错」。
+    var gotCodes = clsV && clsV.codes ? clsV.codes : null;
+    var chkCodes = gotCodes ? (flipped ? flipCodes(gotCodes) : gotCodes) : null;
+    var mismatch = [];
+    if (chkCodes) {
+      for (var mi = 0; mi < 90; mi++) {
+        if (chkCodes[mi] !== startMap[mi]) mismatch.push(mi + ':' + chkCodes[mi] + '/' + startMap[mi]);
+      }
+    }
+    var gotFen = chkCodes ? codesToBoardFen(chkCodes) : '';
+    var redN = 0, blkN = 0;
+    if (gotCodes) {
+      for (var ci = 0; ci < 90; ci++) {
+        var cv = gotCodes[ci];
+        if (cv >= 1 && cv <= 7) redN++; else if (cv >= 8) blkN++;
+      }
+    }
+    /** 某一行 9 格的像素特征均值：区分「采样网格偏了」和「颜色判据错」 */
+    function rowProbe(row) {
+      var sum = { warm: 0, red: 0, dark: 0, ink: 0, redInk: 0, darkInk: 0 };
+      for (var c2 = 0; c2 < 9; c2++) {
+        var st = stats[row * 9 + c2];
+        if (!st) continue;
+        sum.warm += st.warmR || 0; sum.red += st.redR || 0; sum.dark += st.darkR || 0;
+        sum.ink += st.inkR || 0; sum.redInk += st.redInkR || 0; sum.darkInk += st.darkInkR || 0;
+      }
+      for (var k in sum) sum[k] = Math.round(sum[k] / 9 * 1000) / 1000;
+      return sum;
+    }
+
     var learned = session.recognizer.bgModel ? 1 : 0;
     var warmTh = session.recognizer.bgModel ? session.recognizer.bgModel.warmThreshold : -1;
 
@@ -399,7 +431,14 @@ var JJEngine = {
       bottomRed: bRed,
       bottomBlack: bBlk,
       topRed: tRed,
-      topBlack: tBlk
+      topBlack: tBlk,
+      gotFen: gotFen,
+      redN: redN,
+      blkN: blkN,
+      mismatchCount: mismatch.length,
+      mismatch: mismatch.join(' '),
+      topProbe: rowProbe(0),
+      bottomProbe: rowProbe(9)
     };
   },
 
