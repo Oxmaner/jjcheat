@@ -121,6 +121,10 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
 @property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *pointCorners;
 @property (nonatomic, assign) int lastFrameW;
 @property (nonatomic, assign) int lastFrameH;
+/* 自动微调只做一次；dx/dy 是最终采用的像素偏移 */
+@property (nonatomic, assign) BOOL refineDone;
+@property (nonatomic, assign) int refineDx;
+@property (nonatomic, assign) int refineDy;
 @end
 
 @implementation JJController
@@ -251,6 +255,9 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     self.pointCorners = saved;   // 原始 point 坐标，抓帧尺寸确定后按比例现算
     self.lastFrameW = 0;
     self.lastFrameH = 0;
+    self.refineDone = NO;
+    self.refineDx = 0;
+    self.refineDy = 0;
     [[JJEngineBridge shared] setCorners:pxCorners];
     [[JJEngineBridge shared] resetWithFen:nil];
     self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
@@ -294,57 +301,113 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
    手指点四点很难精确到 1/5 格，偏一点 90 个采样点就整体错位（表现为顶/底行全判成同色、
    verifyDiff 卡在十几二十）。这里以当前标定为基准，在 ±30px 内粗搜再细搜，
    用引擎自己的 verifyDiff 当目标函数挑最优偏移。只做一次。 */
+/* 标准开局 32 个有子位置（90 格索引：r*9+c） */
+static const int kStartPieceSq[32] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8,        /* 黑方底线 */
+    19, 25,                            /* 黑炮 r=2,c=1/7 */
+    27, 29, 31, 33, 35,                /* 黑兵 r=3,c=0/2/4/6/8 */
+    81, 82, 83, 84, 85, 86, 87, 88, 89,/* 红方底线 */
+    64, 70,                            /* 红炮 r=7,c=1/7 */
+    54, 56, 58, 60, 62                 /* 红兵 r=6,c=0/2/4/6/8 */
+};
+
+static BOOL JJSqIsStartPiece(int sq) {
+    for (int i = 0; i < 32; i++) if (kStartPieceSq[i] == sq) return YES;
+    return NO;
+}
+
+/* 四角双线性插值，和引擎里 gridPoints 的算法一致 */
+static CGPoint JJGridPt(NSArray *corners, int r, int c, int dx, int dy) {
+    double u = (double)c / 8.0;
+    double v = (double)r / 9.0;
+    double x00 = [corners[0][0] doubleValue], y00 = [corners[0][1] doubleValue];
+    double x08 = [corners[1][0] doubleValue], y08 = [corners[1][1] doubleValue];
+    double x89 = [corners[2][0] doubleValue], y89 = [corners[2][1] doubleValue];
+    double x80 = [corners[3][0] doubleValue], y80 = [corners[3][1] doubleValue];
+    double x = (1 - u) * (1 - v) * x00 + u * (1 - v) * x08 + u * v * x89 + (1 - u) * v * x80;
+    double y = (1 - u) * (1 - v) * y00 + u * (1 - v) * y08 + u * v * y89 + (1 - u) * v * y80;
+    return CGPointMake(x + dx, y + dy);
+}
+
+/* 纯内存评分：棋子位置的颜色与背景差异，应显著大于空位。
+   不调引擎，74 次候选也就几千次取色，毫秒级，不会卡主线程。 */
+static double JJOffsetScore(NSData *rgba, int w, int h, NSArray *corners, int dx, int dy) {
+    const uint8_t *px = (const uint8_t *)rgba.bytes;
+    NSUInteger len = rgba.length;
+    if (!px || w <= 0 || h <= 0) return -1e9;
+
+    /* 背景参考：中宫四周几个点（那里开局一定是空的） */
+    static const int refs[4][2] = { {4, 4}, {5, 4}, {4, 3}, {5, 3} };
+    double br = 0, bg = 0, bb = 0;
+    int bn = 0;
+    for (int i = 0; i < 4; i++) {
+        CGPoint p = JJGridPt(corners, refs[i][0], refs[i][1], dx, dy);
+        int x = (int)lround(p.x), y = (int)lround(p.y);
+        if (x < 0 || y < 0 || x >= w || y >= h) continue;
+        NSUInteger o = ((NSUInteger)y * (NSUInteger)w + (NSUInteger)x) * 4;
+        if (o + 2 >= len) continue;
+        br += px[o]; bg += px[o + 1]; bb += px[o + 2];
+        bn++;
+    }
+    if (bn == 0) return -1e9;
+    br /= bn; bg /= bn; bb /= bn;
+
+    double pieceSum = 0, emptySum = 0;
+    int pieceCnt = 0, emptyCnt = 0;
+    for (int r = 0; r < 10; r++) {
+        for (int c = 0; c < 9; c++) {
+            CGPoint p = JJGridPt(corners, r, c, dx, dy);
+            int x = (int)lround(p.x), y = (int)lround(p.y);
+            if (x < 0 || y < 0 || x >= w || y >= h) continue;
+            NSUInteger o = ((NSUInteger)y * (NSUInteger)w + (NSUInteger)x) * 4;
+            if (o + 2 >= len) continue;
+            double d = fabs(px[o] - br) + fabs(px[o + 1] - bg) + fabs(px[o + 2] - bb);
+            if (JJSqIsStartPiece(r * 9 + c)) { pieceSum += d; pieceCnt++; }
+            else { emptySum += d; emptyCnt++; }
+        }
+    }
+    if (pieceCnt == 0 || emptyCnt == 0) return -1e9;
+    return (pieceSum / pieceCnt) - (emptySum / emptyCnt);
+}
+
+/* 学习：第一次用纯内存评分搜一次偏移，之后固定用这个偏移。
+   绝不在这里反复调引擎 —— 之前每 tick 74 次 dispatch_sync 直接把主线程堵死了。 */
 - (NSDictionary *)learnWithAutoRefine:(NSData *)rgba width:(int)w height:(int)h {
     NSArray *base = [self cornersForWidth:w height:h];
     if (!base) {
         return [[JJEngineBridge shared] learnBoardWithPixels:rgba width:w height:h];
     }
 
-    __block NSInteger bestDiff = NSIntegerMax;
-    __block NSArray *bestCorners = base;
-    __block int bestDx = 0;
-    __block int bestDy = 0;
-    __block NSDictionary *bestInfo = nil;
+    if (!self.refineDone) {
+        self.refineDone = YES;
 
-    void (^tryOffset)(int, int) = ^(int dx, int dy) {
-        NSMutableArray *c = [NSMutableArray arrayWithCapacity:4];
-        for (NSArray *p in base) {
-            [c addObject:@[@([p[0] doubleValue] + dx), @([p[1] doubleValue] + dy)]];
+        double bestScore = -1e9;
+        int bdx = 0, bdy = 0;
+        for (int dy = -30; dy <= 30; dy += 10) {
+            for (int dx = -30; dx <= 30; dx += 10) {
+                double sc = JJOffsetScore(rgba, w, h, base, dx, dy);
+                if (sc > bestScore) { bestScore = sc; bdx = dx; bdy = dy; }
+            }
         }
-        [[JJEngineBridge shared] setCorners:c];
-        NSDictionary *info = [[JJEngineBridge shared] learnBoardWithPixels:rgba width:w height:h];
-        NSInteger diff = [info[@"verifyDiff"] integerValue];
-        if (diff < bestDiff) {
-            bestDiff = diff;
-            bestCorners = c;
-            bestDx = dx;
-            bestDy = dy;
-            bestInfo = info;
+        int cx = bdx, cy = bdy;
+        for (int dy = cy - 8; dy <= cy + 8; dy += 4) {
+            for (int dx = cx - 8; dx <= cx + 8; dx += 4) {
+                double sc = JJOffsetScore(rgba, w, h, base, dx, dy);
+                if (sc > bestScore) { bestScore = sc; bdx = dx; bdy = dy; }
+            }
         }
-    };
 
-    /* 粗搜：±30，步长 10 */
-    for (int dy = -30; dy <= 30; dy += 10) {
-        for (int dx = -30; dx <= 30; dx += 10) {
-            tryOffset(dx, dy);
-        }
-    }
-    /* 细搜：粗搜最优点附近 ±8，步长 4 */
-    int cx = bestDx, cy = bestDy;
-    for (int dy = cy - 8; dy <= cy + 8; dy += 4) {
-        for (int dx = cx - 8; dx <= cx + 8; dx += 4) {
-            tryOffset(dx, dy);
-        }
+        self.refineDx = bdx;
+        self.refineDy = bdy;
+        NSLog(@"[JJCheat] 标定微调：dx=%d dy=%d score=%.1f", bdx, bdy, bestScore);
     }
 
-    [[JJEngineBridge shared] setCorners:bestCorners];
-    NSDictionary *final = [[JJEngineBridge shared] learnBoardWithPixels:rgba width:w height:h];
-    NSLog(@"[JJCheat] 标定微调：最优偏移 dx=%d dy=%d，verifyDiff %ld → %@",
-          bestDx, bestDy, (long)[bestInfo[@"verifyDiff"] integerValue], final[@"verifyDiff"]);
-    self.lastFrameW = 0;   /* 让下一帧按新 corners 重算 gridPoints */
-    self.lastFrameH = 0;
-    self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
-    return final;
+    NSMutableArray *c = [NSMutableArray arrayWithCapacity:4];
+    for (NSArray *p in base) {
+        [c addObject:@[@([p[0] doubleValue] + self.refineDx), @([p[1] doubleValue] + self.refineDy)]];
+    }
+    [[JJEngineBridge shared] setCorners:c];
+    return [[JJEngineBridge shared] learnBoardWithPixels:rgba width:w height:h];
 }
 
 - (void)applyCornersForFrameWidth:(int)w height:(int)h {
