@@ -24,6 +24,29 @@ if [ -f "$OLD_PIKA" ]; then
     rm -f "$OLD_PIKA" && echo "[JJCheat] postinst: 已移除旧版独立引擎可执行文件"
 fi
 
+# ---- 2.1.58 历史版本残留清扫 -------------------------------------------
+# ① 2.1.50/2.1.51 往 App 数据容器里拷过的 pikafish 可执行文件
+#    （当时以为容器副本能 exec；沙盒 EPERM 后已成废文件，白占 800KB）
+CONT_BASE="/var/mobile/Containers/Data/Application"
+find "$CONT_BASE" -type f -name "pikafish" 2>/dev/null | while read -r f; do
+    rm -f "$f" && echo "[JJCheat] postinst: 清除容器残留 $f"
+done
+# ② 1.x jjcheat-fix 写进 .app 包的 engine.js（破坏代码签名，且会被
+#    VisionBridge 的兜底候选误读）；只删内容带我们标记的，绝不碰别人的文件
+for app in /var/containers/Bundle/Application/*/*.app; do
+    [ -d "$app" ] || continue
+    t="$app/engine.js"
+    [ -f "$t" ] || continue
+    if grep -qE "JJCheat|jjcheat|alphaBeta" "$t" 2>/dev/null; then
+        rm -f "$t" && echo "[JJCheat] postinst: 清除 1.x 包内残留 $t"
+    fi
+done
+# ③ 1.x 在容器里留过的 engine.js 备份
+find "$CONT_BASE" -type f -name "engine.js.bak*" 2>/dev/null | while read -r f; do
+    rm -f "$f" && echo "[JJCheat] postinst: 清除旧备份 $f"
+done
+# ------------------------------------------------------------------------
+
 if [ -f "$NET" ]; then
     chmod 0644 "$NET" 2>/dev/null
     chown 0:0 "$NET" 2>/dev/null

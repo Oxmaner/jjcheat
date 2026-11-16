@@ -642,6 +642,14 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
         NSLog(@"[JJCheat] 模板自举 尝试=%@ 占位差=%@ 成功=%@ 模板数=%@",
               info[@"bootTried"] ?: @"-", info[@"bootOccDiff"] ?: @"-",
               info[@"bootMade"] ?: @"-", info[@"tplCount"] ?: @"-");
+        /* 2.1.58：开局匹配滤波对齐。命中=开局 32 位里偏离棋盘亮度的格数，
+           原命中=对齐前恒等网格的命中数。手指点四角误差 ±30px 会让采样窗
+           只擦到棋子边缘 → 32 子全判空（2.1.57 根因），对齐就是治这个的。 */
+        NSLog(@"[JJCheat] 格点对齐 采纳=%@ 命中=%@/32 空格误报=%@ 原命中=%@ 平移=%@,%@ 缩放=%@,%@",
+              info[@"alignAccepted"] ?: @"-", info[@"alignOccHit"] ?: @"-",
+              info[@"alignEmptyHit"] ?: @"-", info[@"alignIdOccHit"] ?: @"-",
+              info[@"alignShiftX"] ?: @"-", info[@"alignShiftY"] ?: @"-",
+              info[@"alignScaleX"] ?: @"-", info[@"alignScaleY"] ?: @"-");
         NSLog(@"[JJCheat] 墨迹图 i=%@", info[@"diagI"] ?: @"-");
         NSLog(@"[JJCheat] 暖色图 w=%@", info[@"diagW"] ?: @"-");
         NSLog(@"[JJCheat] 亮度图 l=%@（36 进制，一位 = L/10）", info[@"diagL"] ?: @"-");
@@ -667,7 +675,16 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
             }
             return;
         }
-        [[JJHUDWindow shared] showStatus:@"学习未完成 · 请停在【开局】棋盘画面"];
+        /* 对齐都说画面里没几个子 → 十有八九停错了画面（大厅/结算/没进对局），
+           提示要具体，别再让用户以为「学习又失败了」。 */
+        {
+            NSInteger alignOcc = [info[@"alignOccHit"] integerValue];
+            if (alignOcc >= 0 && alignOcc < 10) {
+                [[JJHUDWindow shared] showStatus:@"画面里没看到棋子 · 请停在【开局】棋盘"];
+            } else {
+                [[JJHUDWindow shared] showStatus:@"学习未完成 · 请停在【开局】棋盘画面"];
+            }
+        }
         return;
     }
 

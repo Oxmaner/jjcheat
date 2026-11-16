@@ -2235,9 +2235,207 @@ function findPipRect(pixels, w, h, pts) {
   return { x0: x0, y0: y0, x1: x1, y1: y1 };
 }
 
+/**
+ * ★ 2.1.58 开局匹配滤波网格对齐
+ *
+ * 【为什么需要】手动点四角天生 ±30px 手指误差（真机 20:06 标定四角的顶边
+ * 本身就带 35px 斜率），自动标定的 refineByPieces 用的「暖亮圆盘掩码」在木色
+ * 皮肤上整块棋盘都命中（R-B=87、L=189 全过），等于对噪声对齐。采样窗 radius≈48
+ * 中心一旦偏 20px+，patch 只擦到棋子边缘：亮度只被拉低 20~30，仍然落在
+ * 「空格区间」内 → 32 个子全被判空（真机 2.1.57：亮度图 90 格全 150~195、
+ * 判有子=0，而黑卒行的偶数列恰好一致偏暗 25 —— 就是擦边的痕迹）。
+ *
+ * 【做法】学习/标定永远发生在「标准开局画面」，32 个子的位置是已知的，
+ * 把它们当匹配滤波：网格候选（整体缩放 + 平移，再四角独立微调）逐个采样
+ * 90 个交叉点的 2×2 亮度，得分 = 32 个开局位偏离棋盘中位亮度的总量
+ * − 58 个空格位的偏离量 × 0.8，红/黑两个朝向取大。
+ *   黑子盘面 L≈33~100、红子中心（红字）L≈77 或盘面 L≈208+，个个远离
+ *   棋盘中位 L≈174；空格贴近中位。对齐正确时分数极高，
+ *   别的排布（中局、大厅木纹）很难冒充 —— 冒充不了就不采纳，宁可不动。
+ *
+ * 参考 64922/xiangqi-advisor：模板从开局帧现场裁的前提，正是
+ * 「标准开局恰好含全部棋子且位置已知」这个强先验。
+ *
+ * @returns {{accepted, corners, occHit, emptyHit, idOccHit, idEmptyHit,
+ *            score, idScore, shiftX, shiftY, scaleX, scaleY, already}|null}
+ */
+function alignGridToOpening(pixels, w, h, corners, openingIdx, emptyIdx) {
+  alignGridToOpening.lastDebug = null;
+  if (!pixels || w < 60 || h < 60 || !corners || corners.length !== 4) return null;
+  const op = Array.isArray(openingIdx) ? openingIdx : null;
+  const em = Array.isArray(emptyIdx) ? emptyIdx : null;
+  if (!op || !em || op.length < 24 || em.length < 40) return null;
+
+  // 90 个交叉点的归一化坐标（u=c/8, v=r/9，与 gridPoints 同参数化）
+  const UV = new Float32Array(180);
+  for (let r = 0; r < 10; r++) {
+    for (let c = 0; c < 9; c++) {
+      const i = (r * 9 + c) * 2;
+      UV[i] = c / 8;
+      UV[i + 1] = r / 9;
+    }
+  }
+  // 翻转坐标映射（红黑互换时的对应格）
+  const FLIP = new Int32Array(90);
+  for (let i = 0; i < 90; i++) FLIP[i] = (9 - ((i / 9) | 0)) * 9 + (8 - (i % 9));
+
+  /** 2×2 均值亮度。出界返回 -1（该候选直接作废） */
+  function probeL(x, y) {
+    const xi = x | 0, yi = y | 0;
+    if (xi < 1 || yi < 1 || xi + 1 >= w || yi + 1 >= h) return -1;
+    const r0 = (yi * w + xi) * 4, r1 = r0 + w * 4;
+    const a = pixels[r0], b = pixels[r0 + 1], c = pixels[r0 + 2];
+    const d = pixels[r0 + 4], e = pixels[r0 + 5], f = pixels[r0 + 6];
+    const g = pixels[r1], hh = pixels[r1 + 1], ii = pixels[r1 + 2];
+    const j = pixels[r1 + 4], k = pixels[r1 + 5], l = pixels[r1 + 6];
+    return (0.299 * (a + d + g + j) + 0.587 * (b + e + hh + k) + 0.114 * (c + f + ii + l)) * 0.25;
+  }
+
+  const dev = new Float32Array(90);
+  let med = 0;
+  let evals = 0;
+
+  /** 对一组四角打分；med 只在第一次（恒等网格）时从中位数求出 */
+  function evalCorners(cs) {
+    evals++;
+    const p00 = cs[0], p10 = cs[1], p11 = cs[2], p01 = cs[3];
+    for (let i = 0; i < 90; i++) {
+      const p = bilinear(p00, p10, p11, p01, UV[i * 2], UV[i * 2 + 1]);
+      const L = probeL(p[0], p[1]);
+      if (L < 0) return null;
+      dev[i] = L;
+    }
+    if (med <= 0) {
+      const sorted = Array.prototype.slice.call(dev).sort((a, b) => a - b);
+      med = sorted[45];
+      if (med <= 0) med = 1;
+    }
+    let best = null;
+    for (let f = 0; f < 2; f++) {
+      let s = 0, oh = 0, eh = 0;
+      for (let k2 = 0; k2 < op.length; k2++) {
+        const d = Math.min(150, Math.abs(dev[f ? FLIP[op[k2]] : op[k2]] - med));
+        s += d;
+        if (d > 25) oh++;
+      }
+      for (let k2 = 0; k2 < em.length; k2++) {
+        const d = Math.min(150, Math.abs(dev[f ? FLIP[em[k2]] : em[k2]] - med));
+        s -= 0.8 * d;
+        if (d > 25) eh++;
+      }
+      if (!best || s > best.s) best = { s: s, occHit: oh, emptyHit: eh, flip: f };
+    }
+    return best;
+  }
+
+  const idr = evalCorners(corners);
+  if (!idr) return null;
+  const idScore = idr.s;
+
+  // 恒等网格已经能看到 ≥22 个子 → 本来就对齐，别动四角
+  if (idr.occHit >= 22) {
+    alignGridToOpening.lastDebug = { already: 1, occHit: idr.occHit, evals: evals };
+    return {
+      accepted: false, already: true, corners: null,
+      occHit: idr.occHit, emptyHit: idr.emptyHit,
+      idOccHit: idr.occHit, idEmptyHit: idr.emptyHit,
+      score: idScore, idScore: idScore,
+      shiftX: 0, shiftY: 0, scaleX: 1, scaleY: 1, evals: evals
+    };
+  }
+
+  const cx = (corners[0][0] + corners[1][0] + corners[2][0] + corners[3][0]) / 4;
+  const cy = (corners[0][1] + corners[1][1] + corners[2][1] + corners[3][1]) / 4;
+  /** 整体缩放 + 平移（绕四角质心） */
+  function xform(ax, ay, dx, dy) {
+    return corners.map(p => [cx + (p[0] - cx) * ax + dx, cy + (p[1] - cy) * ay + dy]);
+  }
+
+  let bestP = { ax: 1, ay: 1, dx: 0, dy: 0 };
+  let bestR = idr;
+
+  // A. 平移粗扫（手指误差以平移为主，±32px 内先兜一圈）
+  for (const ddx of [-32, -16, 16, 32]) {
+    for (const ddy of [-32, -16, 0, 16, 32]) {
+      const r = evalCorners(xform(1, 1, ddx, ddy));
+      if (r && r.s > bestR.s) { bestR = r; bestP = { ax: 1, ay: 1, dx: ddx, dy: ddy }; }
+    }
+  }
+  for (const ddy of [-32, -16, 16, 32]) {
+    const r = evalCorners(xform(1, 1, 0, ddy));
+    if (r && r.s > bestR.s) { bestR = r; bestP = { ax: 1, ay: 1, dx: 0, dy: ddy }; }
+  }
+
+  // B. 坐标下降：缩放 ax/ay + 平移 dx/dy，步长逐层减半
+  let sScale = 0.02, sOff = 8;
+  for (let iter = 0; iter < 6; iter++) {
+    for (const key of ['ax', 'ay', 'dx', 'dy']) {
+      const step = (key === 'ax' || key === 'ay') ? sScale : sOff;
+      for (const sgn of [1, -1]) {
+        const cand = { ax: bestP.ax, ay: bestP.ay, dx: bestP.dx, dy: bestP.dy };
+        cand[key] += sgn * step;
+        if (cand.ax < 0.90 || cand.ax > 1.10 || cand.ay < 0.90 || cand.ay > 1.10) continue;
+        const r = evalCorners(xform(cand.ax, cand.ay, cand.dx, cand.dy));
+        if (r && r.s > bestR.s) { bestR = r; bestP = cand; }
+      }
+    }
+    sScale *= 0.5;
+    sOff = Math.max(1, sOff >> 1);
+  }
+
+  // C. 四角独立微调（手指点出来的四边形带斜率，统一缩放表达不了；
+  //    每个角在自己的 ±64px 邻域里贪心挪，两轮）
+  let curC = xform(bestP.ax, bestP.ay, bestP.dx, bestP.dy).map(p => [p[0], p[1]]);
+  const origC = curC.map(p => [p[0], p[1]]);
+  for (let round = 0; round < 3; round++) {
+    for (let ci = 0; ci < 4; ci++) {
+      for (let dim = 1; dim >= 0; dim--) {
+        for (const step of [24, 12, 6, 3]) {
+          let moved = false;
+          for (const sgn of [1, -1]) {
+            const cs = curC.map((p, k) => {
+              if (k !== ci) return [p[0], p[1]];
+              const np = dim ? [p[0], p[1] + sgn * step] : [p[0] + sgn * step, p[1]];
+              if (Math.abs(np[0] - origC[k][0]) > 64 || Math.abs(np[1] - origC[k][1]) > 64) {
+                return [p[0], p[1]];
+              }
+              return np;
+            });
+            const r = evalCorners(cs);
+            if (r && r.s > bestR.s) { bestR = r; curC = cs; moved = true; break; }
+          }
+          if (!moved) break;
+        }
+      }
+    }
+  }
+
+  // 采纳标准：命中明显变多（≥18/32 且比恒等多 ≥6）、空格误报受控、总分明显提升。
+  // 「宁缺毋滥」：中局/大厅画面凑不出这套分布，就什么都不改。
+  const accepted = bestR.s > idScore + 150 &&
+    bestR.occHit >= 18 &&
+    bestR.occHit >= idr.occHit + 6 &&
+    bestR.emptyHit <= 14;
+
+  alignGridToOpening.lastDebug = {
+    accepted: accepted ? 1 : 0, occHit: bestR.occHit, emptyHit: bestR.emptyHit,
+    idOccHit: idr.occHit, idEmptyHit: idr.emptyHit, evals: evals
+  };
+  return {
+    accepted: accepted, already: false,
+    corners: accepted ? curC.map(p => [p[0], p[1]]) : null,
+    occHit: bestR.occHit, emptyHit: bestR.emptyHit,
+    idOccHit: idr.occHit, idEmptyHit: idr.emptyHit,
+    score: bestR.s, idScore: idScore, flip: bestR.flip,
+    shiftX: bestP.dx, shiftY: bestP.dy,
+    scaleX: bestP.ax, scaleY: bestP.ay, evals: evals
+  };
+}
+
 module.exports = {
   BoardRecognizer, EMPTY, RED_PC, BLK_PC,
   bilinear, homography, applyH,
   autoDetectBoard, findEvenlySpacedPeaks,
-  refineByPieces, refineGrid, fitEvenLines, findPeaks1D, findPipRect, gridAlignScore
+  refineByPieces, refineGrid, fitEvenLines, findPeaks1D, findPipRect, gridAlignScore,
+  alignGridToOpening
 };

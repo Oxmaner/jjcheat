@@ -27,8 +27,9 @@
    1.1.44 = anchorCodes（开局锚定 + 一步棋状态机）；
    2.0.0  = waitingOpponent（红先黑后真实轮次 + 新局重锚 + 超时兜底）；
    2.0.1  = calibRejected（失败的重标定不污染已收敛会话）；
-   2.1.0  = pikafishNative（JS 只识别不搜索，搜索交给独立进程 Pikafish）。 */
-static NSString * const kJJEngineFeatureMark = @"pikafishNative2157";
+   2.1.0  = pikafishNative（JS 只识别不搜索，搜索交给独立进程 Pikafish）；
+   2.1.58 = alignGridToOpening（开局匹配滤波网格对齐）。 */
+static NSString * const kJJEngineFeatureMark = @"pikafishNative2158";
 
 // roothide 适配：jbroot 每次越狱都会换一个随机路径，必须在运行时解析。
 // 非 roothide 构建（rootful/rootless）不引这个头，避免多出 libroothide 依赖。

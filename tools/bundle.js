@@ -475,11 +475,10 @@ var session = {
 
 var JJEngine = {
   version: '2.1.0',
-  /* 2.1.56：契约标记带版本尾巴。
-     为什么必须变：JJVisionBridge 只在「容器里那份 engine.js 缺这个标记」时才覆盖升级，
-     标记不变 = 用户容器里 253886 字节的旧脚本永远不会被换掉，新识别逻辑根本跑不到。
-     新标记必须包含旧标记作为子串之外的前缀（旧脚本里没有 pikafishNative2156）。 */
-  featureMark: 'pikafishNative2157',
+  /* 2.1.58：开局匹配滤波对齐（alignGridToOpening）。标记必须变：
+     容器里那份 engine.js 只认「缺当前标记 → 覆盖升级」，标记不变 = 2.1.57
+     的旧脚本一直被用下去，新对齐逻辑根本跑不到。 */
+  featureMark: 'pikafishNative2158',
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
@@ -861,6 +860,40 @@ var JJEngine = {
     var base = (baseCorners && baseCorners.length === 4) ? baseCorners : null;
     if (base) JJEngine.setCorners(base);
 
+    /* ★ 2.1.58 开局匹配滤波对齐：先用「已知开局 32 个位置」对整帧像素反解真实网格，
+       再进入 refineGrid / learnBoard。
+       根因（真机 2.1.57 日志实锤）：手动四角天生 ±30px 手指误差，采样窗中心
+       偏 20px+ 后 patch 只擦到棋子边缘，亮度只被拉低 20~30、仍落在空格区间内
+       → 32 个子全判空（亮度图 90 格全 150~195、判有子=0）。
+       对齐用开局 32 位偏离棋盘中位的总量做匹配滤波，红黑两个朝向取大；
+       凑不出这套分布（中局/大厅）就什么都不改。 */
+    var alignR = null;
+    if (base && REC.alignGridToOpening) {
+      try {
+        var spmAl = TRK.startPieceMap();
+        var opAl = [], emAl = [];
+        for (var ai = 0; ai < 90; ai++) (spmAl[ai] ? opAl : emAl).push(ai);
+        alignR = REC.alignGridToOpening(pixels, w, h, base, opAl, emAl);
+        if (alignR && alignR.accepted && alignR.corners) {
+          base = alignR.corners.map(function (p) { return [p[0], p[1]]; });
+          JJEngine.setCorners(base);
+        }
+      } catch (eAl) { alignR = null; }
+    }
+    /** 把对齐诊断挂到返回值上（fast 路径与主路径共用） */
+    function alignFields(o) {
+      o.alignAccepted = alignR ? (alignR.accepted ? 1 : 0) : -1;
+      o.alignAlready = (alignR && alignR.already) ? 1 : 0;
+      o.alignOccHit = alignR ? alignR.occHit : -1;
+      o.alignEmptyHit = alignR ? alignR.emptyHit : -1;
+      o.alignIdOccHit = alignR ? alignR.idOccHit : -1;
+      o.alignShiftX = alignR ? Math.round(alignR.shiftX || 0) : 0;
+      o.alignShiftY = alignR ? Math.round(alignR.shiftY || 0) : 0;
+      o.alignScaleX = alignR ? Math.round((alignR.scaleX || 1) * 1000) / 1000 : 1;
+      o.alignScaleY = alignR ? Math.round((alignR.scaleY || 1) * 1000) / 1000 : 1;
+      return o;
+    }
+
     var refined = null, err = '', tried = 0;
     if (base) {
       tried = 1;
@@ -906,7 +939,7 @@ var JJEngine = {
         fast.refineCorners = refined;
         fast.finalCorners = refined;
         fast.refineError = err;
-        return fast;
+        return alignFields(fast);
       }
     }
 
@@ -932,7 +965,7 @@ var JJEngine = {
     out.refineCorners = refined || null;
     out.finalCorners = accepted ? refined : (base || session.corners || []);
     out.refineError = err;
-    return out;
+    return alignFields(out);
   },
 
   /** 清空学习结果，退回默认阈值模式（画面不是开局时的兜底） */
@@ -1021,6 +1054,30 @@ var JJEngine = {
   autoCalibrate: function (pixels, w, h) {
     var r = JJEngine.autoDetectBoard(pixels, w, h);
     if (!r) return { ok: false };
+    /* ★ 2.1.58 自动检测四角必须先过「开局匹配滤波」确认再落地。
+       refineByPieces 的暖亮圆盘掩码在木色皮肤上整块棋盘都命中
+       （R-B=87、L=189 全过），等于对噪声对齐 —— 以前直接 set + 持久化，
+       一组被木纹带歪的网格点会一直用到下次手动标定。
+       现在用已知开局 32 个位置复核：对不齐（或画面根本不是开局棋盘）
+       就拒绝，宁可让用户重试，也不落一组错点。 */
+    if (REC.alignGridToOpening) {
+      var spmAc = TRK.startPieceMap();
+      var opAc = [], emAc = [];
+      for (var ai = 0; ai < 90; ai++) (spmAc[ai] ? opAc : emAc).push(ai);
+      var alignAc = null;
+      try { alignAc = REC.alignGridToOpening(pixels, w, h, r, opAc, emAc); } catch (eAc) {}
+      if (alignAc) {
+        if (alignAc.accepted && alignAc.corners) {
+          JJEngine.setCorners(alignAc.corners);
+          return { ok: true, corners: alignAc.corners, align: alignAc };
+        }
+        if (alignAc.already) {
+          JJEngine.setCorners(r);
+          return { ok: true, corners: r, align: alignAc };
+        }
+        return { ok: false, reason: 'no_pieces', align: alignAc, corners: r };
+      }
+    }
     JJEngine.setCorners(r);
     return { ok: true, corners: r };
   },
