@@ -258,6 +258,42 @@ function codesLegal(codes) {
   return true;
 }
 
+/**
+ * 兵种配额裁剪（1.1.43）
+ *
+ * 真机 14:51 日志：开局只错了 4 个兵种（verifyDiff=4），其中一格把「马」认成
+ * 「卒」，黑卒变成 6 个 > LIM 的 5，codesLegal 就把整盘判非法 → legalNow=false
+ * → skipAnalyze=1 → 一条着法都出不来。少一个子可以忍，整盘作废不能忍。
+ * 做法：某一类棋子超额时，把该类里置信度最低的几格清成空格，让盘面重新合法。
+ *
+ * @param {Array|Int8Array} codes 90 格兵种编码
+ * @param {Array} conf 每格模板置信度（低的先清）
+ * @returns {{codes: Int8Array, repaired: number}}
+ */
+function repairCodesQuota(codes, conf) {
+  var LIM = [0, 1, 2, 2, 2, 2, 2, 5];   // 将 仕 相 马 车 炮 兵
+  var out = new Int8Array(90);
+  for (var i = 0; i < 90; i++) out[i] = codes[i] || 0;
+  var repaired = 0;
+  for (var side = 0; side < 2; side++) {
+    var base = side === 0 ? 1 : 8;
+    for (var t = 1; t <= 7; t++) {
+      var v = base + t - 1, list = [];
+      for (var sq = 0; sq < 90; sq++) {
+        if (out[sq] === v) list.push({ sq: sq, conf: conf ? (conf[sq] || 0) : 1 });
+      }
+      var excess = list.length - LIM[t];
+      if (excess <= 0) continue;
+      list.sort(function (a, b) { return a.conf - b.conf; });
+      for (var k = 0; k < excess; k++) {
+        out[list[k].sq] = 0;
+        repaired++;
+      }
+    }
+  }
+  return { codes: out, repaired: repaired };
+}
+
 /* ============================================================
  *  全局会话状态（单例）
  * ============================================================ */
@@ -859,6 +895,18 @@ var JJEngine = {
     if (cls.codes) cls.codes = mergedCodes;
     session.lowConfCount = lowConfCount;
 
+    // 1.1.43：裁掉超额的兵种，避免「一个兵种错 → 整盘判非法 → 永不出着法」。
+    // 必须在 detectOrientation / codesHash / rawFen 之前，让全链路用同一份 codes。
+    var quotaFix = { repaired: 0 };
+    if (cls.codes) {
+      quotaFix = repairCodesQuota(cls.codes, cls.conf);
+      cls.codes = quotaFix.codes;
+      mergedCodes = Array.prototype.slice.call(cls.codes);
+      if (cls.grid) {
+        for (var qz = 0; qz < 90; qz++) if (!cls.codes[qz]) cls.grid[qz] = 0;
+      }
+    }
+
     // 画面翻转时（用户执黑）翻回标准坐标，引擎内部一律「红在下」
     //
     // ★ 朝向改成每帧重判，不再只信 learnBoard 那一帧的结论。
@@ -980,7 +1028,7 @@ var JJEngine = {
     }
     // 要求连续 3 帧识别结果完全一致才认为局面定下来了。
     // 2 帧门槛太低：一次落子动画 + 高亮圈切换就能凑够两帧抖动。
-    var codesSettled = liveMode ? true : (session.codesStable >= 2);
+    var codesSettled = liveMode ? true : (session.codesStable >= 1);
 
     // 第一帧只要认出来就直接落地，不再等「3 帧完全一致」。
     //   之前一律要求 3 帧一致才更新，结果中途进对局时识别在两组结果之间抖
@@ -1006,6 +1054,15 @@ var JJEngine = {
       session.illegalStreak = 0;
       session.legalStreak = (session.legalStreak || 0) + 1;
     }
+
+    // 1.1.43：真机每帧间隔 7~9 秒（Metal 1s 节流 + process 0.8s + 未收敛退避 2.5s），
+    // 落子动画/计时器/高亮每帧都不同，「连续 N 帧完全一致」几乎凑不出来，
+    // 旧版因此让 codesOk 恒为 false、skipAnalyze 恒为 1，形成死锁。
+    // 对「距上次成功落地超过 2.5 秒的合法帧」无条件放行一次。
+    var latchNow = Date.now();
+    var latchTimeout = !session.lastFenUpdateTime ||
+                       (latchNow - session.lastFenUpdateTime > 2500);
+    if (!codesSettled && legalNow && latchTimeout) codesSettled = true;
 
     if (legalNow && (firstLatch || codesSettled) && cls.codes && codesUsable(cls.codes)) {
       // 两套 FEN，别再混用：
@@ -1078,20 +1135,26 @@ var JJEngine = {
     }
     out.codesValid = codesOk ? 1 : 0;
     out.codesSettled = codesSettled ? 1 : 0;
-    // 诊断：合法性闸门为什么没放行。识别错到红车 5 个、黑车 4 个时 codesLegal
-    // 会判 false，整盘被作废、拿开局 FEN 算棋，表现就是「对方走完不给提示」。
+    // 诊断：合法性闸门为什么没放行。1.1.42 只打印 illegalStreak / codesStable，
+    // 看不出 legalNow 到底是不是 0，14:51 日志因此误导了好几轮。
     out.legalNow = legalNow ? 1 : 0;
     out.illegalStreak = session.illegalStreak || 0;
     out.codesStableCount = session.codesStable || 0;
+    out.repairedCount = quotaFix.repaired;
+    out.flipped = session.flipped ? 1 : 0;
+    out.skipReason = 'none';
 
     // 2) 到了我方走 → 算棋
     // 【1.1.42 卡顿根因】识别没收敛时，旧逻辑仍会拿 session.tracker.fen（开局 FEN）
     // 跑一次 ENG.analyze；而 illegalStreak>12 又清掉 lastResult 强制重算，于是
-    // 盘面全空 / 满盘乱码时引擎队列永远满载。真机日志「识别未收敛」每 5.5s 一条，
-    // 恰好就是一次 process 的耗时。这里直接短路：一次搜索都不做，也不画过期箭头。
-    // 字符串 skipAnalyze 同时充当 dylib 判断容器 engine.js 版本的新标记。
-    if (!legalNow || !codesOk) {
+    // 盘面全空 / 满盘乱码时引擎队列永远满载。
+    // 【1.1.43 死锁根因】旧短路条件 (!legalNow || !codesOk) 把「只是等稳定」也
+    // 算进去：短路后 stableCodes / lastBoardFen 都不更新，识别永远收敛不了，
+    // 真机就表现为每帧 skipAnalyze=1、一条着法都不给。现在只有真正乱码
+    // （裁剪后仍非法 / 一子未认出）才短路；合法但等稳定时沿用上一合法局面算棋。
+    if (!legalNow || !cls.codes || !codesUsable(cls.codes)) {
       out.skipAnalyze = 1;
+      out.skipReason = !legalNow ? 'illegal' : 'empty';
       out.suggest = '';
       out.suggestChinese = '';
       out.from = -1;
@@ -1101,7 +1164,11 @@ var JJEngine = {
       out.depth = 0;
       return out;
     }
-    var analyzeFen = directFen || session.tracker.fen;
+    // codesOk=false 时别退回开局 FEN：优先复用上一次算棋用的局面（命中缓存、
+    // 不重算），否则用上一合法盘面组一次。
+    var analyzeFen = directFen || session.lastFen ||
+        ((session.lastBoardFen || session.tracker.fen.split(' ')[0]) + ' ' +
+         (mySideDetected === 'red' ? 'w' : 'b') + ' - - 0 1');
     if (out.moveDetected || !session.lastResult || session.lastFen !== analyzeFen) {
       var t0 = Date.now();
       // 开局库：命中就照谱走，一眼出着、也不算棋（跟鹏飞「库:」一样）

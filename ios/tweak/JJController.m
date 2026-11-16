@@ -863,21 +863,26 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
         if (self2.gridPtsCache.count != 90) {
             self2.gridPtsCache = [self2 gridPointsFromCorners:self2.finalCorners];
         }
-        /* 盘面不可信（识别未收敛 / JS 已跳过搜索）→ 退避一段时间，别每帧重算。
-           这是 14:07 日志里每 5.5s 一条「识别未收敛」演变成整机卡顿的关键闸门。 */
-        BOOL stalled = ![result[@"legalNow"] boolValue] || [result[@"skipAnalyze"] boolValue];
+        /* 盘面不可信（JS 已明确短路：裁剪后仍非法 / 一子未认出）→ 退避，别每帧重算。
+           【1.1.43】旧判定还看 legalNow，但 legalNow=0 时配额裁剪已能修好盘面，
+           再按它退避会把正常帧也拖进 2.5s 空转；现在只认 skipAnalyze。 */
+        BOOL stalled = [result[@"skipAnalyze"] boolValue];
         if (stalled) {
             self2.processNotBefore = [[NSDate date] timeIntervalSince1970] + JJ_PROCESS_ILLEGAL_GAP;
-            NSLog(@"[JJCheat] 识别未收敛：illegalStreak=%@ codesStable=%@ skipAnalyze=%@（退避 %.1fs）",
-                  result[@"illegalStreak"], result[@"codesStableCount"],
-                  result[@"skipAnalyze"] ?: @"0", JJ_PROCESS_ILLEGAL_GAP);
+            NSLog(@"[JJCheat] 识别未收敛：legalNow=%@ codesValid=%@ codesStable=%@ repaired=%@ illegalStreak=%@ skipReason=%@（退避 %.1fs）",
+                  result[@"legalNow"] ?: @"-", result[@"codesValid"] ?: @"-",
+                  result[@"codesStableCount"] ?: @"-", result[@"repairedCount"] ?: @"-",
+                  result[@"illegalStreak"] ?: @"-", result[@"skipReason"] ?: @"-",
+                  JJ_PROCESS_ILLEGAL_GAP);
         }
 
         [[JJHUDWindow shared] showResult:result gridPoints:self2.gridPtsCache fen:result[@"fen"] ?: @""];
 
         if ([result[@"moveDetected"] boolValue]) {
-            NSLog(@"[JJCheat] 检测到走法 %@ %@ → FEN %@",
-                  result[@"move"], result[@"moveChinese"], result[@"fen"]);
+            NSLog(@"[JJCheat] 检测到走法 %@ %@ → FEN %@ | suggest=%@ legalNow=%@ repaired=%@",
+                  result[@"move"], result[@"moveChinese"], result[@"fen"],
+                  result[@"suggest"] ?: @"-", result[@"legalNow"] ?: @"-",
+                  result[@"repairedCount"] ?: @"-");
         }
     }];
 }
