@@ -1,21 +1,15 @@
 #!/bin/sh
-# JJCheat 2.1.0 roothide prerm
+# JJCheat 2.1.52 roothide prerm
 #
-# 2.0 起插件不再往 .app 里写文件，这里的清理只为收拾 1.x 时代
-# jjcheat-fix 留下的残余（只删和我们那份完全一致的，绝不碰别的文件）。
+# 插件不再往 .app 里写文件，这里只收拾 1.x 时代 jjcheat-fix 留下的残余
+# （只删和我们那份完全一致的，绝不碰别的文件）。
+# 2.1.52 起引擎在进程内，没有独立进程需要 kill。
 set +e
 
 APP_DIR="/Library/Application Support/JJCheat"
 ENGINE="$APP_DIR/engine.js"
-PIKA="$APP_DIR/Pikafish/pikafish"
-NET="$APP_DIR/Pikafish/pikafish.nnue"
 ROOTFS="${JJ_ROOTFS:-/rootfs}"
 APPS="$ROOTFS/var/containers/Bundle/Application"
-
-# 卸载前停掉引擎进程，否则正在跑的 pikafish 会短暂变成孤儿
-if [ -f "$PIKA" ] || [ -f "$NET" ]; then
-    killall -9 pikafish 2>/dev/null || true
-fi
 
 for app in "$APPS"/*/*.app; do
     [ -d "$app" ] || continue

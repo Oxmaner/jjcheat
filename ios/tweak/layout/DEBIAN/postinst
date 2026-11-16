@@ -1,19 +1,17 @@
 #!/bin/sh
-# JJCheat 2.1.0 roothide postinst
+# JJCheat 2.1.52 roothide postinst
 #
-# 2.1.0 只做三件事：
-#   1) 确认 engine.js（识别脚本，已内嵌 dylib 作兜底）就位
-#   2) 给 Pikafish 可执行文件补执行权限（deb 打包时保留不了 0755 的情况兜底）
-#   3) 重启 SpringBoard 让注入生效
+# 2.1.52 起引擎跑在 dylib 进程内，包里不再有可执行文件，这里只剩两件事：
+#   1) 确认 engine.js（识别脚本，dylib 内嵌副本兜底）就位
+#   2) 确认 NNUE 权重就位并补读权限（引擎 mmap 读不到会直接退出）
 #
-# 注意：不再往 .app 里搬任何文件。写 .app 会破坏 App 的代码签名，
-# 2.0 起 engine.js 改走「App 容器优先 + dylib 内嵌副本兜底」。
+# 注意：不往 .app 里搬任何文件。写 .app 会破坏 App 的代码签名。
 set +e
 
 APP_DIR="/Library/Application Support/JJCheat"
 ENGINE="$APP_DIR/engine.js"
-PIKA="$APP_DIR/Pikafish/pikafish"
 NET="$APP_DIR/Pikafish/pikafish.nnue"
+OLD_PIKA="$APP_DIR/Pikafish/pikafish"
 
 if [ -f "$ENGINE" ]; then
     echo "[JJCheat] postinst: engine.js 就位（$(wc -c < "$ENGINE" 2>/dev/null | tr -d ' ') 字节）"
@@ -21,19 +19,14 @@ else
     echo "[JJCheat] postinst: engine.js 缺失，但 dylib 内嵌副本仍可工作"
 fi
 
-if [ -f "$PIKA" ]; then
-    chmod 0755 "$PIKA" 2>/dev/null
-    chown 0:0 "$PIKA" 2>/dev/null
-    echo "[JJCheat] postinst: Pikafish 就位（$(wc -c < "$PIKA" 2>/dev/null | tr -d ' ') 字节）"
-    if [ ! -x "$PIKA" ]; then
-        echo "[JJCheat] postinst: !! Pikafish 无法执行，检查 deb 是否被剥离权限"
-    fi
-else
-    echo "[JJCheat] postinst: !! 包里没有 Pikafish，插件会一直提示「引擎未安装」"
+# 2.1.51 及更早版本留下的可执行文件：进程内方案已经不用了，顺手清掉省 800KB
+if [ -f "$OLD_PIKA" ]; then
+    rm -f "$OLD_PIKA" && echo "[JJCheat] postinst: 已移除旧版独立引擎可执行文件"
 fi
 
 if [ -f "$NET" ]; then
     chmod 0644 "$NET" 2>/dev/null
+    chown 0:0 "$NET" 2>/dev/null
     echo "[JJCheat] postinst: NNUE 权重就位（$(wc -c < "$NET" 2>/dev/null | tr -d ' ') 字节）"
 else
     echo "[JJCheat] postinst: !! 包里没有 pikafish.nnue，引擎会启动即退出"

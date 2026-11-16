@@ -1,19 +1,21 @@
 //
 //  JJPikafish.h
-//  JJCheat —— Pikafish 独立引擎进程（2.1.0 核心）
+//  JJCheat —— Pikafish 进程内引擎（2.1.52 起）
 //
-//  2.1.0 架构：识别在 engine.js（JSContext），棋力在独立进程 Pikafish。
-//  通信走标准 UCI 方言（Pikafish 源自 Stockfish，position fen / go movetime /
+//  2.1.0 原本把 Pikafish 当独立可执行文件 posix_spawn 起来，真机验证失败：
+//  iOS App 沙盒不允许对自己数据容器与 jbroot 下的二进制做 exec
+//  （access(X_OK) 一路 EPERM），连容器副本都起不来。2.1.52 改为把 Pikafish
+//  交叉编译成静态库链进 JJCheat.dylib，用 jjpika_shim 接管 std::cin/std::cout，
+//  在专用线程里跑 UCIEngine::loop()。沙盒再也拦不到，也不再需要可执行文件。
+//
+//  仍然说标准 UCI 方言（Pikafish 源自 Stockfish：position fen / go movetime /
 //  bestmove；不是 UCCI——那是皮卡鱼早期 GUI 的叫法）。
 //
-//  设计要点（全部踩坑预防）：
-//   - 独立进程：搜索不吃游戏 JSC/CPU 预算，内存不挤游戏的 jetsam，
-//     引擎崩溃杀不死游戏进程。
-//   - 引擎只在 App 沙箱内活动：posix_spawn 一个可执行副本（安装器已放进
-//     容器），stdin/stdout/stderr 走管道，子进程继承沙箱但只碰自己目录。
-//   - 看门狗：go 发出后 movetime+3s 仍无 bestmove → kill -9 → 重生 → 重试一次；
-//     连续 3 次起不来 → 退避 30s，HUD 显示引擎不可用。
-//   - 队列：所有引擎交互都在串行 pikaQueue 上，回调统一回主线程。
+//  线程模型：
+//    engine 线程  —— jjpika_start() 阻塞跑引擎主循环
+//    reader 线程  —— jjpika_recv() 取输出行，dispatch 到 pikaQueue
+//    pikaQueue    —— 串行：状态机、发命令、回调派发，全部在这上面
+//  回调统一回主线程。引擎与界面之间没有任何共享可变状态。
 //
 
 #import <Foundation/Foundation.h>
@@ -22,10 +24,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 typedef NS_ENUM(NSInteger, JJPikaState) {
     JJPikaStateIdle = 0,      // 未启动
-    JJPikaStateStarting,      // 安装/spawn/握手中
+    JJPikaStateStarting,      // 加载权重 / UCI 握手中
     JJPikaStateReady,         // 可用
     JJPikaStateSearching,     // 搜索中
-    JJPikaStateDead,          // 崩溃/超时，等待重生或退避
+    JJPikaStateDead,          // 异常（权重缺失 / 握手超时），等待重试
 };
 
 /** bestmove 回调（主线程）。result 为 nil = 本次没结果（引擎不可用）。
@@ -43,13 +45,16 @@ typedef void (^JJPikaResultBlock)(NSDictionary * _Nullable result);
 /** 状态简述（HUD / 悬浮球引擎状态点用） */
 - (NSString *)stateText;
 
-/** 实际在用的可执行文件路径（可能是 deb 源位，也可能是容器副本） */
-- (NSString *)enginePathInUse;
+/** 实际在用的 NNUE 权重路径（诊断面板用；为空表示还没解析出来） */
+- (NSString *)netPathInUse;
 
-/** 启动引擎：确保安装 → spawn → UCI 握手。幂等，可反复调用。 */
+/** 引擎主循环是否在跑 */
+- (BOOL)engineThreadAlive;
+
+/** 启动引擎：解析权重 → 起线程 → UCI 握手。幂等，可反复调用。 */
 - (void)start;
 
-/** 停止引擎（插件关闭时调用；quit + 收尸 + 关管道） */
+/** 停止引擎（插件关闭时调用）：发 quit，线程自行退出。 */
 - (void)shutdown;
 
 /**

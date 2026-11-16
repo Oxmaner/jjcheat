@@ -1,6 +1,6 @@
 //
 //  JJPikafishInstaller.m
-//  JJCheat
+//  JJCheat —— Pikafish 权重定位（2.1.52 起）
 //
 
 #import "JJPikafishInstaller.h"
@@ -10,29 +10,16 @@
 #import <roothide.h>
 #endif
 
-/* 复制指纹：NSUserDefaults 里记录「上次复制时源文件的大小」。
-   装了新 deb（pikafish 重新编译 / 换了网，大小几乎必变）→ 下次启动自动重拷。 */
-#define kJJKeyPikaBinSize @"JJCheat.pikaBinSize"
-#define kJJKeyPikaNetSize @"JJCheat.pikaNetSize"
+/* 复制指纹：NSUserDefaults 记录「上次复制时源文件的大小」。
+   装了新 deb（换了网）→ 大小几乎必变 → 下次启动自动重拷。 */
+#define kJJKeyNetSize @"JJCheat.pikaNetSize"
+/* 权重正常 48MB 上下；小于这个数一律当没下全 */
+#define kJJMinNetSize (20LL * 1024 * 1024)
 
-/* 两个产物 —— 数组顺序即安装顺序，日志按这个顺序打。
-   下标 0 是可执行文件（要补 0755），下标 1 是 NNUE 权重。 */
-static NSString *const kJJArtifactNames[] = { JJ_PIKA_BIN_NAME, JJ_PIKA_NET_NAME };
-static const NSUInteger kJJArtifactCount = 2;
-
-static NSString *JJKeyForSize(NSUInteger idx) {
-    return idx == 0 ? kJJKeyPikaBinSize : kJJKeyPikaNetSize;
-}
-
-/** 相对 jbroot 的路径：Library/Application Support/JJCheat/Pikafish/<name> */
-static NSString *JJArtifactRelPath(NSUInteger idx) {
-    return [JJ_PIKA_DIR_REL stringByAppendingPathComponent:kJJArtifactNames[idx]];
-}
+static NSString *sResolvedNet = nil;
 
 @interface JJPikafishInstaller ()
-+ (nullable NSString *)containerPathFor:(NSUInteger)idx;
-+ (nullable NSDictionary *)findSourceFor:(NSUInteger)idx;
-+ (BOOL)installArtifact:(NSUInteger)idx error:(NSError **)error;
++ (nullable NSString *)findSourcePath;
 @end
 
 @implementation JJPikafishInstaller
@@ -55,159 +42,159 @@ static NSString *JJArtifactRelPath(NSUInteger idx) {
     return cached;
 }
 
-+ (NSString *)enginePathInContainer {
-    NSString *dir = [self engineDirInContainer];
-    return dir.length ? [dir stringByAppendingPathComponent:JJ_PIKA_BIN_NAME] : @"";
-}
-
 + (NSString *)netPathInContainer {
     NSString *dir = [self engineDirInContainer];
     return dir.length ? [dir stringByAppendingPathComponent:JJ_PIKA_NET_NAME] : @"";
 }
 
-+ (NSString *)containerPathFor:(NSUInteger)idx {
-    NSString *dir = [self engineDirInContainer];
-    if (!dir.length) return nil;
-    return [dir stringByAppendingPathComponent:kJJArtifactNames[idx]];
+/* 相对 jbroot 的路径：Library/Application Support/JJCheat/Pikafish/pikafish.nnue */
++ (NSString *)artifactRelPath {
+    return [JJ_PIKA_DIR_REL stringByAppendingPathComponent:JJ_PIKA_NET_NAME];
 }
 
-/* 候选源按「块」排列，每块正好 kJJArtifactCount 个，块内顺序与产物下标一致：
- *   块 0: App 容器（目标，不当作源）
- *   块 1: <bundle>/.jbroot/...  （roothide 在主程序旁放的符号链接）
- *   块 2: jbroot("/Library/...")（仅 roothide 构建有）
- *   块 3: /var/jb/Library/...    （rootless）
- *   块 4: /Library/...           （rootful）
- * 这样 findSourceFor: 只要 base = k*(产物数) 就能定位到对应产物。 */
 + (NSArray<NSString *> *)candidateSources {
-    NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithCapacity:10];
+    NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithCapacity:6];
+    NSString *rel = [self artifactRelPath];
 
     /* 块 0：容器目标 */
-    for (NSUInteger i = 0; i < kJJArtifactCount; i++) {
-        NSString *dst = [self containerPathFor:i];
-        [paths addObject:dst ?: @""];
-    }
+    NSString *dst = [self netPathInContainer];
+    [paths addObject:dst.length ? dst : @""];
 
-    /* 块 1：bundle/.jbroot */
+    /* 块 1：bundle/.jbroot（roothide 在主程序旁放的符号链接） */
     NSString *bundleRoot = [[NSBundle mainBundle] bundlePath];
-    for (NSUInteger i = 0; i < kJJArtifactCount; i++) {
-        if (!bundleRoot.length) break;
+    if (bundleRoot.length) {
         NSString *link = [bundleRoot stringByAppendingPathComponent:@".jbroot"];
-        [paths addObject:[link stringByAppendingPathComponent:JJArtifactRelPath(i)]];
+        [paths addObject:[link stringByAppendingPathComponent:rel]];
     }
 
-    /* 块 2：jbroot() */
-    for (NSUInteger i = 0; i < kJJArtifactCount; i++) {
+    /* 块 2：jbroot()（仅 roothide 构建有） */
 #ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
-        [paths addObject:jbroot([@"/" stringByAppendingString:JJArtifactRelPath(i)])];
+    [paths addObject:jbroot([@"/" stringByAppendingString:rel])];
 #endif
-    }
 
     /* 块 3 / 4：rootless 与 rootful 字面量 */
-    for (NSUInteger i = 0; i < kJJArtifactCount; i++) {
-        [paths addObject:[@"/var/jb" stringByAppendingPathComponent:JJArtifactRelPath(i)]];
-    }
-    for (NSUInteger i = 0; i < kJJArtifactCount; i++) {
-        [paths addObject:[@"/" stringByAppendingString:JJArtifactRelPath(i)]];
-    }
+    [paths addObject:[@"/var/jb" stringByAppendingPathComponent:rel]];
+    [paths addObject:[@"/" stringByAppendingString:rel]];
     return paths;
 }
 
-+ (NSDictionary *)findSourceFor:(NSUInteger)idx {
++ (NSString *)findSourcePath {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray<NSString *> *cands = [self candidateSources];
-    NSUInteger total = cands.count;
-
-    /* 从块 1 开始（跳过容器目标本身），逐块找同一下标的产物 */
-    for (NSUInteger base = kJJArtifactCount; base + idx < total; base += kJJArtifactCount) {
-        NSUInteger pos = base + idx;
-        NSString *p = cands[pos];
+    for (NSUInteger i = 1; i < cands.count; i++) {   /* 从 1 开始：0 是容器目标本身 */
+        NSString *p = cands[i];
         if (!p.length || ![fm fileExistsAtPath:p]) {
-            NSLog(@"[JJCheat][Pika] %@ 源位 %lu 未命中: %@", kJJArtifactNames[idx],
-                  (unsigned long)pos, p.length ? p : @"(nil)");
+            NSLog(@"[JJCheat][Pika] 权重源位 %lu 未命中: %@", (unsigned long)i,
+                  p.length ? p : @"(nil)");
             continue;
         }
-        NSLog(@"[JJCheat][Pika] %@ 命中源位 %lu: %@", kJJArtifactNames[idx],
-              (unsigned long)pos, p);
         NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
-        return @{ @"path": p, @"size": @(attr.fileSize) };
+        if ([attr fileSize] < (unsigned long long)kJJMinNetSize) {
+            NSLog(@"[JJCheat][Pika] 权重源位 %lu 太小（%llu 字节），跳过: %@",
+                  (unsigned long)i, [attr fileSize], p);
+            continue;
+        }
+        NSLog(@"[JJCheat][Pika] 权重命中源位 %lu: %@（%llu 字节）", (unsigned long)i, p,
+              [attr fileSize]);
+        return p;
     }
     return nil;
 }
 
-+ (BOOL)installArtifact:(NSUInteger)idx error:(NSError **)error {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *name = kJJArtifactNames[idx];
-    NSString *dst = [self containerPathFor:idx];
-    if (!dst.length) return NO;
-
-    NSDictionary *src = [self findSourceFor:idx];
-    long long recorded = [[NSUserDefaults standardUserDefaults] integerForKey:JJKeyForSize(idx)];
-    BOOL dstExists = [fm fileExistsAtPath:dst];
-
-    /* 情况 1：容器已有副本，且没有新源（或源大小 == 记录值）→ 直接用 */
-    if (dstExists && (!src || [(NSNumber *)src[@"size"] longLongValue] == recorded)) {
-        NSDictionary *attr = [fm attributesOfItemAtPath:dst error:nil];
-        if (idx == 0 && (([attr filePosixPermissions] & 0100) == 0)) {
-            [fm setAttributes:@{NSFilePosixPermissions: @(0755)} ofItemAtPath:dst error:nil];
-            NSLog(@"[JJCheat][Pika] 补可执行位: %@", dst);
-        }
-        return YES;
-    }
-
-    /* 情况 2：容器为空，或源大小变了 → 重新复制 */
-    if (!src) {
-        if (dstExists) return YES;   /* 源没了（deb 被卸）但副本还在 → 继续用 */
-        if (error) {
-            *error = [NSError errorWithDomain:@"JJCheat" code:2
-                                     userInfo:@{NSLocalizedDescriptionKey:
-                [NSString stringWithFormat:@"deb 里找不到 %@（包未安装或损坏）", name]}];
-        }
-        NSLog(@"[JJCheat][Pika] 安装失败：容器无 %@ 且所有候选源都不存在", name);
-        return NO;
-    }
-
-    NSString *srcPath = src[@"path"];
-    NSString *oldPath = [dst stringByAppendingString:@".old"];
-    NSError *copyErr = nil;
-    if (dstExists) {
-        [fm removeItemAtPath:oldPath error:nil];
-        [fm moveItemAtPath:dst toPath:oldPath error:nil];
-    }
-    BOOL ok = [fm copyItemAtPath:srcPath toPath:dst error:&copyErr];
-    if (ok) {
-        if (idx == 0) {
-            [fm setAttributes:@{NSFilePosixPermissions: @(0755)} ofItemAtPath:dst error:nil];
-        }
-        [fm removeItemAtPath:oldPath error:nil];
-        [[NSUserDefaults standardUserDefaults] setInteger:[src[@"size"] longLongValue]
-                                                  forKey:JJKeyForSize(idx)];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        NSLog(@"[JJCheat][Pika] %@ 已复制到容器（%lld 字节）", name,
-              [(NSNumber *)src[@"size"] longLongValue]);
-        return YES;
-    }
-    /* 复制失败：恢复旧副本，别让升级把能用的版本弄没 */
-    NSLog(@"[JJCheat][Pika] %@ 复制失败: %@", name, copyErr.localizedDescription);
-    if ([fm fileExistsAtPath:oldPath]) {
-        [fm removeItemAtPath:dst error:nil];
-        [fm moveItemAtPath:oldPath toPath:dst error:nil];
-    }
-    if (error) *error = copyErr;
-    return dstExists;
+/** 读一眼文件头，确认引擎 mmap 不会失败（读不了就宁可重拷） */
++ (BOOL)fileLooksReadable:(NSString *)path {
+    if (!path.length) return NO;
+    FILE *f = fopen(path.fileSystemRepresentation, "rb");
+    if (!f) return NO;
+    unsigned char buf[64];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    return n > 0;
 }
 
-+ (BOOL)ensureInstalledWithError:(NSError **)error {
-    if (![self engineDirInContainer].length) {
++ (NSString *)resolveNetPathWithError:(NSError **)error {
+    return [self resolveNetPathWithError:error force:NO];
+}
+
++ (NSString *)resolveNetPathWithError:(NSError **)error force:(BOOL)force {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dst = [self netPathInContainer];
+    if (!dst.length) {
         if (error) {
             *error = [NSError errorWithDomain:@"JJCheat" code:1
                                      userInfo:@{NSLocalizedDescriptionKey: @"容器目录不可用"}];
         }
-        return NO;
+        return nil;
     }
-    for (NSUInteger i = 0; i < kJJArtifactCount; i++) {
-        if (![self installArtifact:i error:error]) return NO;
+
+    if (!force && sResolvedNet.length && [fm fileExistsAtPath:sResolvedNet]) {
+        return sResolvedNet;
     }
-    return YES;
+
+    unsigned long long dstSize =
+        [[fm attributesOfItemAtPath:dst error:nil] fileSize];
+    NSString *src = [self findSourcePath];
+    unsigned long long srcSize = src ? [[fm attributesOfItemAtPath:src error:nil] fileSize] : 0;
+    long long recorded = [[NSUserDefaults standardUserDefaults] integerForKey:kJJKeyNetSize];
+
+    /* 情况 1：容器副本可用，且源没变（或压根没有源）→ 直接用，省掉 48MB 复制 */
+    if (dstSize >= (unsigned long long)kJJMinNetSize) {
+        BOOL srcChanged = src && (long long)srcSize != recorded && srcSize != dstSize;
+        if (!srcChanged && [self fileLooksReadable:dst]) {
+            sResolvedNet = dst;
+            return dst;
+        }
+        NSLog(@"[JJCheat][Pika] 权重源已变（记录 %lld / 源 %llu），重新复制", recorded, srcSize);
+    }
+
+    /* 情况 2：复制源 → 容器 */
+    if (src.length) {
+        NSString *oldPath = [dst stringByAppendingString:@".old"];
+        [fm removeItemAtPath:oldPath error:nil];
+        if (dstSize > 0) [fm moveItemAtPath:dst toPath:oldPath error:nil];
+
+        NSError *copyErr = nil;
+        if ([fm copyItemAtPath:src toPath:dst error:&copyErr]) {
+            [fm setAttributes:@{NSFilePosixPermissions: @(0644)} ofItemAtPath:dst error:nil];
+            [fm removeItemAtPath:oldPath error:nil];
+            [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)srcSize
+                                                      forKey:kJJKeyNetSize];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+            NSLog(@"[JJCheat][Pika] 权重已复制到容器（%llu 字节）", srcSize);
+            if ([self fileLooksReadable:dst]) {
+                sResolvedNet = dst;
+                return dst;
+            }
+            NSLog(@"[JJCheat][Pika] 复制完成但容器副本仍读不了，回退源路径");
+            sResolvedNet = src;
+            return src;
+        }
+
+        NSLog(@"[JJCheat][Pika] 权重复制失败: %@", copyErr.localizedDescription);
+        if ([fm fileExistsAtPath:oldPath]) {
+            [fm removeItemAtPath:dst error:nil];
+            [fm moveItemAtPath:oldPath toPath:dst error:nil];
+        }
+        /* 复制失败但源可读：直接让引擎读源位（只读，不写） */
+        if ([self fileLooksReadable:src]) {
+            sResolvedNet = src;
+            return src;
+        }
+    }
+
+    /* 情况 3：源没了但容器还有旧副本 → 继续用，不因为升级失败把引擎弄没 */
+    if (dstSize >= (unsigned long long)kJJMinNetSize && [self fileLooksReadable:dst]) {
+        sResolvedNet = dst;
+        return dst;
+    }
+
+    if (error) {
+        *error = [NSError errorWithDomain:@"JJCheat" code:2
+                                 userInfo:@{NSLocalizedDescriptionKey:
+            [NSString stringWithFormat:@"deb 里找不到 %@（包未安装或损坏）", JJ_PIKA_NET_NAME]}];
+    }
+    NSLog(@"[JJCheat][Pika] 权重缺失：容器无有效副本，所有候选源都不存在");
+    return nil;
 }
 
 @end

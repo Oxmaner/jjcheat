@@ -12,8 +12,9 @@ const path = require('path');
 const SRC = path.join(__dirname, '..', 'src');
 const OUT_DIR = path.join(__dirname, '..', 'dist');
 
-/* 2.1.0：JS 只做视觉识别与状态机。搜索已迁到独立进程 Pikafish
-   （ObjC 侧 JJPikafish），cst/eval、cst/search、cst/book 不再打包。
+/* 2.1.0：JS 只做视觉识别与状态机。搜索已迁到 Pikafish
+   （2.1.52 起在 dylib 进程内跑，ObjC 侧 JJPikafish），
+   cst/eval、cst/search、cst/book 已彻底删除，不再打包。
    cst/position + cst/notation 保留：process 里「检测到走法」的中文记谱
    仍由它们产出（不依赖搜索器）。 */
 const ENTRY_FILES = [

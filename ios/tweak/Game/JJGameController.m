@@ -296,25 +296,23 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     NSLog(@"[JJCheat] 打开思考时间设置");
 }
 
-/** 引擎状态详情（2.1.0 新增）：一眼看出 Pikafish 到底在不在、跑没跑起来 */
+/** 引擎状态详情：一眼看出 Pikafish 到底在不在、跑没跑起来。
+    2.1.52 起引擎在进程内跑（静态库链进 dylib），没有可执行文件可查，
+    所以只报告「权重路径 / 权重大小 / 引擎线程是否活着」。 */
 - (void)showEngineStatus {
     JJPikafish *pika = [JJPikafish shared];
     NSFileManager *fm = [NSFileManager defaultManager];
     NSMutableString *msg = [NSMutableString string];
     [msg appendFormat:@"状态：%@\n", [pika stateText]];
+    [msg appendFormat:@"引擎：进程内（Pikafish 静态库）\n"];
+    [msg appendFormat:@"线程：%@\n", [pika engineThreadAlive] ? @"运行中" : @"未运行"];
 
-    /* 报告「真正在用的那个」：可能是 deb 源位，也可能是容器副本。
-       权重必须与二进制同目录（引擎就是这么找的），按同一个目录去查。 */
-    NSString *bin = [pika enginePathInUse];
-    NSString *dir = [bin stringByDeletingLastPathComponent];
-    NSDictionary *ba = [fm attributesOfItemAtPath:bin error:nil];
-    [msg appendFormat:@"可执行：%@（%@ 字节）\n",
-        ba ? @"已就位" : @"缺失", ba ? @([ba fileSize]) : @"-"];
-    NSString *net = dir.length ? [dir stringByAppendingPathComponent:JJ_PIKA_NET_NAME] : @"";
+    NSString *net = [pika netPathInUse];
+    if (!net.length) net = [JJPikafishInstaller netPathInContainer];
     NSDictionary *na = [fm attributesOfItemAtPath:net error:nil];
     [msg appendFormat:@"权重：%@（%@ 字节）\n",
         na ? @"已就位" : @"缺失", na ? @([na fileSize]) : @"-"];
-    if (dir.length) [msg appendFormat:@"目录：%@\n", dir];
+    if (net.length) [msg appendFormat:@"路径：%@\n", net];
 
     [msg appendFormat:@"线程 1 · 哈希 %d MB · 每步 %ld ms", JJ_PIKA_HASH_MB, (long)self.thinkMs];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"皮卡鱼引擎"

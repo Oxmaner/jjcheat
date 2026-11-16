@@ -1,13 +1,14 @@
 # ============================================================
-#  JJCheat 2.1.0 — roothide 构建配置
+#  JJCheat 2.1.52 — roothide 构建配置
 #
-#  2.1.0 变化：
+#  2.1.52 变化：
+#   - 引擎改进程内：Pikafish 由 engine/build-ios.sh 编译成静态库
+#     Engine/lib/libpikafish.a，直接链进 JJCheat.dylib。
+#     原因：iOS App 沙盒不允许 exec 自己容器与 jbroot 下的二进制，2.1.51
+#     之前 posix_spawn 独立进程的方案真机上一条 spawn 都发不出去。
+#   - 包里只剩 NNUE 权重一个引擎资源（layout/.../pikafish.nnue）
 #   - 源码按模块分目录（Core / Capture / Vision / Engine / Game / UI）
-#   - 搜索引擎从 JS 换成独立进程 Pikafish（Engine/JJPikafish.m + posix_spawn）
-#     pikafish 可执行文件由 engine/build-ios.sh 交叉编译后放进
-#     layout/Library/Application Support/JJCheat/Pikafish/pikafish，
-#     本 Makefile 只负责打包，不参与引擎编译（避免每次改 UI 都重编 30MB 引擎）
-#   - JS 只剩「识别」，engine.js 从 ~285KB 降到 ~250KB
+#   - JS 只剩「识别」，engine.js 约 250KB
 #
 #  roothide 方案做的事:
 #   1) dylib install_name 变成 @loader_path/.jbroot/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib
@@ -61,6 +62,12 @@ JJCheat_FRAMEWORKS = UIKit Foundation QuartzCore CoreGraphics JavaScriptCore \
                      IOSurface CoreVideo OpenGLES Metal MetalKit
 JJCheat_PRIVATE_FRAMEWORKS =
 
+# 进程内 Pikafish：静态库 + C++ 运行时
+# 引擎自身用 -fno-exceptions 编译，但桥接层用到了 std::string/deque/iostream，
+# 必须把 libc++ 链上，否则一堆 std::__1:: 符号未定义。
+PIKA_LIB := $(JJ_ENGINE)/lib/libpikafish.a
+JJCheat_LDFLAGS = -L$(JJ_ENGINE)/lib -lpikafish -lc++ -Wl,-dead_strip
+
 # roothide: jbroot() 来自 libroothide
 ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
 JJCheat_LIBRARIES = roothide
@@ -69,25 +76,26 @@ endif
 include $(THEOS_MAKE_PATH)/tweak.mk
 
 # ------------------------------------------------------------
-#  打包前体检：引擎两个产物都必须在 layout 里，否则装到手机上必然启动失败
-#  （2026 版 Pikafish 不内嵌 NNUE，权重是独立文件）
+#  打包前体检：静态库与权重都必须在，否则装上去引擎必然起不来
 #  用 JJ_SKIP_ENGINE_CHECK=1 可以跳过（只编 UI 时用）
 # ------------------------------------------------------------
 PIKA_DIR := $(THEOS_PROJECT_DIR)/layout/Library/Application Support/JJCheat/Pikafish
-PIKA_BIN := $(PIKA_DIR)/pikafish
 PIKA_NET := $(PIKA_DIR)/pikafish.nnue
 
 before-package::
 	@if [ "$(JJ_SKIP_ENGINE_CHECK)" != "1" ]; then \
-	    for f in "$(PIKA_BIN)" "$(PIKA_NET)"; do \
-	        if [ ! -f "$$f" ]; then \
-	            echo "!! 缺少引擎文件: $$f"; \
-	            echo "!! 先跑 engine/build-ios.sh，或用 JJ_SKIP_ENGINE_CHECK=1 跳过"; \
-	            exit 1; \
-	        fi; \
-	        echo ">> $$(basename "$$f"): $$(wc -c < "$$f" | tr -d ' ') 字节"; \
-	    done; \
+	    if [ ! -f "$(PIKA_LIB)" ]; then \
+	        echo "!! 缺少引擎静态库: $(PIKA_LIB)"; \
+	        echo "!! 先跑 engine/build-ios.sh，或用 JJ_SKIP_ENGINE_CHECK=1 跳过"; \
+	        exit 1; \
+	    fi; \
+	    if [ ! -f "$(PIKA_NET)" ]; then \
+	        echo "!! 缺少 NNUE 权重: $(PIKA_NET)"; \
+	        exit 1; \
+	    fi; \
+	    echo ">> libpikafish.a: $$(wc -c < '$(PIKA_LIB)' | tr -d ' ') 字节"; \
+	    echo ">> pikafish.nnue: $$(wc -c < '$(PIKA_NET)' | tr -d ' ') 字节"; \
 	fi
 
 after-install::
-	install.exec "chmod 0755 '/Library/Application Support/JJCheat/Pikafish/pikafish' 2>/dev/null; killall -9 SpringBoard 2>/dev/null || true"
+	install.exec "killall -9 SpringBoard 2>/dev/null || true"

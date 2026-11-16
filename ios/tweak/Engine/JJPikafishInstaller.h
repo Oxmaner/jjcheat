@@ -1,21 +1,16 @@
 //
 //  JJPikafishInstaller.h
-//  JJCheat —— Pikafish 引擎资源安装（2.1.0 新增）
+//  JJCheat —— Pikafish 资源定位（2.1.52 起只管 NNUE 权重）
 //
-//  deb 把两个文件放在 jbroot 的 Library/Application Support/JJCheat/Pikafish/ 下：
-//    pikafish        可执行文件（~800KB，iOS arm64，ldid ad-hoc 签名）
-//    pikafish.nnue   NNUE 权重（~48MB，官方 master-net，zstd 压缩格式）
+//  2.1.0 时代这里要安装「可执行文件 + 权重」两个产物；2.1.52 改成进程内
+//  运行后，可执行文件已经编进 dylib，只剩权重需要落盘。
 //
-//  为什么权重必须随包走：Pikafish 2026 版取消了编译期内嵌（network.cpp 里
-//  没有 INCBIN 分支），Network::load() 只在 {cwd, 二进制所在目录} 里找文件。
-//  官方默认的 EvalFile 名就是 pikafish.nnue，所以「和二进制放同一目录」
-//  是它自己会找的路径；我们另外再显式 setoption EvalFile 一次做双保险。
+//  deb 把权重放在 jbroot 的 Library/Application Support/JJCheat/Pikafish/ 下。
+//  为什么要复制进 App 容器：引擎用 mmap 读这个文件，一旦读失败 Pikafish 的
+//  Network::load 会直接 exit(EXIT_FAILURE)——那是把游戏一起带走，赌不起。
+//  容器副本是我们自己写的，读权限 100% 确定。首次复制 48MB，之后按大小指纹复用。
 //
-//  为什么要复制进 App 容器：roothide 的 App 沙箱跨容器读不了 jbroot，
-//  而 posix_spawn 需要可读可执行的目标。沿用 engine.js 的成熟方案：
-//  首次激活时把两个文件复制进 App 自己的容器，之后一直用容器副本。
-//
-//  读取源走 4 级回退链，日志写明哪条命中（这同时是真机沙盒探针）：
+//  源查找走 4 级回退（日志写明哪条命中，同时是真机沙盒探针）：
 //    ① App 容器（已复制过，直接用）
 //    ② <主程序 bundle>/.jbroot/...（roothide 在 bundle 里放的符号链接）
 //    ③ jbroot("/Library/Application Support/JJCheat/Pikafish/...")
@@ -28,24 +23,24 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface JJPikafishInstaller : NSObject
 
-/** 引擎资源在 App 容器内的目录：<容器>/Library/Application Support/JJCheat/Pikafish */
+/** 资源目录：<容器>/Library/Application Support/JJCheat/Pikafish */
 + (NSString *)engineDirInContainer;
 
-/** 可执行文件在 App 容器内的完整路径 */
-+ (NSString *)enginePathInContainer;
-
-/** NNUE 权重在 App 容器内的完整路径（= 引擎二进制同目录） */
+/** 权重在 App 容器内的完整路径 */
 + (NSString *)netPathInContainer;
-
-/**
- * 确保容器里同时有可执行的 pikafish 与 pikafish.nnue。
- * 升级判定按「安装源文件大小」指纹：新 deb 的任一文件大小变了就重新复制。
- * 源读不到但容器已有副本时照常返回 YES（旧版继续用）。
- */
-+ (BOOL)ensureInstalledWithError:(NSError **)error;
 
 /** 全部候选源路径（诊断用），第 0 个是容器目标，其余按优先级排列 */
 + (NSArray<NSString *> *)candidateSources;
+
+/**
+ * 解析出「引擎真正该用的权重路径」，带缓存，可反复调用。
+ * 正常返回容器副本的绝对路径；源缺失但容器已有副本时也返回容器副本。
+ * 返回 nil 时 error 说明缺什么。
+ */
++ (nullable NSString *)resolveNetPathWithError:(NSError **)error;
+
+/** 同上，但强制重新检查源指纹（升级 deb 后由调用方决定是否重来）。 */
++ (nullable NSString *)resolveNetPathWithError:(NSError **)error force:(BOOL)force;
 
 @end
 

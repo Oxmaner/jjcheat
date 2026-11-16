@@ -86,16 +86,16 @@
 #define JJ_LOGO_REL_PATH        @"Library/Application Support/JJCheat/logo.png"
 
 /* ============================================================
- *  2.1.0 Pikafish 独立引擎
+ *  2.1.52 Pikafish 进程内引擎
  * ============================================================ */
-/* deb 内引擎目录（相对 jbroot）与可执行名 */
+/* deb 内资源目录（相对 jbroot）。2.1.52 起这里只有一个文件：权重。
+   可执行文件已经编进 JJCheat.dylib（engine/build-ios.sh 产出 libpikafish.a），
+   不再随包分发，也不再需要任何 exec 权限。 */
 #define JJ_PIKA_DIR_REL         @"Library/Application Support/JJCheat/Pikafish"
-#define JJ_PIKA_BIN_NAME        @"pikafish"
 /* NNUE 权重文件名。必须与 Pikafish 的 EvalFileDefaultName 一致：
-   引擎会先在「二进制所在目录」按这个名字找，我们另外再显式 setoption 一次。
-   2026 版已取消编译期内嵌，这个文件不随包走引擎就起不来。 */
+   引擎会在 argv[0] 所在目录按这个名字找。 */
 #define JJ_PIKA_NET_NAME        @"pikafish.nnue"
-/* 哈希表 MB。手机别给太大：64MB 独立进程内存，游戏本体不受影响 */
+/* 哈希表 MB。手机别给太大：64MB 进程内内存，与游戏共用地址空间但独立分配 */
 #define JJ_PIKA_HASH_MB         64
 /* 引擎状态小圆点刷新间隔（秒） */
 #define JJ_ENGINE_DOT_GAP       2.0
