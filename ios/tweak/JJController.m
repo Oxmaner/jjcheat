@@ -9,6 +9,7 @@
 #import "JJScreenGrabber.h"
 #import "JJHUDWindow.h"
 #import <UIKit/UIKit.h>
+#import <math.h>
 
 typedef NS_ENUM(NSInteger, JJCtrlState) {
     JJCtrlStateIdle = 0,
@@ -108,6 +109,10 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
 @property (nonatomic, assign) BOOL busy;
 @property (nonatomic, assign) NSInteger tickCount;
 @property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *gridPtsCache;
+/* 标定得到的屏幕 point 坐标（原始值）；像素坐标按实际抓帧尺寸现算 */
+@property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *pointCorners;
+@property (nonatomic, assign) int lastFrameW;
+@property (nonatomic, assign) int lastFrameH;
 @end
 
 @implementation JJController
@@ -149,6 +154,7 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
             [corners addObject:@[[NSNumber numberWithDouble:[p[0] doubleValue]],
                                  [NSNumber numberWithDouble:[p[1] doubleValue]]]];
         }
+        self.pointCorners = corners;
         [[JJEngineBridge shared] setCorners:corners];
         self.state = JJCtrlStateWaitingBoard;
         self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
@@ -215,6 +221,9 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     [[NSUserDefaults standardUserDefaults] setBool:YES forKey:JJ_KEY_CALIBRATED];
     [[NSUserDefaults standardUserDefaults] synchronize];
 
+    self.pointCorners = saved;   // 原始 point 坐标，抓帧尺寸确定后按比例现算
+    self.lastFrameW = 0;
+    self.lastFrameH = 0;
     [[JJEngineBridge shared] setCorners:pxCorners];
     [[JJEngineBridge shared] resetWithFen:nil];
     self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
@@ -230,6 +239,67 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     [[JJEngineBridge shared] resetWithFen:nil];
     self.state = JJCtrlStateWaitingBoard;
     [[JJHUDWindow shared] showStatus:@"已重置 · 等开局画面"];
+}
+
+/* ------------------------------------------------------------
+ *  标定坐标自适应
+ *  handleCalibration / start 里是按 nativeBounds 把 point 换算成像素的，
+ *  但 roothide 下抓帧往往走 GL-hook，拿到的是 GL framebuffer 尺寸，
+ *  可能和 nativeBounds 不一致。一旦不一致，90 个采样点整体错位，
+ *  识别结果就是「整盘空格」—— 表现正好是 verifyDiff=32、顶/底行 0 子。
+ *  这里按「实际抓帧尺寸 / 屏幕 point」重算一次，尺寸变了才重设。
+ * ------------------------------------------------------------ */
+- (void)applyCornersForFrameWidth:(int)w height:(int)h {
+    if (self.pointCorners.count != 4 || w <= 0 || h <= 0) return;
+    if (self.lastFrameW == w && self.lastFrameH == h) return;
+
+    CGSize pt = [UIScreen mainScreen].bounds.size;
+    if (pt.width <= 0 || pt.height <= 0) return;
+
+    CGFloat sx = (CGFloat)w / pt.width;
+    CGFloat sy = (CGFloat)h / pt.height;
+
+    NSMutableArray *px = [NSMutableArray arrayWithCapacity:4];
+    for (NSArray *p in self.pointCorners) {
+        [px addObject:@[@([p[0] doubleValue] * sx), @([p[1] doubleValue] * sy)]];
+    }
+
+    self.lastFrameW = w;
+    self.lastFrameH = h;
+    [[JJEngineBridge shared] setCorners:px];
+    self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
+
+    CGRect nb = [UIScreen mainScreen].nativeBounds;
+    NSLog(@"[JJCheat] 抓帧 %dx%d（point %.0fx%.0f / native %.0fx%.0f）→ 标定缩放 %.3f/%.3f",
+          w, h, pt.width, pt.height, nb.size.width, nb.size.height, sx, sy);
+}
+
+/* 学习校验没过时，把几个采样点的真实颜色打出来：
+ *   全是背景色 → 采样点错位（标定/尺寸问题）
+ *   有棋子色但判空 → 阈值或皮肤问题（调 recognizer 的 redTh/darkTh） */
+- (void)dumpSamplesWithPixels:(NSData *)rgba width:(int)w height:(int)h {
+    NSArray<NSArray<NSNumber *> *> *grid = self.gridPtsCache;
+    if (grid.count != 90 || !rgba.length || w <= 0 || h <= 0) return;
+
+    const uint8_t *px = (const uint8_t *)rgba.bytes;
+    NSUInteger len = rgba.length;
+    NSInteger probes[] = { 0, 4, 8, 40, 81, 85, 89, 13, 76 };
+    NSMutableString *log = [NSMutableString string];
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        NSInteger idx = probes[i];
+        if (idx < 0 || idx >= (NSInteger)grid.count) continue;
+        int x = (int)lround([grid[(NSUInteger)idx][0] doubleValue]);
+        int y = (int)lround([grid[(NSUInteger)idx][1] doubleValue]);
+        if (x < 0 || y < 0 || x >= w || y >= h) {
+            [log appendFormat:@" #%ld(%d,%d)越界", (long)idx, x, y];
+            continue;
+        }
+        NSUInteger o = ((NSUInteger)y * (NSUInteger)w + (NSUInteger)x) * 4;
+        if (o + 2 >= len) continue;
+        [log appendFormat:@" #%ld(%d,%d)=(%d,%d,%d)",
+         (long)idx, x, y, px[o], px[o + 1], px[o + 2]];
+    }
+    NSLog(@"[JJCheat] 采样点颜色(RGB) w=%d h=%d%@", w, h, log);
 }
 
 - (void)startTimer {
@@ -248,6 +318,9 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     NSData *rgba = [[JJScreenGrabber shared] grabRGBAWithWidth:&w height:&h];
     if (!rgba || w <= 0 || h <= 0) return;
 
+    // 抓帧尺寸可能和 nativeBounds 不一致（roothide 下走 GL-hook），标定按实际尺寸重算
+    [self applyCornersForFrameWidth:w height:h];
+
     self.busy = YES;
     self.tickCount++;
 
@@ -258,6 +331,10 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
             self.learnedBoard = YES;
             self.state = JJCtrlStateRunning;
             NSLog(@"[JJCheat] 棋盘学习完成 %@", info);
+            if (![info[@"ok"] boolValue]) {
+                NSLog(@"[JJCheat] 学习校验未通过（verifyDiff=%@），dump 采样点定位", info[@"verifyDiff"]);
+                [self dumpSamplesWithPixels:rgba width:w height:h];
+            }
         }
         self.busy = NO;
         if (!self.learnedBoard) {
