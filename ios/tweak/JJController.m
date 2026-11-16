@@ -129,6 +129,8 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
 @property (nonatomic, assign) uint64_t lastFrameSerial;
 /* 学习失败退避：learnAndRefine 要几百 ms~几秒，不能每 250ms 重跑一次 */
 @property (nonatomic, assign) NSTimeInterval lastLearnAttempt;
+/* 学习静默失败计数：每 5 次留一条日志，杜绝「没提示又没日志」的黑洞 */
+@property (nonatomic, assign) NSInteger learnFailCount;
 @end
 
 @implementation JJController
@@ -263,6 +265,7 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     self.finalCorners = nil;
     self.lastFrameSerial = 0;
     self.lastLearnAttempt = 0;
+    self.learnFailCount = 0;
     [[JJEngineBridge shared] setCorners:pxCorners];
     [[JJEngineBridge shared] resetWithFen:nil];
     self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
@@ -461,6 +464,16 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
             if (!self2) return;
             self2.busy = NO;
             if (!info || [info[@"templateCount"] integerValue] <= 0) {
+                /* 每 5 次留一条：旧版 engine.js 让 learnAndRefine 变 undefined 时
+                   info 恒为 nil，原来会一直静默重试，日志里什么都看不到。 */
+                self2.learnFailCount++;
+                if ((self2.learnFailCount % 5) == 1) {
+                    NSLog(@"[JJCheat] 学习未完成（第 %ld 次）info=%@ templateCount=%@ verifyDiff=%@",
+                          (long)self2.learnFailCount,
+                          info ? @"有" : @"nil",
+                          info[@"templateCount"] ?: @"-",
+                          info[@"verifyDiff"] ?: @"-");
+                }
                 [[JJHUDWindow shared] showStatus:@"正在学习棋盘…请停留在开局画面"];
                 return;
             }

@@ -20,6 +20,12 @@
 #import "JJEngineScript.h"
 #import <JavaScriptCore/JavaScriptCore.h>
 
+/* engine.js 的关键接口标记：1.1.40 起才有 JJEngine.learnAndRefine。
+   App 容器里的 engine.js 优先级最高，而装新 deb 不会覆盖它（deb 只写 jbroot
+   那份）。旧脚本会让 learnAndRefine 变成 undefined → 学习静默失败、永远不给
+   走法提示。启动时自检，缺标记就自动用编进 dylib 的内嵌副本覆盖升级。 */
+static NSString * const kJJEngineFeatureMark = @"learnAndRefine";
+
 // roothide 适配：jbroot 每次越狱都会换一个随机路径，必须在运行时解析。
 // 非 roothide 构建（rootful/rootless）不引这个头，避免多出 libroothide 依赖。
 #ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
@@ -75,19 +81,37 @@ static NSString *JJContainerEnginePath(void) {
     return cached;
 }
 
-/* 首次运行把内嵌副本落到 App 容器；已经存在就不动（保留用户热改的版本） */
+/* 把内嵌副本落到 App 容器：
+   - 文件不存在 → 首次释放；
+   - 文件存在但缺 kJJEngineFeatureMark → 旧包残留，自动覆盖升级；
+   - 文件存在且是新版 → 保持不动（尊重用户热改的参数）。 */
 - (BOOL)seedEngineIntoContainer {
     NSString *dst = JJContainerEnginePath();
     if (!dst.length) return NO;
-    if ([[NSFileManager defaultManager] fileExistsAtPath:dst]) return YES;
 
-    NSData *data = [NSData dataWithBytes:JJEngineScript length:(NSUInteger)JJEngineScriptLength];
-    if (data.length == 0) return NO;
+    NSData *embedded = [NSData dataWithBytes:JJEngineScript length:(NSUInteger)JJEngineScriptLength];
+    if (embedded.length == 0) return NO;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL needWrite = NO;
+    NSString *reason = nil;
+    if (![fm fileExistsAtPath:dst]) {
+        needWrite = YES;
+        reason = @"首次释放到容器";
+    } else {
+        NSString *old = [NSString stringWithContentsOfFile:dst encoding:NSUTF8StringEncoding error:nil];
+        if (old.length == 0 || [old rangeOfString:kJJEngineFeatureMark].location == NSNotFound) {
+            needWrite = YES;
+            reason = @"旧版残留自动升级";
+        }
+    }
+    if (!needWrite) return YES;
 
     NSError *err = nil;
-    BOOL ok = [data writeToFile:dst options:NSDataWritingAtomic error:&err];
-    NSLog(@"[JJCheat] engine.js 释放到容器: %@ ok=%d %@",
-          dst, ok, ok ? @"" : (err.localizedDescription ?: @""));
+    BOOL ok = [embedded writeToFile:dst options:NSDataWritingAtomic error:&err];
+    NSLog(@"[JJCheat] engine.js %@: %@ ok=%d %lu 字节 %@",
+          reason, dst, ok, (unsigned long)embedded.length,
+          ok ? @"" : (err.localizedDescription ?: @""));
     return ok;
 }
 
@@ -124,24 +148,31 @@ static NSString *JJContainerEnginePath(void) {
 - (BOOL)loadEngine {
     if (self.loaded) return YES;
 
-    // 先把内嵌副本落到容器（仅当容器里还没有），让 ① 可用
+    // 先把内嵌副本落到容器（不存在则释放，旧版残留则覆盖升级），让 ① 可用
     [self seedEngineIntoContainer];
 
     NSString *src = nil;
     NSString *path = [self locateEngineScript];
     NSURL *sourceURL = nil;
+    NSString *origin = @"内嵌副本";
 
     if (path) {
         NSError *err = nil;
         src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
         if (!src.length) {
             NSLog(@"[JJCheat] 读取 engine.js 失败: %@", err);
+        } else if ([src rangeOfString:kJJEngineFeatureMark].location == NSNotFound) {
+            /* 双保险：容器覆盖失败（沙箱只读等）时旧脚本也不能进 JSContext */
+            NSLog(@"[JJCheat] engine.js 缺关键接口 %@（旧包残留？），改用内嵌副本",
+                  kJJEngineFeatureMark);
+            src = nil;
         } else {
             sourceURL = [NSURL fileURLWithPath:path];
+            origin = path.lastPathComponent ?: @"磁盘文件";
         }
     }
 
-    // 兜底：文件全都读不到就用内嵌副本，引擎照样能起
+    // 兜底：文件全都读不到（或版本过旧）就用内嵌副本，引擎照样能起
     if (!src.length) {
         src = [[NSString alloc] initWithBytes:JJEngineScript
                                        length:(NSUInteger)JJEngineScriptLength
@@ -153,6 +184,13 @@ static NSString *JJContainerEnginePath(void) {
         NSLog(@"[JJCheat] engine.js 不可用（文件与内嵌副本都读不出来）");
         return NO;
     }
+
+    /* 开机一条版本指纹：大小 + 关键接口有没有 + 实际来源，日志里一眼可判 */
+    NSLog(@"[JJCheat] engine.js 版本: %lu 字节, %@=%@, 来源=%@",
+          (unsigned long)[src lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+          kJJEngineFeatureMark,
+          [src rangeOfString:kJJEngineFeatureMark].location == NSNotFound ? @"缺" : @"有",
+          origin);
 
     dispatch_sync(self.engineQueue, ^{
         self.ctx = [[JSContext alloc] init];
@@ -209,13 +247,18 @@ static NSString *JJContainerEnginePath(void) {
             JSValue *arrVal = [self2 makePixelArray:rgba width:w height:h];
             if (arrVal) {
                 JSValue *fn = ctx[@"JJEngine"][@"learnAndRefine"];
-                JSValue *cornersVal = baseCorners
-                    ? [JSValue valueWithObject:baseCorners inContext:ctx]
-                    : [JSValue valueWithNullInContext:ctx];
-                JSValue *res = fn && !fn.isUndefined
-                    ? [fn callWithArguments:@[arrVal, @(w), @(h), cornersVal]]
-                    : nil;
-                if (res && !res.isUndefined && !res.isNull) result = [res toDictionary];
+                if (!fn || fn.isUndefined) {
+                    /* 旧版 engine.js 没有这个接口，原来会静默返回 nil，
+                       日志一片空白、学习永远不完成，必须留一条明确报错。 */
+                    NSLog(@"[JJCheat] JS 接口缺失: JJEngine.%@（engine.js 是旧版，学习无法进行）",
+                          kJJEngineFeatureMark);
+                } else {
+                    JSValue *cornersVal = baseCorners
+                        ? [JSValue valueWithObject:baseCorners inContext:ctx]
+                        : [JSValue valueWithNullInContext:ctx];
+                    JSValue *res = [fn callWithArguments:@[arrVal, @(w), @(h), cornersVal]];
+                    if (res && !res.isUndefined && !res.isNull) result = [res toDictionary];
+                }
             }
         }
         self2.busy = NO;
