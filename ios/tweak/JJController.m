@@ -8,6 +8,7 @@
 #import "JJEngineBridge.h"
 #import "JJScreenGrabber.h"
 #import "JJHUDWindow.h"
+#import "JJMetalGrabber.h"
 #import <UIKit/UIKit.h>
 #import <math.h>
 
@@ -121,10 +122,13 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
 @property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *pointCorners;
 @property (nonatomic, assign) int lastFrameW;
 @property (nonatomic, assign) int lastFrameH;
-/* 自动微调只做一次；dx/dy 是最终采用的像素偏移 */
+/* 四角自校准只做一次；finalCorners 是 JS refineGrid 采纳后的最终四角 */
 @property (nonatomic, assign) BOOL refineDone;
-@property (nonatomic, assign) int refineDx;
-@property (nonatomic, assign) int refineDy;
+@property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *finalCorners;
+/* 帧去重：Metal 没出新帧就不重复喂 JS（每帧 14MB 拷贝 + 90 格模板匹配） */
+@property (nonatomic, assign) uint64_t lastFrameSerial;
+/* 学习失败退避：learnAndRefine 要几百 ms~几秒，不能每 250ms 重跑一次 */
+@property (nonatomic, assign) NSTimeInterval lastLearnAttempt;
 @end
 
 @implementation JJController
@@ -256,8 +260,9 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     self.lastFrameW = 0;
     self.lastFrameH = 0;
     self.refineDone = NO;
-    self.refineDx = 0;
-    self.refineDy = 0;
+    self.finalCorners = nil;
+    self.lastFrameSerial = 0;
+    self.lastLearnAttempt = 0;
     [[JJEngineBridge shared] setCorners:pxCorners];
     [[JJEngineBridge shared] resetWithFen:nil];
     self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
@@ -297,27 +302,9 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     return px;
 }
 
-/* 自动网格微调：
-   手指点四点很难精确到 1/5 格，偏一点 90 个采样点就整体错位（表现为顶/底行全判成同色、
-   verifyDiff 卡在十几二十）。这里以当前标定为基准，在 ±30px 内粗搜再细搜，
-   用引擎自己的 verifyDiff 当目标函数挑最优偏移。只做一次。 */
-/* 标准开局 32 个有子位置（90 格索引：r*9+c） */
-static const int kStartPieceSq[32] = {
-    0, 1, 2, 3, 4, 5, 6, 7, 8,        /* 黑方底线 */
-    19, 25,                            /* 黑炮 r=2,c=1/7 */
-    27, 29, 31, 33, 35,                /* 黑兵 r=3,c=0/2/4/6/8 */
-    81, 82, 83, 84, 85, 86, 87, 88, 89,/* 红方底线 */
-    64, 70,                            /* 红炮 r=7,c=1/7 */
-    54, 56, 58, 60, 62                 /* 红兵 r=6,c=0/2/4/6/8 */
-};
-
-static BOOL JJSqIsStartPiece(int sq) {
-    for (int i = 0; i < 32; i++) if (kStartPieceSq[i] == sq) return YES;
-    return NO;
-}
-
-/* 四角双线性插值，和引擎里 gridPoints 的算法一致 */
-static CGPoint JJGridPt(NSArray *corners, int r, int c, int dx, int dy) {
+/* 四角双线性插值，和引擎里 gridPoints 的算法一致。
+   纯本地计算，不 dispatch_sync 问 JS —— 主线程不能再等引擎队列。 */
+static CGPoint JJGridPt(NSArray *corners, int r, int c) {
     double u = (double)c / 8.0;
     double v = (double)r / 9.0;
     double x00 = [corners[0][0] doubleValue], y00 = [corners[0][1] doubleValue];
@@ -326,92 +313,59 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c, int dx, int dy) {
     double x80 = [corners[3][0] doubleValue], y80 = [corners[3][1] doubleValue];
     double x = (1 - u) * (1 - v) * x00 + u * (1 - v) * x08 + u * v * x89 + (1 - u) * v * x80;
     double y = (1 - u) * (1 - v) * y00 + u * (1 - v) * y08 + u * v * y89 + (1 - u) * v * y80;
-    return CGPointMake(x + dx, y + dy);
+    return CGPointMake(x, y);
 }
 
-/* 纯内存评分：棋子位置的颜色与背景差异，应显著大于空位。
-   不调引擎，74 次候选也就几千次取色，毫秒级，不会卡主线程。 */
-static double JJOffsetScore(NSData *rgba, int w, int h, NSArray *corners, int dx, int dy) {
-    const uint8_t *px = (const uint8_t *)rgba.bytes;
-    NSUInteger len = rgba.length;
-    if (!px || w <= 0 || h <= 0) return -1e9;
-
-    /* 背景参考：中宫四周几个点（那里开局一定是空的） */
-    static const int refs[4][2] = { {4, 4}, {5, 4}, {4, 3}, {5, 3} };
-    double br = 0, bg = 0, bb = 0;
-    int bn = 0;
-    for (int i = 0; i < 4; i++) {
-        CGPoint p = JJGridPt(corners, refs[i][0], refs[i][1], dx, dy);
-        int x = (int)lround(p.x), y = (int)lround(p.y);
-        if (x < 0 || y < 0 || x >= w || y >= h) continue;
-        NSUInteger o = ((NSUInteger)y * (NSUInteger)w + (NSUInteger)x) * 4;
-        if (o + 2 >= len) continue;
-        br += px[o]; bg += px[o + 1]; bb += px[o + 2];
-        bn++;
-    }
-    if (bn == 0) return -1e9;
-    br /= bn; bg /= bn; bb /= bn;
-
-    double pieceSum = 0, emptySum = 0;
-    int pieceCnt = 0, emptyCnt = 0;
+/** 用给定四角本地算 90 个交叉点（dump 诊断 + HUD 画箭头都用它）。 */
+- (NSArray<NSArray<NSNumber *> *> *)gridPointsFromCorners:(NSArray *)corners {
+    if (corners.count != 4) return @[];
+    NSMutableArray *pts = [NSMutableArray arrayWithCapacity:90];
     for (int r = 0; r < 10; r++) {
         for (int c = 0; c < 9; c++) {
-            CGPoint p = JJGridPt(corners, r, c, dx, dy);
-            int x = (int)lround(p.x), y = (int)lround(p.y);
-            if (x < 0 || y < 0 || x >= w || y >= h) continue;
-            NSUInteger o = ((NSUInteger)y * (NSUInteger)w + (NSUInteger)x) * 4;
-            if (o + 2 >= len) continue;
-            double d = fabs(px[o] - br) + fabs(px[o + 1] - bg) + fabs(px[o + 2] - bb);
-            if (JJSqIsStartPiece(r * 9 + c)) { pieceSum += d; pieceCnt++; }
-            else { emptySum += d; emptyCnt++; }
+            CGPoint p = JJGridPt(corners, r, c);
+            [pts addObject:@[@(p.x), @(p.y)]];
         }
     }
-    if (pieceCnt == 0 || emptyCnt == 0) return -1e9;
-    return (pieceSum / pieceCnt) - (emptySum / emptyCnt);
+    return pts;
 }
 
-/* 学习：第一次用纯内存评分搜一次偏移，之后固定用这个偏移。
-   绝不在这里反复调引擎 —— 之前每 tick 74 次 dispatch_sync 直接把主线程堵死了。 */
-- (NSDictionary *)learnWithAutoRefine:(NSData *)rgba width:(int)w height:(int)h {
-    NSArray *base = [self cornersForWidth:w height:h];
-    if (!base) {
-        return [[JJEngineBridge shared] learnBoardWithPixels:rgba width:w height:h];
-    }
-
-    if (!self.refineDone) {
-        self.refineDone = YES;
-
-        double bestScore = -1e9;
-        int bdx = 0, bdy = 0;
-        for (int dy = -30; dy <= 30; dy += 10) {
-            for (int dx = -30; dx <= 30; dx += 10) {
-                double sc = JJOffsetScore(rgba, w, h, base, dx, dy);
-                if (sc > bestScore) { bestScore = sc; bdx = dx; bdy = dy; }
-            }
-        }
-        int cx = bdx, cy = bdy;
-        for (int dy = cy - 8; dy <= cy + 8; dy += 4) {
-            for (int dx = cx - 8; dx <= cx + 8; dx += 4) {
-                double sc = JJOffsetScore(rgba, w, h, base, dx, dy);
-                if (sc > bestScore) { bestScore = sc; bdx = dx; bdy = dy; }
-            }
-        }
-
-        self.refineDx = bdx;
-        self.refineDy = bdy;
-        NSLog(@"[JJCheat] 标定微调：dx=%d dy=%d score=%.1f", bdx, bdy, bestScore);
-    }
-
-    NSMutableArray *c = [NSMutableArray arrayWithCapacity:4];
-    for (NSArray *p in base) {
-        [c addObject:@[@([p[0] doubleValue] + self.refineDx), @([p[1] doubleValue] + self.refineDy)]];
-    }
-    [[JJEngineBridge shared] setCorners:c];
-    return [[JJEngineBridge shared] learnBoardWithPixels:rgba width:w height:h];
+/**
+ * 学习 + 四角自校准：整段丢到引擎队列异步跑，回调回主线程。
+ *
+ * 旧实现在这里用 JJOffsetScore 做 ±30px 纯平移粗搜/细搜，再 dispatch_sync 调
+ * learnBoard，两个硬伤：
+ *   ① 纯平移修不了梯形（真机底行左 y1967 / 右 y1994，9 行累计差 27px）；
+ *   ② dispatch_sync 让主线程冻结 3~4 秒，学习失败时每 250ms 又重来一次，
+ *      连着十几次正是日志里 12:08:19→12:08:50 那段 31 秒空白。
+ * 现在交给 JS 的 learnAndRefine：refineGrid 双线性拟合四角，再用 verifyDiff
+ * 前后对比取优（拟合拉歪也不会比现状差）。
+ */
+- (void)learnWithAutoRefine:(NSData *)rgba
+                      width:(int)w
+                     height:(int)h
+                   callback:(void (^)(NSDictionary *info))callback {
+    NSArray *base = self.finalCorners.count == 4
+        ? self.finalCorners
+        : [self cornersForWidth:w height:h];
+    [[JJEngineBridge shared] learnAndRefineWithPixels:rgba
+                                                  width:w
+                                                 height:h
+                                            baseCorners:base
+                                               callback:^(NSDictionary *result, NSError *error) {
+        if (callback) callback(result);
+    }];
 }
 
 - (void)applyCornersForFrameWidth:(int)w height:(int)h {
-    if (self.pointCorners.count != 4 || w <= 0 || h <= 0) return;
+    if (w <= 0 || h <= 0) return;
+    /* 学习已采纳精修四角后，不能再按 point 比例重设，否则梯形修正会被冲掉 */
+    if (self.finalCorners.count == 4) {
+        if (self.gridPtsCache.count != 90) {
+            self.gridPtsCache = [self gridPointsFromCorners:self.finalCorners];
+        }
+        return;
+    }
+    if (self.pointCorners.count != 4) return;
     if (self.lastFrameW == w && self.lastFrameH == h) return;
 
     CGSize pt = [UIScreen mainScreen].bounds.size;
@@ -428,7 +382,8 @@ static double JJOffsetScore(NSData *rgba, int w, int h, NSArray *corners, int dx
     self.lastFrameW = w;
     self.lastFrameH = h;
     [[JJEngineBridge shared] setCorners:px];
-    self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
+    /* 本地算，不再 dispatch_sync 问 JS（那会让主线程等引擎队列） */
+    self.gridPtsCache = [self gridPointsFromCorners:px];
 
     CGRect nb = [UIScreen mainScreen].nativeBounds;
     NSLog(@"[JJCheat] 抓帧 %dx%d（point %.0fx%.0f / native %.0fx%.0f）→ 标定缩放 %.3f/%.3f",
@@ -475,6 +430,14 @@ static double JJOffsetScore(NSData *rgba, int w, int h, NSArray *corners, int dx
     if (self.busy) return;
     if (self.state != JJCtrlStateWaitingBoard && self.state != JJCtrlStateRunning) return;
 
+    /* Metal 没出新帧就别把上一帧再喂一遍 JS：每帧要拷 14MB 进 JSContext
+       再跑 90 格模板匹配，重复帧纯属白烧 CPU。 */
+    uint64_t serial = JJMetalFrameSerial();
+    if (serial > 0) {
+        if (serial == self.lastFrameSerial) return;
+        self.lastFrameSerial = serial;
+    }
+
     int w = 0, h = 0;
     NSData *rgba = [[JJScreenGrabber shared] grabRGBAWithWidth:&w height:&h];
     if (!rgba || w <= 0 || h <= 0) return;
@@ -482,28 +445,45 @@ static double JJOffsetScore(NSData *rgba, int w, int h, NSArray *corners, int dx
     // 抓帧尺寸可能和 nativeBounds 不一致（roothide 下走 GL-hook），标定按实际尺寸重算
     [self applyCornersForFrameWidth:w height:h];
 
-    self.busy = YES;
-    self.tickCount++;
-
-    // 学习阶段需要带 patch 采样
+    // ---- 学习阶段：整段异步，主线程一步都不等 ----
     if (!self.learnedBoard) {
-        NSDictionary *info = [self learnWithAutoRefine:rgba width:w height:h];
-        if (info && [info[@"templateCount"] integerValue] > 0) {
-            self.learnedBoard = YES;
-            self.state = JJCtrlStateRunning;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        /* 失败退避：learnAndRefine 要几百 ms~几秒，旧逻辑每 250ms 重跑一次，
+           连着十几次就是日志里 12:08:19→12:08:50 那段 31 秒主线程空白。 */
+        if (now - self.lastLearnAttempt < 1.5) return;
+        self.lastLearnAttempt = now;
+        self.busy = YES;
+        self.tickCount++;
+
+        __weak typeof(self) weakSelf = self;
+        [self learnWithAutoRefine:rgba width:w height:h callback:^(NSDictionary *info) {
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (!self2) return;
+            self2.busy = NO;
+            if (!info || [info[@"templateCount"] integerValue] <= 0) {
+                [[JJHUDWindow shared] showStatus:@"正在学习棋盘…请停留在开局画面"];
+                return;
+            }
+            self2.learnedBoard = YES;
+            self2.state = JJCtrlStateRunning;
+            NSArray *fc = info[@"finalCorners"];
+            if ([fc isKindOfClass:[NSArray class]] && fc.count == 4) {
+                self2.finalCorners = fc;
+                self2.gridPtsCache = [self2 gridPointsFromCorners:fc];
+            } else {
+                self2.gridPtsCache = [[JJEngineBridge shared] gridPoints];
+            }
             NSLog(@"[JJCheat] 棋盘学习完成 %@", info);
             if (![info[@"ok"] boolValue]) {
                 NSLog(@"[JJCheat] 学习校验未通过（verifyDiff=%@），dump 采样点定位", info[@"verifyDiff"]);
-                [self dumpSamplesWithPixels:rgba width:w height:h];
+                [self2 dumpSamplesWithPixels:rgba width:w height:h];
             }
-        }
-        self.busy = NO;
-        if (!self.learnedBoard) {
-            [[JJHUDWindow shared] showStatus:@"正在学习棋盘…请停留在开局画面"];
-        }
+        }];
         return;
     }
 
+    self.busy = YES;
+    self.tickCount++;
     __weak typeof(self) weakSelf = self;
     [[JJEngineBridge shared] processPixels:rgba width:w height:h timeMs:JJ_TIME_MS
                                   callback:^(NSDictionary *result, NSError *error) {
@@ -513,14 +493,13 @@ static double JJOffsetScore(NSData *rgba, int w, int h, NSArray *corners, int dx
         if (!result) return;
 
         if (self2.gridPtsCache.count != 90) {
-            self2.gridPtsCache = [[JJEngineBridge shared] gridPoints];
+            self2.gridPtsCache = [self2 gridPointsFromCorners:self2.finalCorners];
         }
-
-        BOOL fail = [result[@"detectFail"] boolValue];
-        if (fail) {
-            NSNumber *d = result[@"detectDiff"];
-            [[JJHUDWindow shared] showStatus:[NSString stringWithFormat:@"识别偏差 %@ 格 · 长按球重新标定", d ?: @(0)]];
-            return;
+        /* 合法性闸门没放行时留一条日志：识别错成红车 5 个时整盘作废，
+           引擎会一直拿开局 FEN 算棋，表现就是「对方走完不给提示」。 */
+        if (![result[@"legalNow"] boolValue]) {
+            NSLog(@"[JJCheat] 识别未收敛：illegalStreak=%@ codesStable=%@（本帧盘面未采用）",
+                  result[@"illegalStreak"], result[@"codesStableCount"]);
         }
 
         [[JJHUDWindow shared] showResult:result gridPoints:self2.gridPtsCache fen:result[@"fen"] ?: @""];

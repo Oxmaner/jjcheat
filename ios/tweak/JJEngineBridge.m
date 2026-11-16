@@ -189,21 +189,40 @@ static NSString *JJContainerEnginePath(void) {
     });
 }
 
-- (NSDictionary *)learnBoardWithPixels:(NSData *)rgba width:(int)w height:(int)h {
-    if (![self loadEngine]) return nil;
-    __block NSDictionary *out = nil;
-    dispatch_sync(self.engineQueue, ^{
-        JSContext *ctx = self.ctx;
-        if (!ctx) return;
-        JSValue *arrVal = [self makePixelArray:rgba width:w height:h];
-        if (!arrVal) return;
-        JSValue *fn = ctx[@"JJEngine"][@"learnBoard"];
-        JSValue *res = [fn callWithArguments:@[arrVal, @(w), @(h)]];
-        if (res && !res.isUndefined && !res.isNull) {
-            out = [res toDictionary];
+- (void)learnAndRefineWithPixels:(NSData *)rgba
+                           width:(int)w
+                          height:(int)h
+                     baseCorners:(NSArray<NSArray<NSNumber *> *> *)baseCorners
+                        callback:(JJEngineResultBlock)callback {
+    if (![self loadEngine] || self.busy) {
+        if (callback) dispatch_async(dispatch_get_main_queue(), ^{ callback(nil, nil); });
+        return;
+    }
+    self.busy = YES;
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.engineQueue, ^{
+        __strong typeof(weakSelf) self2 = weakSelf;
+        NSDictionary *result = nil;
+        if (self2 && self2.ctx) {
+            JSContext *ctx = self2.ctx;
+            JSValue *arrVal = [self2 makePixelArray:rgba width:w height:h];
+            if (arrVal) {
+                JSValue *fn = ctx[@"JJEngine"][@"learnAndRefine"];
+                JSValue *cornersVal = baseCorners
+                    ? [JSValue valueWithObject:baseCorners inContext:ctx]
+                    : [JSValue valueWithNullInContext:ctx];
+                JSValue *res = fn && !fn.isUndefined
+                    ? [fn callWithArguments:@[arrVal, @(w), @(h), cornersVal]]
+                    : nil;
+                if (res && !res.isUndefined && !res.isNull) result = [res toDictionary];
+            }
+        }
+        self2.busy = NO;
+        if (callback) {
+            dispatch_async(dispatch_get_main_queue(), ^{ callback(result, nil); });
         }
     });
-    return out;
 }
 
 - (void)processPixels:(NSData *)rgba
@@ -215,7 +234,11 @@ static NSString *JJContainerEnginePath(void) {
         if (callback) dispatch_async(dispatch_get_main_queue(), ^{ callback(nil, nil); });
         return;
     }
-    if (self.busy) return;   // 上一帧还没算完，丢弃新帧（防堆积）
+    if (self.busy) {
+        /* 必须回调：上层 JJController 靠回调清自己的 busy，直接 return 会让它永久停摆 */
+        if (callback) dispatch_async(dispatch_get_main_queue(), ^{ callback(nil, nil); });
+        return;
+    }
     self.busy = YES;
 
     __weak typeof(self) weakSelf = self;

@@ -442,6 +442,128 @@ var JJEngine = {
     };
   },
 
+  /**
+   * 学习 + 四角独立自校准（一次调用完成，供 ObjC 在后台队列里跑）
+   *
+   * 为什么需要：手动标定的四角带梯形误差，纯平移 dx/dy 修不了。
+   * 真机实测底行左 y1967 / 右 y1994，9 行累计差 27px，四角采样直接落到木色上，
+   * 模板把残缺字形认成别的兵种（verifyDiff=16），进而被 codesLegal 判死。
+   * REC.refineGrid 按双线性（含 u*v 交叉项）对 90 个格点做最小二乘拟合，
+   * 能表达梯形，正好修这个。
+   *
+   * 性能：refineGrid 的邻域搜索量与格距平方成正比，全尺寸 1284x2778 要十几秒。
+   * 先在 1/2 降采样图上拟合（约 1/4 耗时）再乘回 2，最后用 verifyDiff 仲裁，
+   * 所以即使拟合不精确也不会比现状更差。
+   *
+   * @returns {object} learnBoard 的全部字段 + refine* 诊断字段
+   */
+  learnAndRefine: function (pixels, w, h, baseCorners) {
+    /** 四角结果体检：位移不超限、四条边不塌缩 */
+    function sane(a, b, lim, minEdge) {
+      if (!b || b.length !== 4) return false;
+      for (var i = 0; i < 4; i++) {
+        if (!b[i] || !isFinite(b[i][0]) || !isFinite(b[i][1])) return false;
+        if (Math.abs(b[i][0] - a[i][0]) > lim || Math.abs(b[i][1] - a[i][1]) > lim) return false;
+      }
+      var wt = b[1][0] - b[0][0], wb = b[2][0] - b[3][0];
+      var hl = b[3][1] - b[0][1], hr = b[2][1] - b[1][1];
+      return wt > minEdge && wb > minEdge && hl > minEdge && hr > minEdge;
+    }
+    function copy(src) {
+      var o = {};
+      for (var k in src) if (Object.prototype.hasOwnProperty.call(src, k)) o[k] = src[k];
+      return o;
+    }
+    /** 2x 最近邻降采样：棋盘是大色块，最近邻足够，比 2x2 平均快一倍 */
+    function halfPixels(px, w0, h0) {
+      var nw = w0 >> 1, nh = h0 >> 1;
+      var out = new Uint8ClampedArray(nw * nh * 4);
+      for (var y = 0; y < nh; y++) {
+        for (var x = 0; x < nw; x++) {
+          var s = ((y * 2) * w0 + x * 2) * 4, d = (y * nw + x) * 4;
+          out[d] = px[s]; out[d + 1] = px[s + 1]; out[d + 2] = px[s + 2]; out[d + 3] = 255;
+        }
+      }
+      return { data: out, w: nw, h: nh };
+    }
+
+    var base = (baseCorners && baseCorners.length === 4) ? baseCorners : null;
+    if (base) JJEngine.setCorners(base);
+
+    var refined = null, err = '', tried = 0;
+    if (base) {
+      tried = 1;
+      try {
+        var sm = halfPixels(pixels, w, h);
+        var bs = base.map(function (p) { return [p[0] * 0.5, p[1] * 0.5]; });
+        var rs = REC.refineGrid(sm.data, sm.w, sm.h, bs, 2);
+        if (rs && sane(bs, rs, 30, 50)) {
+          /* 真机采样点证明 x 方向本来就是准的：左边 99→95、右边 1194→1193，
+             两条边几乎垂直；梯形误差全在 y（底行左 1967 / 右 1994）。
+             而 refineGrid 会被棋盘外的暖色木框把 x 拉歪几十像素，
+             所以 x 只采纳一个整体平移，y 才让四角独立。 */
+          var shiftX = 0;
+          for (var qi = 0; qi < 4; qi++) shiftX += rs[qi][0] * 2 - base[qi][0];
+          shiftX = Math.max(-30, Math.min(30, shiftX / 4));
+          var back = rs.map(function (p2, i2) {
+            /* 顶边也有证据：#0 y797 / #8 y794，只差 3px，本来就是准的。
+               拟合偶尔会被木框把顶边整体拉走几十像素，所以顶边只给 ±20，
+               底边才允许 ±60（梯形误差集中在底行，右下角要修 ~27px）。 */
+            var limY = (i2 < 2) ? 20 : 60;
+            var dy = Math.max(-limY, Math.min(limY, p2[1] * 2 - base[i2][1]));
+            return [base[i2][0] + shiftX, base[i2][1] + dy];
+          });
+          if (sane(base, back, 60, 100)) refined = back;
+        }
+      } catch (e2) { err = String(e2 && e2.message || e2); refined = null; }
+    }
+
+    var rRef = null, dRef = 999, rBase = null, dBase = null;
+    if (refined) {
+      JJEngine.setCorners(refined);
+      try { rRef = JJEngine.learnBoard(pixels, w, h); dRef = rRef.verifyDiff; }
+      catch (e3) { rRef = null; dRef = 999; }
+      /* 拟合后已经收敛（ok 的阈值就是 8），直接用，省掉基准帧那次全量学习 */
+      if (rRef && dRef <= 8) {
+        var fast = copy(rRef);
+        fast.refineTried = tried;
+        fast.refineAccepted = 1;
+        fast.diffBase = null;
+        fast.diffRefined = dRef;
+        fast.diffBefore = null;
+        fast.diffAfter = dRef;
+        fast.refineCorners = refined;
+        fast.finalCorners = refined;
+        fast.refineError = err;
+        return fast;
+      }
+    }
+
+    if (base) JJEngine.setCorners(base);
+    try { rBase = JJEngine.learnBoard(pixels, w, h); dBase = rBase.verifyDiff; }
+    catch (e4) {
+      return { verifyDiff: 999, ok: 0, templateCount: 0,
+               finalCorners: base || session.corners || [], refineError: String(e4 && e4.message || e4) };
+    }
+
+    var accepted = (rRef && dRef < dBase) ? 1 : 0;
+    if (accepted) {
+      /* bgModel 已在 refined 那一帧学过，只需把 corners 切回去 */
+      JJEngine.setCorners(refined);
+    }
+    var out = copy(accepted ? rRef : rBase);
+    out.refineTried = tried;
+    out.refineAccepted = accepted;
+    out.diffBase = dBase;
+    out.diffRefined = rRef ? dRef : null;
+    out.diffBefore = dBase;
+    out.diffAfter = accepted ? dRef : dBase;
+    out.refineCorners = refined || null;
+    out.finalCorners = accepted ? refined : (base || session.corners || []);
+    out.refineError = err;
+    return out;
+  },
+
   /** 清空学习结果，退回默认阈值模式（画面不是开局时的兜底） */
   skipLearning: function () {
     if (session.recognizer) {
@@ -956,6 +1078,11 @@ var JJEngine = {
     }
     out.codesValid = codesOk ? 1 : 0;
     out.codesSettled = codesSettled ? 1 : 0;
+    // 诊断：合法性闸门为什么没放行。识别错到红车 5 个、黑车 4 个时 codesLegal
+    // 会判 false，整盘被作废、拿开局 FEN 算棋，表现就是「对方走完不给提示」。
+    out.legalNow = legalNow ? 1 : 0;
+    out.illegalStreak = session.illegalStreak || 0;
+    out.codesStableCount = session.codesStable || 0;
 
     // 2) 到了我方走 → 算棋
     var analyzeFen = directFen || session.tracker.fen;

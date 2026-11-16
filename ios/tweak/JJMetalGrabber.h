@@ -16,8 +16,11 @@
 extern "C" {
 #endif
 
-/** 取最新一帧 RGBA（1.5 秒内有效），没有则 nil */
+/** 取最新一帧 RGBA（5 秒内有效），没有则 nil */
 NSData *JJMetalFrameCopy(int *outW, int *outH);
+
+/** 已成功出帧的序号；上层用它跳过「同一帧重复喂给 JS」的白工 */
+uint64_t JJMetalFrameSerial(void);
 
 /** 安装 hook（幂等；Metal framework 未加载时会先 dlopen） */
 void JJMetalInstallHooks(void);

@@ -27,6 +27,10 @@ static int                            s_glHookFrames   = 0;
 static int                            s_grabLogCount   = 0;
 static int                            s_rsFailStreak   = 0;
 static int                            s_blackFrames    = 0;
+/* 最近一张内容有效的 Metal 帧：游戏停渲染时复用，避免掉进全屏 CALayer 回退 */
+static NSData *                       s_lastGoodMetal  = nil;
+static int                            s_lastGoodW      = 0;
+static int                            s_lastGoodH      = 0;
 
 @interface JJScreenGrabber () {
     IOSurfaceRef   _surface;
@@ -308,17 +312,33 @@ static BOOL JJFrameIsBlack(NSData *d, int w, int h) {
         NSLog(@"[JJCheat] GL-hook 帧全黑（读像素时机不对，或游戏不是 GL 渲染）");
     }
 
-    /* ② Metal：present 之前 blit 读回 drawable 的 texture（GL 游戏不会走到这里） */
+    /* ② Metal：nextDrawable 的 IOSurface（GL 游戏不会走到这里） */
     w = 0; h = 0;
     d = [self grabViaMetalWithWidth:&w height:&h];
     if (d.length && !JJFrameIsBlack(d, w, h)) {
+        s_lastGoodMetal = d;
+        s_lastGoodW = w;
+        s_lastGoodH = h;
         if (outW) *outW = w;
         if (outH) *outH = h;
         [self logGrabSource:@"Metal" data:d w:outW h:outH];
         return d;
     }
 
-    /* ② CARenderServer：roothide 下常常静默返回全黑，验内容后不可用就关掉 */
+    /* Metal 曾经稳定出过帧就不再回退。
+       结算页 / 对方思考时游戏会停渲染，旧逻辑会因为「帧过期」掉到
+       CARenderServer（roothide 下静默全黑）再到 CALayer——后者要在主线程
+       全屏 renderInContext，既卡又只拿到一张全黑图，JS 还会白跑一轮模板匹配。
+       复用上一张有效帧，配合上层 JJMetalFrameSerial 去重，代价为零。 */
+    if (s_lastGoodMetal.length) {
+        int cw = s_lastGoodW, ch = s_lastGoodH;
+        if (outW) *outW = cw;
+        if (outH) *outH = ch;
+        [self logGrabSource:@"Metal(缓存)" data:s_lastGoodMetal w:&cw h:&ch];
+        return s_lastGoodMetal;
+    }
+
+    /* ② CARenderServer：Metal 从未成功时才试，roothide 下常常静默返回全黑 */
     w = 0; h = 0;
     d = [self grabViaRenderServerWithWidth:&w height:&h];
     if (d.length && !JJFrameIsBlack(d, w, h)) {

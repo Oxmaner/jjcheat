@@ -1,4 +1,4 @@
-//
+﻿//
 //  JJEngineBridge.h
 //  JJCheat
 //
@@ -25,10 +25,18 @@ typedef void (^JJEngineResultBlock)(NSDictionary * _Nullable result, NSError * _
 /** 重置到指定局面（nil = 标准开局） */
 - (void)resetWithFen:(nullable NSString *)fen;
 
-/** 在「正好是标准开局」的画面上学习棋盘背景与棋子模板 */
-- (nullable NSDictionary *)learnBoardWithPixels:(NSData *)rgba
-                                          width:(int)w
-                                         height:(int)h;
+/**
+ * 学习棋盘 + 四角独立自校准，整段在引擎队列异步执行，回调回主线程。
+ *
+ * 为什么必须异步：learnBoard 要跑 90 格模板匹配，refineGrid 还要对 90 个格点
+ * 做邻域搜索 + 最小二乘拟合，同步调用会把主线程冻住好几秒（真机实测 3~4 秒）。
+ * baseCorners 传 nil 时只做原来的 learnBoard，不校准。
+ */
+- (void)learnAndRefineWithPixels:(NSData *)rgba
+                           width:(int)w
+                          height:(int)h
+                     baseCorners:(nullable NSArray<NSArray<NSNumber *> *> *)baseCorners
+                        callback:(JJEngineResultBlock)callback;
 
 /**
  * 处理一帧。异步执行（引擎搜索会占用几百毫秒），回调在主线程。

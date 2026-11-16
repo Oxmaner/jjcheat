@@ -335,11 +335,21 @@ NSData *JJMetalFrameCopy(int *outW, int *outH) {
     os_unfair_lock_unlock(&gLock);
 
     if (!d.length || w <= 0 || h <= 0) return nil;
-    if (CACurrentMediaTime() - ts > 1.5) return nil;
+    /* 结算页/对方思考时游戏会主动降帧甚至停渲染，1.5s 太容易误判「无帧」，
+       一误判就掉到 CALayer 全屏 renderInContext（主线程重活 + 拿到全黑帧）。
+       放宽到 5s，配合 JJScreenGrabber 的有效帧缓存兜底。 */
+    if (CACurrentMediaTime() - ts > 5.0) return nil;
 
     if (outW) *outW = w;
     if (outH) *outH = h;
     return d;
+}
+
+uint64_t JJMetalFrameSerial(void) {
+    os_unfair_lock_lock(&gLock);
+    uint64_t s = (uint64_t)gCaptureCount;
+    os_unfair_lock_unlock(&gLock);
+    return s;
 }
 
 NSString *JJMetalStatus(void) {
