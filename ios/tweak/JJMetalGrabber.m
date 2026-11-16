@@ -113,20 +113,21 @@ static id JJNextDrawable(id self, SEL _cmd) {
     return d;
 }
 
-/* 找原实现：先查本类记录，再沿父类链找一个「不是我们自己」的实现 */
+/* 找原实现：
+   我们 hook 的可能是父类（class_copyMethodList 只列自有方法），运行时 self 是子类，
+   所以不能只看 [self class]，要沿父类链找「字典里有记录的那个类」。 */
 static IMP JJFindOrigPresent(id self, SEL _cmd) {
-    NSString *key = NSStringFromClass([self class]);
-    IMP orig = key ? [gOrigPresentByClass[key] pointerValue] : NULL;
-    if (orig && orig != (IMP)JJPresentDrawable) return orig;
-
-    Class sup = class_getSuperclass([self class]);
-    while (sup) {
-        Method m = class_getInstanceMethod(sup, _cmd);
-        if (m) {
-            IMP imp = method_getImplementation(m);
-            if (imp != (IMP)JJPresentDrawable) return imp;
+    Class c = [self class];
+    while (c) {
+        NSString *name = NSStringFromClass(c);
+        if (name) {
+            NSValue *v = gOrigPresentByClass[name];
+            if (v) {
+                IMP imp = (IMP)[v pointerValue];
+                if (imp && imp != (IMP)JJPresentDrawable) return imp;
+            }
         }
-        sup = class_getSuperclass(sup);
+        c = class_getSuperclass(c);
     }
     return NULL;
 }

@@ -219,6 +219,10 @@ static void swapRB(uint32_t *p, size_t count) {
 
 - (NSData *)grabViaMetalWithWidth:(int *)outW height:(int *)outH {
     NSData *d = JJMetalFrameCopy(outW, outH);
+    static int s_metalLog = 0;
+    if ((s_metalLog++ % 25) == 0) {
+        NSLog(@"[JJCheat] Metal 状态 %@ (frame=%d B)", JJMetalStatus(), (int)d.length);
+    }
     if (d.length) self.activeMethod = @"Metal";
     return d;
 }
