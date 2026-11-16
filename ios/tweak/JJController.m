@@ -276,6 +276,77 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
  *  识别结果就是「整盘空格」—— 表现正好是 verifyDiff=32、顶/底行 0 子。
  *  这里按「实际抓帧尺寸 / 屏幕 point」重算一次，尺寸变了才重设。
  * ------------------------------------------------------------ */
+/* 只算不设：把标定的 point 坐标按抓帧尺寸换算成像素坐标 */
+- (NSArray<NSArray<NSNumber *> *> *)cornersForWidth:(int)w height:(int)h {
+    if (self.pointCorners.count != 4 || w <= 0 || h <= 0) return nil;
+    CGSize pt = [UIScreen mainScreen].bounds.size;
+    if (pt.width <= 0 || pt.height <= 0) return nil;
+    CGFloat sx = (CGFloat)w / pt.width;
+    CGFloat sy = (CGFloat)h / pt.height;
+    NSMutableArray *px = [NSMutableArray arrayWithCapacity:4];
+    for (NSArray *p in self.pointCorners) {
+        [px addObject:@[@([p[0] doubleValue] * sx), @([p[1] doubleValue] * sy)]];
+    }
+    return px;
+}
+
+/* 自动网格微调：
+   手指点四点很难精确到 1/5 格，偏一点 90 个采样点就整体错位（表现为顶/底行全判成同色、
+   verifyDiff 卡在十几二十）。这里以当前标定为基准，在 ±30px 内粗搜再细搜，
+   用引擎自己的 verifyDiff 当目标函数挑最优偏移。只做一次。 */
+- (NSDictionary *)learnWithAutoRefine:(NSData *)rgba width:(int)w height:(int)h {
+    NSArray *base = [self cornersForWidth:w height:h];
+    if (!base) {
+        return [[JJEngineBridge shared] learnBoardWithPixels:rgba width:w height:h];
+    }
+
+    __block NSInteger bestDiff = NSIntegerMax;
+    __block NSArray *bestCorners = base;
+    __block int bestDx = 0;
+    __block int bestDy = 0;
+    __block NSDictionary *bestInfo = nil;
+
+    void (^tryOffset)(int, int) = ^(int dx, int dy) {
+        NSMutableArray *c = [NSMutableArray arrayWithCapacity:4];
+        for (NSArray *p in base) {
+            [c addObject:@[@([p[0] doubleValue] + dx), @([p[1] doubleValue] + dy)]];
+        }
+        [[JJEngineBridge shared] setCorners:c];
+        NSDictionary *info = [self learnWithAutoRefine:rgba width:w height:h];
+        NSInteger diff = [info[@"verifyDiff"] integerValue];
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            bestCorners = c;
+            bestDx = dx;
+            bestDy = dy;
+            bestInfo = info;
+        }
+    };
+
+    /* 粗搜：±30，步长 10 */
+    for (int dy = -30; dy <= 30; dy += 10) {
+        for (int dx = -30; dx <= 30; dx += 10) {
+            tryOffset(dx, dy);
+        }
+    }
+    /* 细搜：粗搜最优点附近 ±8，步长 4 */
+    int cx = bestDx, cy = bestDy;
+    for (int dy = cy - 8; dy <= cy + 8; dy += 4) {
+        for (int dx = cx - 8; dx <= cx + 8; dx += 4) {
+            tryOffset(dx, dy);
+        }
+    }
+
+    [[JJEngineBridge shared] setCorners:bestCorners];
+    NSDictionary *final = [[JJEngineBridge shared] learnBoardWithPixels:rgba width:w height:h];
+    NSLog(@"[JJCheat] 标定微调：最优偏移 dx=%d dy=%d，verifyDiff %ld → %@",
+          bestDx, bestDy, (long)[bestInfo[@"verifyDiff"] integerValue], final[@"verifyDiff"]);
+    self.lastFrameW = 0;   /* 让下一帧按新 corners 重算 gridPoints */
+    self.lastFrameH = 0;
+    self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
+    return final;
+}
+
 - (void)applyCornersForFrameWidth:(int)w height:(int)h {
     if (self.pointCorners.count != 4 || w <= 0 || h <= 0) return;
     if (self.lastFrameW == w && self.lastFrameH == h) return;
