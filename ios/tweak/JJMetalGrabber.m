@@ -103,6 +103,8 @@ static void JJMetalCapture(id drawable) {
 
 #pragma mark - hooks
 
+static void JJPresentDrawable(id self, SEL _cmd, id drawable);
+
 static id JJNextDrawable(id self, SEL _cmd) {
     id d = ((id (*)(id, SEL))gOrigNextDrawable)(self, _cmd);
     if (++gNextDrawableCount == 1) {
@@ -111,17 +113,41 @@ static id JJNextDrawable(id self, SEL _cmd) {
     return d;
 }
 
+/* 找原实现：先查本类记录，再沿父类链找一个「不是我们自己」的实现 */
+static IMP JJFindOrigPresent(id self, SEL _cmd) {
+    NSString *key = NSStringFromClass([self class]);
+    IMP orig = key ? [gOrigPresentByClass[key] pointerValue] : NULL;
+    if (orig && orig != (IMP)JJPresentDrawable) return orig;
+
+    Class sup = class_getSuperclass([self class]);
+    while (sup) {
+        Method m = class_getInstanceMethod(sup, _cmd);
+        if (m) {
+            IMP imp = method_getImplementation(m);
+            if (imp != (IMP)JJPresentDrawable) return imp;
+        }
+        sup = class_getSuperclass(sup);
+    }
+    return NULL;
+}
+
 static void JJPresentDrawable(id self, SEL _cmd, id drawable) {
     @try {
         JJMetalCapture(drawable);
     } @catch (NSException *e) {
         gCaptureFail++;
     }
-    IMP orig = nil;
-    NSString *key = NSStringFromClass([self class]);
-    if (key) orig = [gOrigPresentByClass[key] pointerValue];
+
+    /* 无论如何都要把原始 present 调回去，否则画面直接黑 */
+    IMP orig = JJFindOrigPresent(self, _cmd);
     if (orig) {
         ((void (*)(id, SEL, id))orig)(self, _cmd, drawable);
+    } else {
+        gCaptureFail++;
+        if ((gCaptureFail % 200) == 1) {
+            NSLog(@"[JJCheat] 警告：presentDrawable: 找不到原实现（%@），本帧未 present",
+                  NSStringFromClass([self class]));
+        }
     }
 }
 
@@ -129,41 +155,52 @@ void JJMetalInstallHooks(void) {
     if (gHooksInstalled) return;
     gHooksInstalled = YES;
 
-    /* Metal framework 可能是懒加载的 */
-    void *m = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY);
-    if (!m) dlopen("/System/Library/PrivateFrameworks/Metal.framework/Metal", RTLD_LAZY);
+    @try {
+        void *m = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY);
+        if (!m) dlopen("/System/Library/PrivateFrameworks/Metal.framework/Metal", RTLD_LAZY);
 
-    gOrigPresentByClass = [NSMutableDictionary dictionary];
+        gOrigPresentByClass = [NSMutableDictionary dictionary];
 
-    Class layerCls = NSClassFromString(@"CAMetalLayer");
-    if (layerCls) {
-        Method nm = class_getInstanceMethod(layerCls, @selector(nextDrawable));
-        if (nm) {
-            gOrigNextDrawable = method_getImplementation(nm);
-            method_setImplementation(nm, (IMP)JJNextDrawable);
+        Class layerCls = NSClassFromString(@"CAMetalLayer");
+        if (layerCls) {
+            Method nm = class_getInstanceMethod(layerCls, @selector(nextDrawable));
+            if (nm) {
+                gOrigNextDrawable = method_getImplementation(nm);
+                method_setImplementation(nm, (IMP)JJNextDrawable);
+            }
         }
-    }
+        NSLog(@"[JJCheat] Metal: CAMetalLayer=%@ nextDrawable=%@",
+              layerCls ? @"有" : @"没有", gOrigNextDrawable ? @"已 hook" : @"未 hook");
 
-    /* presentDrawable: 定义在若干私有 command buffer 类上，扫一遍全装上 */
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    int hooked = 0;
-    for (unsigned int i = 0; i < count; i++) {
-        Class c = classes[i];
-        Method pm = class_getInstanceMethod(c, @selector(presentDrawable:));
-        if (!pm) continue;
-        IMP cur = method_getImplementation(pm);
-        if (cur == (IMP)JJPresentDrawable) continue;   /* 父类已装 */
-        NSString *name = NSStringFromClass(c);
-        if (!name) continue;
-        gOrigPresentByClass[name] = [NSValue valueWithPointer:cur];
-        method_setImplementation(pm, (IMP)JJPresentDrawable);
-        hooked++;
-    }
-    if (classes) free(classes);
+        /* 只 hook「自己实现了 presentDrawable:」的类（class_copyMethodList 不含继承），
+           这样每个类的 orig 一定是它自己的实现，不会查不到。 */
+        unsigned int count = 0;
+        Class *classes = objc_copyClassList(&count);
+        int hooked = 0;
+        for (unsigned int i = 0; i < count; i++) {
+            Class c = classes[i];
+            unsigned int mcount = 0;
+            Method *methods = class_copyMethodList(c, &mcount);
+            if (!methods) continue;
+            for (unsigned int k = 0; k < mcount; k++) {
+                if (method_getName(methods[k]) != @selector(presentDrawable:)) continue;
+                IMP cur = method_getImplementation(methods[k]);
+                if (cur == (IMP)JJPresentDrawable) break;
+                NSString *name = NSStringFromClass(c);
+                if (!name) break;
+                gOrigPresentByClass[name] = [NSValue valueWithPointer:cur];
+                method_setImplementation(methods[k], (IMP)JJPresentDrawable);
+                hooked++;
+                break;
+            }
+            free(methods);
+        }
+        if (classes) free(classes);
 
-    NSLog(@"[JJCheat] Metal hook: nextDrawable=%@ presentDrawable 类数=%d CAMetalLayer=%@",
-          gOrigNextDrawable ? @"装" : @"没装", hooked, layerCls ? @"有" : @"没有");
+        NSLog(@"[JJCheat] Metal hook 完成：presentDrawable 类数=%d", hooked);
+    } @catch (NSException *e) {
+        NSLog(@"[JJCheat] Metal hook 安装异常: %@", e);
+    }
 }
 
 #pragma mark - 对外
