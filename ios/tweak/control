@@ -6,4 +6,5 @@ Description: JJ象棋 实时辅助（roothide 适配版）— 识别棋盘、引
 Maintainer: fujiang
 Author: fujiang
 Section: Tweaks
+Icon: file:///Library/Application Support/JJCheat/logo.png
 Depends: mobilesubstrate, firmware (>= 14.0)

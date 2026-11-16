@@ -1,4 +1,4 @@
-#ifndef JJConfig_h
+﻿#ifndef JJConfig_h
 #define JJConfig_h
 
 /* ============================================================
@@ -6,13 +6,23 @@
  * ============================================================ */
 
 /* 每步搜索思考时长（毫秒）。越大越强，越费电。
-   识别没收敛时 FEN 会逐帧抖动，每抖动一次就重算一次；900ms 会让 JS 线程
-   长期满载、整机发烫掉帧。350ms 的建议走法对实战足够，先保证流畅。 */
-#define JJ_TIME_MS              350
+   1.1.42 起改为运行时可在悬浮球菜单里修改（不再编译期写死）。
+   默认 200ms：真机实测 350ms 在识别未收敛时会让 JS 队列长期满载。 */
+#define JJ_THINK_MS_DEFAULT     200
+#define JJ_THINK_MS_MIN         50
+#define JJ_THINK_MS_MAX         3000
 
 /* 抓帧频率（每秒）。每帧都要跑 90 格采样 + 86 模板比对 + 浮窗扫描，
    8 fps 时 JS 线程几乎没空闲；4 fps 仍远快于落子动画（~200ms）。 */
 #define JJ_SCAN_FPS             4
+
+/* process 调用节流（秒）。一次 process 在真机上要数秒，回调刚落地就立刻
+   发下一帧会让引擎队列永不清空；识别未收敛时再退避更久，避免空转烧 CPU。 */
+#define JJ_PROCESS_MIN_GAP      0.8
+#define JJ_PROCESS_ILLEGAL_GAP  2.5
+#define JJ_LEARN_RETRY_GAP      3.0
+/* 学习连续失败上限：超过就停下来提示用户切回开局画面，不再无限重试 */
+#define JJ_LEARN_MAX_FAIL       6
 
 /* 连续多少帧识别一致才认为局面稳定（防手抖/动画中间帧） */
 #define JJ_STABLE_FRAMES        2
@@ -39,5 +49,10 @@
 #define JJ_KEY_CORNERS          @"JJCheat.corners"
 #define JJ_KEY_ENABLED          @"JJCheat.enabled"
 #define JJ_KEY_CALIBRATED       @"JJCheat.calibrated"
+#define JJ_KEY_HUD_VISIBLE      @"JJCheat.hudVisible"
+#define JJ_KEY_THINK_MS         @"JJCheat.thinkMs"
+
+/* 插件图标：随 deb 落到 jbroot 下，悬浮球优先用它，读不到回退文字「象棋」 */
+#define JJ_LOGO_REL_PATH        @"Library/Application Support/JJCheat/logo.png"
 
 #endif /* JJConfig_h */

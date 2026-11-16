@@ -37,7 +37,14 @@ static IMP gOrigNextDrawable = NULL;
    固定 5 fps（覆盖 JJ_SCAN_FPS 的 4 帧需求并留余量），不用「每 N 帧」——
    游戏帧率一变，读数就跟着失控。 */
 static CFTimeInterval gLastReadTs = 0;
-static const CFTimeInterval kJJReadInterval = 0.20;
+/* 读一帧 = 14MB memcpy + 350 万次 32 位 R/B 交换，是在游戏的渲染线程上做的。
+   0.20s 一次（5Hz）等于每 12 帧就卡一次渲染管线，真机表现就是「巨卡无比」。
+   JJ_SCAN_FPS=4 且 process 实际几秒才跑一次，1s 一帧完全够用。 */
+static const CFTimeInterval kJJReadInterval = 1.0;
+
+/* 抓帧总开关：默认关。待机（只挂悬浮球）和插件关闭时真的不读帧，
+   由 JJController 在点球开工 / 打开插件时置 YES。 */
+static volatile BOOL gCaptureEnabled = NO;
 
 /* 只统计 nextDrawable→IOSurface 这条路径出的帧，用来关掉重复的 present blit */
 static int gSurfaceReadCount = 0;
@@ -78,7 +85,7 @@ static IOSurfaceRef JJDrawableSurface(id drawable) {
 }
 
 static void JJReadSurface(IOSurfaceRef s, int w, int h) {
-    if (!s || w <= 0 || h <= 0) return;
+    if (!gCaptureEnabled || !s || w <= 0 || h <= 0) return;
     if (IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL) != KERN_SUCCESS) {
         gCaptureFail++;
         return;
@@ -130,7 +137,7 @@ static void JJReadSurface(IOSurfaceRef s, int w, int h) {
 #pragma mark - blit 兜底（present 路径真的存在时才有用）
 
 static void JJMetalCapture(id drawable) {
-    if (!drawable) return;
+    if (!gCaptureEnabled || !drawable) return;
     int seq = gPresentCount++;
     /* nextDrawable 的 IOSurface 路径已稳定出帧后，present blit 纯属重复劳动：
        又要 GPU→CPU 同步读回 14MB，直接卡住渲染管线。只在 IOSurface 还没出过帧时
@@ -207,6 +214,16 @@ static IMP JJFindOrig(id self, SEL _cmd) {
 #pragma mark - nextDrawable：核心
 
 static id JJNextDrawable(id self, SEL _cmd) {
+    /* 插件没开工时只透传：不 retain surface、不读帧、不做字节交换。
+       原来所谓「待机不抓帧」只是上层不取帧，hook 仍然 5Hz 读 14MB，
+       游戏渲染线程一直被拖着走。 */
+    if (!gCaptureEnabled) {
+        if (gPendingSurface) {
+            CFRelease(gPendingSurface);
+            gPendingSurface = NULL;
+        }
+        return ((id (*)(id, SEL))gOrigNextDrawable)(self, _cmd);
+    }
     int idx = gNextDrawableCount;
     CFTimeInterval now = CACurrentMediaTime();
 
@@ -354,6 +371,24 @@ uint64_t JJMetalFrameSerial(void) {
 
 NSString *JJMetalStatus(void) {
     return [NSString stringWithFormat:
-            @"nextDrawable=%d present=%d captured=%d fail=%d surfaceMiss=%d origMissing=%d",
-            gNextDrawableCount, gPresentCount, gCaptureCount, gCaptureFail, gSurfaceMiss, gOrigMissing];
+            @"nextDrawable=%d present=%d captured=%d fail=%d surfaceMiss=%d origMissing=%d enabled=%d",
+            gNextDrawableCount, gPresentCount, gCaptureCount, gCaptureFail, gSurfaceMiss, gOrigMissing,
+            gCaptureEnabled ? 1 : 0];
+}
+
+void JJMetalSetCaptureEnabled(BOOL enabled) {
+    gCaptureEnabled = enabled;
+    if (!enabled) {
+        /* 立刻丢掉挂着的 surface，别把上一帧留到下次开工时误用 */
+        if (gPendingSurface) {
+            CFRelease(gPendingSurface);
+            gPendingSurface = NULL;
+        }
+        os_unfair_lock_lock(&gLock);
+        gFrame = nil;
+        gFrameW = 0;
+        gFrameH = 0;
+        os_unfair_lock_unlock(&gLock);
+    }
+    NSLog(@"[JJCheat] Metal 抓帧开关=%@", enabled ? @"开" : @"关");
 }

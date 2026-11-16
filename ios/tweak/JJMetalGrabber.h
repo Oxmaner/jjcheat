@@ -28,6 +28,10 @@ void JJMetalInstallHooks(void);
 /** 诊断串 */
 NSString *JJMetalStatus(void);
 
+/** 抓帧总开关：关掉后 nextDrawable hook 只透传，不做 IOSurface 读回/字节交换。
+    待机、插件关闭时调用，避免每帧在游戏渲染线程上白烧 14MB 拷贝。 */
+void JJMetalSetCaptureEnabled(BOOL enabled);
+
 #ifdef __cplusplus
 }
 #endif

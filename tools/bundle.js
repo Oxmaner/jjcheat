@@ -1085,6 +1085,22 @@ var JJEngine = {
     out.codesStableCount = session.codesStable || 0;
 
     // 2) 到了我方走 → 算棋
+    // 【1.1.42 卡顿根因】识别没收敛时，旧逻辑仍会拿 session.tracker.fen（开局 FEN）
+    // 跑一次 ENG.analyze；而 illegalStreak>12 又清掉 lastResult 强制重算，于是
+    // 盘面全空 / 满盘乱码时引擎队列永远满载。真机日志「识别未收敛」每 5.5s 一条，
+    // 恰好就是一次 process 的耗时。这里直接短路：一次搜索都不做，也不画过期箭头。
+    // 字符串 skipAnalyze 同时充当 dylib 判断容器 engine.js 版本的新标记。
+    if (!legalNow || !codesOk) {
+      out.skipAnalyze = 1;
+      out.suggest = '';
+      out.suggestChinese = '';
+      out.from = -1;
+      out.to = -1;
+      out.scoreText = '+0.00';
+      out.winrate = 50;
+      out.depth = 0;
+      return out;
+    }
     var analyzeFen = directFen || session.tracker.fen;
     if (out.moveDetected || !session.lastResult || session.lastFen !== analyzeFen) {
       var t0 = Date.now();

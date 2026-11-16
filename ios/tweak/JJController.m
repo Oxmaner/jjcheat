@@ -12,6 +12,10 @@
 #import <UIKit/UIKit.h>
 #import <math.h>
 
+#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
+#import <roothide.h>
+#endif
+
 typedef NS_ENUM(NSInteger, JJCtrlState) {
     JJCtrlStateIdle = 0,
     JJCtrlStateCalibrating,
@@ -20,12 +24,53 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
 };
 
 /* ============================================================
- *  悬浮球 —— 用来控制显隐 / 重新标定 / 重置
+ *  悬浮球 —— 点击弹出设置菜单，可拖动 / 长按快速手动标定
  * ============================================================ */
+static const CGFloat kJJBallSize       = 52.0;
+static const CGFloat kJJMenuWidth      = 232.0;
+static const CGFloat kJJMenuRowHeight  = 44.0;
+
+/** 插件图标：优先读随 deb 落到 jbroot 的 logo.png，读不到就回退文字「象棋」。 */
+static UIImage *JJLoadLogoImage(void) {
+    NSString *rel = [@"/" stringByAppendingString:JJ_LOGO_REL_PATH];
+    NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithCapacity:5];
+#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
+    [paths addObject:jbroot(rel)];
+#endif
+    [paths addObject:rel];
+    [paths addObject:[JJ_ENGINE_PATH_ROOTLESS stringByReplacingOccurrencesOfString:@"engine.js"
+                                                                       withString:@"logo.png"]];
+    NSArray<NSString *> *dirs =
+        NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES);
+    if (dirs.count) [paths addObject:[dirs[0] stringByAppendingPathComponent:@"JJCheat/logo.png"]];
+    NSString *inBundle = [[NSBundle mainBundle] pathForResource:@"logo" ofType:@"png"];
+    if (inBundle.length) [paths addObject:inBundle];
+
+    for (NSString *p in paths) {
+        if (!p.length) continue;
+        UIImage *im = [UIImage imageWithContentsOfFile:p];
+        if (im) {
+            NSLog(@"[JJCheat] 插件图标命中: %@", p);
+            return im;
+        }
+    }
+    NSLog(@"[JJCheat] 插件图标未找到，悬浮球回退文字");
+    return nil;
+}
+
 @interface JJBallWindow : UIWindow
 @property (nonatomic, strong) UIButton *ball;
+@property (nonatomic, strong) UIView *backdrop;
+@property (nonatomic, strong) UIView *menuView;
+@property (nonatomic, assign) BOOL usesLogo;
+@property (nonatomic, assign, getter=isMenuVisible) BOOL menuVisible;
 @property (nonatomic, copy) void (^onTap)(void);
 @property (nonatomic, copy) void (^onLongPress)(void);
+@property (nonatomic, copy) void (^onMenuItem)(NSInteger index);
+
+- (void)setActive:(BOOL)active;
+- (void)showMenuWithTitles:(NSArray<NSString *> *)titles;
+- (void)hideMenu;
 @end
 
 @implementation JJBallWindow
@@ -38,8 +83,25 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
         self.rootViewController = [[UIViewController alloc] init];
         self.rootViewController.view.backgroundColor = [UIColor clearColor];
 
-        CGFloat d = 52;
         CGRect scr = [UIScreen mainScreen].bounds;
+        /* 菜单遮罩：点空白处收起菜单，避免把触摸漏给游戏造成误落子 */
+        _backdrop = [[UIView alloc] initWithFrame:scr];
+        _backdrop.backgroundColor = [UIColor colorWithWhite:0 alpha:0.22];
+        _backdrop.hidden = YES;
+        [_backdrop addGestureRecognizer:[[UITapGestureRecognizer alloc]
+                                         initWithTarget:self action:@selector(closeMenuTap)]];
+        [self.rootViewController.view addSubview:_backdrop];
+
+        _menuView = [[UIView alloc] initWithFrame:CGRectZero];
+        _menuView.backgroundColor = [UIColor colorWithRed:0.07 green:0.08 blue:0.11 alpha:0.97];
+        _menuView.layer.cornerRadius = 12.0;
+        _menuView.layer.borderWidth = 1.0;
+        _menuView.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
+        _menuView.clipsToBounds = YES;
+        _menuView.hidden = YES;
+        [self.rootViewController.view addSubview:_menuView];
+
+        CGFloat d = kJJBallSize;
         _ball = [UIButton buttonWithType:UIButtonTypeCustom];
         _ball.frame = CGRectMake(0, 0, d, d);
         _ball.center = CGPointMake(scr.size.width - 34, scr.size.height * 0.45);
@@ -51,6 +113,18 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
         _ball.titleLabel.numberOfLines = 2;
         [_ball setTitle:@"象\n棋" forState:UIControlStateNormal];
         [_ball setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+
+        UIImage *logo = JJLoadLogoImage();
+        if (logo) {
+            self.usesLogo = YES;
+            [_ball setTitle:nil forState:UIControlStateNormal];
+            [_ball setImage:logo forState:UIControlStateNormal];
+            _ball.imageView.contentMode = UIViewContentModeScaleAspectFit;
+            _ball.imageEdgeInsets = UIEdgeInsetsMake(3, 3, 3, 3);
+            _ball.backgroundColor = [UIColor colorWithWhite:0.98 alpha:0.94];
+            _ball.layer.borderColor = [UIColor colorWithWhite:0.85 alpha:1.0].CGColor;
+        }
+
         [_ball addTarget:self action:@selector(tapBall) forControlEvents:UIControlEventTouchUpInside];
 
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panBall:)];
@@ -63,13 +137,68 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     return self;
 }
 
-/* 未激活：半透明 + 提示「点我」；激活后：实心「象棋」 */
+/* 未激活：半透明；激活后：实心（有 logo 时只改透明度，别把图片标题冲掉） */
 - (void)setActive:(BOOL)active {
     self.ball.alpha = active ? 1.0 : 0.55;
-    [self.ball setTitle:(active ? @"象\n棋" : @"点\n我") forState:UIControlStateNormal];
+    if (!self.usesLogo) {
+        [self.ball setTitle:(active ? @"象\n棋" : @"点\n我") forState:UIControlStateNormal];
+    }
 }
 
 - (void)tapBall { if (self.onTap) self.onTap(); }
+
+- (void)closeMenuTap { [self hideMenu]; }
+
+/** 在球旁边竖排列出设置项；点击任意项先收起菜单再回调上层。 */
+- (void)showMenuWithTitles:(NSArray<NSString *> *)titles {
+    for (UIView *v in [self.menuView.subviews copy]) [v removeFromSuperview];
+
+    CGFloat w = kJJMenuWidth;
+    CGFloat rowH = kJJMenuRowHeight;
+    CGFloat menuH = rowH * (CGFloat)titles.count;
+    CGRect scr = [UIScreen mainScreen].bounds;
+
+    CGFloat x = CGRectGetMinX(self.ball.frame) - w - 10.0;
+    if (x < 8.0) x = CGRectGetMaxX(self.ball.frame) + 10.0;
+    x = MAX(8.0, MIN(x, scr.size.width - w - 8.0));
+    CGFloat y = CGRectGetMidY(self.ball.frame) - menuH / 2.0;
+    y = MAX(60.0, MIN(y, scr.size.height - menuH - 40.0));
+    self.menuView.frame = CGRectMake(x, y, w, menuH);
+
+    for (NSUInteger i = 0; i < titles.count; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.frame = CGRectMake(0, (CGFloat)i * rowH, w, rowH);
+        b.tag = (NSInteger)(100 + i);
+        [b setTitle:titles[i] forState:UIControlStateNormal];
+        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont systemFontOfSize:14.0];
+        b.titleLabel.numberOfLines = 2;
+        b.titleLabel.adjustsFontSizeToFitWidth = YES;
+        b.titleLabel.minimumScaleFactor = 0.8;
+        [b addTarget:self action:@selector(menuItemTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [self.menuView addSubview:b];
+        if (i > 0) {
+            UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(10, (CGFloat)i * rowH, w - 20, 0.5)];
+            sep.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
+            [self.menuView addSubview:sep];
+        }
+    }
+    self.backdrop.hidden = NO;
+    self.menuView.hidden = NO;
+    self.menuVisible = YES;
+}
+
+- (void)hideMenu {
+    self.backdrop.hidden = YES;
+    self.menuView.hidden = YES;
+    self.menuVisible = NO;
+}
+
+- (void)menuItemTapped:(UIButton *)b {
+    NSInteger idx = b.tag - 100;
+    [self hideMenu];
+    if (self.onMenuItem) self.onMenuItem(idx);
+}
 
 - (void)lpBall:(UILongPressGestureRecognizer *)g {
     if (g.state == UIGestureRecognizerStateBegan && self.onLongPress) self.onLongPress();
@@ -99,7 +228,13 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *v = [super hitTest:point withEvent:event];
-    return (v == self.ball) ? v : nil;
+    if (v == self.ball) return v;
+    /* 菜单打开时放行遮罩与菜单按钮（点遮罩即收起），其余一律透传给游戏 */
+    if (self.menuVisible && v &&
+        (v == self.backdrop || [v isDescendantOfView:self.menuView])) {
+        return v;
+    }
+    return nil;
 }
 
 @end
@@ -131,6 +266,24 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
 @property (nonatomic, assign) NSTimeInterval lastLearnAttempt;
 /* 学习静默失败计数：每 5 次留一条日志，杜绝「没提示又没日志」的黑洞 */
 @property (nonatomic, assign) NSInteger learnFailCount;
+/* 插件总开关：关掉后连 Metal 抓帧 hook 都停止读帧，真正不占渲染线程 */
+@property (nonatomic, assign) BOOL enabled;
+/* 思考时长（ms），悬浮球菜单可改，持久化到 JJ_KEY_THINK_MS */
+@property (nonatomic, assign) NSInteger thinkMs;
+/* process 节流：一次 JS 处理要数秒，回调刚落地不能立刻再发下一帧 */
+@property (nonatomic, assign) NSTimeInterval lastProcessTime;
+@property (nonatomic, assign) NSTimeInterval processNotBefore;
+/* 自动标定：本轮学习采纳的精修四角要写回 JJ_KEY_CORNERS */
+@property (nonatomic, assign) BOOL autoCalibrating;
+
+- (void)showMenu;
+- (void)setPluginEnabled:(BOOL)on;
+- (void)autoCalibrate;
+- (void)manualCalibrate;
+- (void)toggleHUD;
+- (void)editThinkMs;
+- (void)applyThinkMs:(NSInteger)v;
+- (void)saveAutoCalibratedCorners:(NSArray *)fc width:(int)w height:(int)h;
 @end
 
 @implementation JJController
@@ -145,11 +298,19 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
 - (instancetype)init {
     self = [super init];
     if (self) {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         _state = JJCtrlStateIdle;
-        _hudVisible = YES;
+        _enabled = [ud objectForKey:JJ_KEY_ENABLED] ? [ud boolForKey:JJ_KEY_ENABLED] : YES;
+        _hudVisible = [ud objectForKey:JJ_KEY_HUD_VISIBLE] ? [ud boolForKey:JJ_KEY_HUD_VISIBLE] : YES;
+        NSInteger savedMs = [ud integerForKey:JJ_KEY_THINK_MS];
+        _thinkMs = savedMs > 0
+            ? MIN(JJ_THINK_MS_MAX, MAX(JJ_THINK_MS_MIN, savedMs))
+            : JJ_THINK_MS_DEFAULT;
         _learnedBoard = NO;
         _busy = NO;
         _tickCount = 0;
+        NSLog(@"[JJCheat] 配置: 插件=%@ HUD=%@ 思考=%ldms",
+              _enabled ? @"开" : @"关", _hudVisible ? @"开" : @"关", (long)_thinkMs);
     }
     return self;
 }
@@ -161,21 +322,28 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     self.learnedBoard = NO;
     [self setupBall];
     [self.ballWindow setActive:NO];
+    /* 待机时把 Metal hook 的读帧也彻底关掉：原来只是上层不取帧，
+       hook 仍按 0.2s/次在游戏渲染线程读 14MB + 350 万次字节交换，游戏照样卡。 */
+    JJMetalSetCaptureEnabled(NO);
     /* 这里刻意不做：loadEngine / grabber.start / HUD attach / startTimer
        避免在登录页、大厅、结算页上误学棋盘、误识别 */
 }
 
 /* 用户点球后才真正开工 */
 - (void)activate {
-    if (self.activated) return;
+    if (self.activated || !self.enabled) return;
     self.activated = YES;
     [self.ballWindow setActive:YES];
     NSLog(@"[JJCheat] 用户点球 → 开始抓帧与识别");
 
+    JJMetalSetCaptureEnabled(YES);
+    self.lastProcessTime = 0;
+    self.processNotBefore = 0;
     [[JJScreenGrabber shared] start];
     [[JJEngineBridge shared] loadEngine];
     [[JJHUDWindow shared] attach];
-    self.hudVisible = YES;
+    /* attach 会把 window.hidden 置 NO，这里按持久化的 HUD 开关还原 */
+    [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
 
     NSArray *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:JJ_KEY_CORNERS];
     if (saved.count == 4) {
@@ -201,6 +369,8 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     self.timer = nil;
     self.state = JJCtrlStateIdle;
     self.activated = NO;
+    self.busy = NO;
+    JJMetalSetCaptureEnabled(NO);
     [[JJScreenGrabber shared] stop];
 }
 
@@ -210,19 +380,170 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     __weak typeof(self) weakSelf = self;
     self.ballWindow.onTap = ^{
         __strong typeof(weakSelf) self2 = weakSelf;
-        if (!self2.activated) {          /* 第一次点：开工 */
-            [self2 activate];
+        if (!self2) return;
+        if (self2.ballWindow.isMenuVisible) {
+            [self2.ballWindow hideMenu];
             return;
         }
-        self2.hudVisible = !self2.hudVisible;   /* 之后：切换 HUD 显隐 */
-        [[JJHUDWindow shared] setHUDHidden:!self2.hudVisible];
+        /* 第一次点球沿用原行为（开工），之后每次点球都弹设置菜单 */
+        if (!self2.activated && self2.enabled) [self2 activate];
+        [self2 showMenu];
     };
     self.ballWindow.onLongPress = ^{
         __strong typeof(weakSelf) self2 = weakSelf;
+        if (!self2 || !self2.enabled) return;
         if (!self2.activated) [self2 activate];
-        [self2 recalibrate];
+        [self2 manualCalibrate];
+    };
+    self.ballWindow.onMenuItem = ^(NSInteger idx) {
+        __strong typeof(weakSelf) self2 = weakSelf;
+        if (!self2) return;
+        switch (idx) {
+            case 0: [self2 setPluginEnabled:!self2.enabled]; break;
+            case 1: [self2 autoCalibrate];                   break;
+            case 2: [self2 manualCalibrate];                 break;
+            case 3: [self2 toggleHUD];                       break;
+            case 4: [self2 editThinkMs];                     break;
+            default: break;
+        }
     };
     [self.ballWindow attach];
+}
+
+#pragma mark - 悬浮球菜单
+
+/** 每次打开都按当前状态重新生成标题，避免显示过期开关值。 */
+- (void)showMenu {
+    NSArray<NSString *> *titles = @[
+        [NSString stringWithFormat:@"① 插件开关：%@", self.enabled ? @"开" : @"关"],
+        @"② 自动标定棋盘（开局画面）",
+        @"③ 手动标定棋盘（点四角）",
+        [NSString stringWithFormat:@"④ HUD 显示：%@", self.hudVisible ? @"开" : @"关"],
+        [NSString stringWithFormat:@"⑤ 思考时间：%ld ms（点击修改）", (long)self.thinkMs]
+    ];
+    [self.ballWindow showMenuWithTitles:titles];
+}
+
+/** 插件总开关：关闭时连 Metal 抓帧都停，是真的不占渲染线程。 */
+- (void)setPluginEnabled:(BOOL)on {
+    self.enabled = on;
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:JJ_KEY_ENABLED];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+
+    if (on) {
+        [self.ballWindow setActive:YES];
+        if (!self.activated) {
+            [self activate];
+        } else {
+            JJMetalSetCaptureEnabled(YES);
+            [[JJScreenGrabber shared] start];
+            [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
+            [self startTimer];
+        }
+        [[JJHUDWindow shared] showStatus:@"插件已开启"];
+        NSLog(@"[JJCheat] 插件开关 → 开");
+    } else {
+        [self.timer invalidate];
+        self.timer = nil;
+        self.busy = NO;
+        [[JJScreenGrabber shared] stop];
+        JJMetalSetCaptureEnabled(NO);
+        [[JJHUDWindow shared] setHUDHidden:YES];
+        [self.ballWindow setActive:NO];
+        NSLog(@"[JJCheat] 插件开关 → 关（停止抓帧与识别）");
+    }
+}
+
+/** 自动标定：清掉旧精修四角，用当前开局画面重新跑 learnAndRefine，
+    采纳后的四角会写回 JJ_KEY_CORNERS，等价于一次自动四点标定。 */
+- (void)autoCalibrate {
+    if (!self.enabled) {
+        [[JJHUDWindow shared] showStatus:@"请先开启插件"];
+        return;
+    }
+    if (!self.activated) [self activate];
+    self.finalCorners = nil;
+    self.refineDone = NO;
+    self.learnedBoard = NO;
+    self.learnFailCount = 0;
+    self.lastLearnAttempt = 0;
+    self.lastFrameSerial = 0;
+    self.processNotBefore = 0;
+    self.autoCalibrating = YES;
+    self.state = JJCtrlStateWaitingBoard;
+    [[JJEngineBridge shared] resetWithFen:nil];
+    [self startTimer];
+    [[JJHUDWindow shared] showStatus:@"自动标定中…请停在开局棋盘画面"];
+    NSLog(@"[JJCheat] 自动标定棋盘：清除精修四角，重新学习");
+}
+
+/** 手动标定：沿用原来的四点触摸标定 */
+- (void)manualCalibrate {
+    if (!self.enabled) {
+        [[JJHUDWindow shared] showStatus:@"请先开启插件"];
+        return;
+    }
+    if (!self.activated) [self activate];
+    self.autoCalibrating = NO;
+    [self recalibrate];
+}
+
+- (void)toggleHUD {
+    self.hudVisible = !self.hudVisible;
+    [[NSUserDefaults standardUserDefaults] setBool:self.hudVisible forKey:JJ_KEY_HUD_VISIBLE];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
+    NSLog(@"[JJCheat] HUD 显示=%@", self.hudVisible ? @"开" : @"关");
+}
+
+/** 思考时间：弹输入框，钳制到 JJ_THINK_MS_MIN~MAX，立即生效并持久化。 */
+/** 统一的写入口：钳制范围、持久化、给 HUD 反馈。 */
+- (void)applyThinkMs:(NSInteger)v {
+    if (v <= 0) v = JJ_THINK_MS_DEFAULT;
+    v = MIN(JJ_THINK_MS_MAX, MAX(JJ_THINK_MS_MIN, v));
+    self.thinkMs = v;
+    [[NSUserDefaults standardUserDefaults] setInteger:v forKey:JJ_KEY_THINK_MS];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [[JJHUDWindow shared] showStatus:[NSString stringWithFormat:@"思考时间已设为 %ld ms", (long)v]];
+    NSLog(@"[JJCheat] 思考时间=%ld ms", (long)v);
+}
+
+/** 思考时间：输入框 + 4 个预设快捷值（键盘不弹时也能改），立即生效并持久化。 */
+- (void)editThinkMs {
+    NSString *msg = [NSString stringWithFormat:
+                     @"每步搜索时长，范围 %d~%d ms，默认 %d ms。\n数值越小越流畅，棋力略降。",
+                     JJ_THINK_MS_MIN, JJ_THINK_MS_MAX, JJ_THINK_MS_DEFAULT];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"思考时间（ms）"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    NSInteger cur = self.thinkMs;
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.placeholder = @"毫秒";
+        tf.text = [NSString stringWithFormat:@"%ld", (long)cur];
+    }];
+    __weak typeof(self) weakSelf = self;
+    __weak UIAlertController *weakAc = ac;
+    [ac addAction:[UIAlertAction actionWithTitle:@"保存输入值" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *action) {
+        __strong typeof(weakSelf) self2 = weakSelf;
+        UIAlertController *alert = weakAc;
+        if (!self2 || !alert) return;
+        [self2 applyThinkMs:[alert.textFields.firstObject.text integerValue]];
+    }]];
+    /* 预设值：不依赖键盘，点一下就改，真机上一个弹窗里全能完成 */
+    for (NSNumber *n in @[@(100), @(200), @(350), @(500)]) {
+        [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@ ms", n]
+                                               style:UIAlertActionStyleDefault
+                                             handler:^(UIAlertAction *action) {
+            __strong typeof(weakSelf) self2 = weakSelf;
+            if (self2) [self2 applyThinkMs:n.integerValue];
+        }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    if (self.ballWindow.hidden) [self.ballWindow attach];
+    [self.ballWindow.rootViewController presentViewController:ac animated:YES completion:nil];
+    NSLog(@"[JJCheat] 打开思考时间设置");
 }
 
 - (void)recalibrate {
@@ -271,7 +592,10 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
 
     self.state = JJCtrlStateWaitingBoard;
+    self.processNotBefore = 0;
     [self startTimer];
+    /* beginCalibration 会把 HUD window 强制显示，标定完按用户设置还原 */
+    [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
     [[JJHUDWindow shared] showStatus:@"标定完成 · 请进入一局新棋（开局布局）"];
     NSLog(@"[JJCheat] 标定完成 %@", pxCorners);
 }
@@ -430,8 +754,12 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
 }
 
 - (void)tick {
+    if (!self.enabled || !self.activated) return;
     if (self.busy) return;
     if (self.state != JJCtrlStateWaitingBoard && self.state != JJCtrlStateRunning) return;
+
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now < self.processNotBefore) return;
 
     /* Metal 没出新帧就别把上一帧再喂一遍 JS：每帧要拷 14MB 进 JSContext
        再跑 90 格模板匹配，重复帧纯属白烧 CPU。 */
@@ -450,10 +778,9 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
 
     // ---- 学习阶段：整段异步，主线程一步都不等 ----
     if (!self.learnedBoard) {
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        /* 失败退避：learnAndRefine 要几百 ms~几秒，旧逻辑每 250ms 重跑一次，
+        /* 失败退避 3s：learnAndRefine 要几秒，旧逻辑每 250ms 重跑一次，
            连着十几次就是日志里 12:08:19→12:08:50 那段 31 秒主线程空白。 */
-        if (now - self.lastLearnAttempt < 1.5) return;
+        if (now - self.lastLearnAttempt < JJ_LEARN_RETRY_GAP) return;
         self.lastLearnAttempt = now;
         self.busy = YES;
         self.tickCount++;
@@ -474,7 +801,25 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
                           info[@"templateCount"] ?: @"-",
                           info[@"verifyDiff"] ?: @"-");
                 }
+                if (self2.learnFailCount >= JJ_LEARN_MAX_FAIL) {
+                    [self2.timer invalidate];
+                    self2.timer = nil;
+                    [[JJHUDWindow shared] showStatus:@"学习失败 · 请检查 engine.js 后重开插件"];
+                    NSLog(@"[JJCheat] 学习连续失败 %ld 次，已暂停重试", (long)self2.learnFailCount);
+                    return;
+                }
                 [[JJHUDWindow shared] showStatus:@"正在学习棋盘…请停留在开局画面"];
+                return;
+            }
+            BOOL accepted = [info[@"ok"] boolValue];
+            /* 校验没过最多再学 2 次；之后仍进 Running，但 JS 侧 skipAnalyze 会在
+               盘面不可信时直接短路，不会拿开局 FEN 空转算棋（1.1.41 的卡顿点）。 */
+            if (!accepted && self2.learnFailCount < 2) {
+                self2.learnFailCount++;
+                NSLog(@"[JJCheat] 学习校验未通过（verifyDiff=%@），第 %ld 次重试",
+                      info[@"verifyDiff"], (long)self2.learnFailCount);
+                [self2 dumpSamplesWithPixels:rgba width:w height:h];
+                [[JJHUDWindow shared] showStatus:@"学习未完成 · 请停在开局棋盘画面"];
                 return;
             }
             self2.learnedBoard = YES;
@@ -483,22 +828,32 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
             if ([fc isKindOfClass:[NSArray class]] && fc.count == 4) {
                 self2.finalCorners = fc;
                 self2.gridPtsCache = [self2 gridPointsFromCorners:fc];
+                if (self2.autoCalibrating) {
+                    [self2 saveAutoCalibratedCorners:fc width:w height:h];
+                }
             } else {
                 self2.gridPtsCache = [[JJEngineBridge shared] gridPoints];
             }
             NSLog(@"[JJCheat] 棋盘学习完成 %@", info);
-            if (![info[@"ok"] boolValue]) {
-                NSLog(@"[JJCheat] 学习校验未通过（verifyDiff=%@），dump 采样点定位", info[@"verifyDiff"]);
-                [self2 dumpSamplesWithPixels:rgba width:w height:h];
+            if (!accepted) {
+                NSLog(@"[JJCheat] 学习校验未通过（verifyDiff=%@），交给 JS 合法性闸门兜底",
+                      info[@"verifyDiff"]);
+                [[JJHUDWindow shared] showStatus:@"识别未收敛 · 请确认棋盘完整可见"];
             }
         }];
         return;
     }
 
+    /* 1.1.42：一次 process 在真机上要数秒，回调刚落地就发下一帧会让引擎队列
+       永不清空。最小间隔 + 识别未收敛时退避，避免空转。 */
+    if (now - self.lastProcessTime < JJ_PROCESS_MIN_GAP) return;
+    self.lastProcessTime = now;
+
     self.busy = YES;
     self.tickCount++;
+    NSInteger thinkMs = self.thinkMs;
     __weak typeof(self) weakSelf = self;
-    [[JJEngineBridge shared] processPixels:rgba width:w height:h timeMs:JJ_TIME_MS
+    [[JJEngineBridge shared] processPixels:rgba width:w height:h timeMs:(int)thinkMs
                                   callback:^(NSDictionary *result, NSError *error) {
         __strong typeof(weakSelf) self2 = weakSelf;
         if (!self2) return;
@@ -508,11 +863,14 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
         if (self2.gridPtsCache.count != 90) {
             self2.gridPtsCache = [self2 gridPointsFromCorners:self2.finalCorners];
         }
-        /* 合法性闸门没放行时留一条日志：识别错成红车 5 个时整盘作废，
-           引擎会一直拿开局 FEN 算棋，表现就是「对方走完不给提示」。 */
-        if (![result[@"legalNow"] boolValue]) {
-            NSLog(@"[JJCheat] 识别未收敛：illegalStreak=%@ codesStable=%@（本帧盘面未采用）",
-                  result[@"illegalStreak"], result[@"codesStableCount"]);
+        /* 盘面不可信（识别未收敛 / JS 已跳过搜索）→ 退避一段时间，别每帧重算。
+           这是 14:07 日志里每 5.5s 一条「识别未收敛」演变成整机卡顿的关键闸门。 */
+        BOOL stalled = ![result[@"legalNow"] boolValue] || [result[@"skipAnalyze"] boolValue];
+        if (stalled) {
+            self2.processNotBefore = [[NSDate date] timeIntervalSince1970] + JJ_PROCESS_ILLEGAL_GAP;
+            NSLog(@"[JJCheat] 识别未收敛：illegalStreak=%@ codesStable=%@ skipAnalyze=%@（退避 %.1fs）",
+                  result[@"illegalStreak"], result[@"codesStableCount"],
+                  result[@"skipAnalyze"] ?: @"0", JJ_PROCESS_ILLEGAL_GAP);
         }
 
         [[JJHUDWindow shared] showResult:result gridPoints:self2.gridPtsCache fen:result[@"fen"] ?: @""];
@@ -522,6 +880,25 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
                   result[@"move"], result[@"moveChinese"], result[@"fen"]);
         }
     }];
+}
+
+/** 自动标定：把 JS 采纳的像素四角换算回屏幕 point 并持久化。 */
+- (void)saveAutoCalibratedCorners:(NSArray *)fc width:(int)w height:(int)h {
+    CGSize pt = [UIScreen mainScreen].bounds.size;
+    if (pt.width <= 0 || pt.height <= 0 || w <= 0 || h <= 0) return;
+    CGFloat kx = pt.width / (CGFloat)w;
+    CGFloat ky = pt.height / (CGFloat)h;
+    NSMutableArray *saved = [NSMutableArray arrayWithCapacity:4];
+    for (NSArray *p in fc) {
+        [saved addObject:@[@([p[0] doubleValue] * kx), @([p[1] doubleValue] * ky)]];
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:saved forKey:JJ_KEY_CORNERS];
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:JJ_KEY_CALIBRATED];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    self.pointCorners = saved;
+    self.autoCalibrating = NO;
+    [[JJHUDWindow shared] showStatus:@"自动标定完成"];
+    NSLog(@"[JJCheat] 自动标定完成，四角(point)=%@", saved);
 }
 
 @end

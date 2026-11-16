@@ -20,11 +20,11 @@
 #import "JJEngineScript.h"
 #import <JavaScriptCore/JavaScriptCore.h>
 
-/* engine.js 的关键接口标记：1.1.40 起才有 JJEngine.learnAndRefine。
+/* engine.js 的版本标记：每个改过 JS 的版本都要换成该版新增的字面量，
    App 容器里的 engine.js 优先级最高，而装新 deb 不会覆盖它（deb 只写 jbroot
-   那份）。旧脚本会让 learnAndRefine 变成 undefined → 学习静默失败、永远不给
-   走法提示。启动时自检，缺标记就自动用编进 dylib 的内嵌副本覆盖升级。 */
-static NSString * const kJJEngineFeatureMark = @"learnAndRefine";
+   那份）。启动时自检，缺标记就自动用编进 dylib 的内嵌副本覆盖升级。
+   1.1.40 = learnAndRefine；1.1.42 = skipAnalyze（识别未收敛时跳过引擎搜索）。 */
+static NSString * const kJJEngineFeatureMark = @"skipAnalyze";
 
 // roothide 适配：jbroot 每次越狱都会换一个随机路径，必须在运行时解析。
 // 非 roothide 构建（rootful/rootless）不引这个头，避免多出 libroothide 依赖。
