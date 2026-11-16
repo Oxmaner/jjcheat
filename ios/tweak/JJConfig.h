@@ -20,6 +20,9 @@
    发下一帧会让引擎队列永不清空；识别未收敛时再退避更久，避免空转烧 CPU。 */
 #define JJ_PROCESS_MIN_GAP      0.8
 #define JJ_PROCESS_ILLEGAL_GAP  2.5
+/* 锚定状态机判定为噪声帧（anchorRejected）时的退避：JS 已命中结论缓存，
+   再跑一轮 90 格模板匹配纯属白烧 CPU；与 Metal 抓帧 1.5s 间隔对齐。 */
+#define JJ_PROCESS_NOISE_GAP    1.5
 #define JJ_LEARN_RETRY_GAP      3.0
 /* 学习连续失败上限：超过就停下来提示用户切回开局画面，不再无限重试 */
 #define JJ_LEARN_MAX_FAIL       6

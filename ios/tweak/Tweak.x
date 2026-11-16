@@ -1,12 +1,23 @@
 //
-//  Tweak.xm
+//  Tweak.x
 //  JJCheat —— 注入 JJ象棋 进程，抓画面、算棋、在棋盘上标注
+//
+//  1.1.44（Logos 审查修复）：
+//   - 本文件没有 C++ / MSHookIvar，按规范用 .x（Objective-C）而非 .xm。
+//   - 删掉 %hook UIApplication -application:didFinishLaunchingWithOptions:。
+//     那是 UIApplicationDelegate 协议方法，UIApplication 类根本不实现，
+//     这段 hook 永不触发；启动本来就是 %ctor 里的 3s dispatch_after 兜底。
+//   - CAMetalLayer -nextDrawable 从 JJMetalGrabber.m 的手写
+//     method_setImplementation 迁回 %hook + %orig；删掉 presentDrawable
+//     家族的全类表遍历（真机计数冻结在 65，纯启动开销 + 误伤风险）。
 //
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <OpenGLES/EAGL.h>
 #import <QuartzCore/QuartzCore.h>
+#import <QuartzCore/CAMetalLayer.h>
+#import <Metal/Metal.h>
 
 #import "JJController.h"
 #import "JJScreenGrabber.h"
@@ -64,30 +75,30 @@ static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
 %end
 
 /* ============================================================
- *  兜底：如果 3 秒内没触发（APP 冷启动慢），用 didFinishLaunching 补一次
+ *  Metal 抓帧（主通道）
+ *
+ *  实测这游戏只走 -nextDrawable，不走 presentDrawable 家族。
+ *  第 N 帧 %orig 前读上一帧的 IOSurface（此时内容已渲染完、还没被复用），
+ *  %orig 后记住本次 drawable 的 surface，交给第 N+1 帧。
+ *  开关关闭时 JJMetal* 两个函数都只透传，不做 14MB 拷贝/字节交换。
  * ============================================================ */
-%hook UIApplication
+%hook CAMetalLayer
 
-- (BOOL)application:(UIApplication *)application
-        didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-    BOOL r = %orig;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        JJStartOnce();
-    });
-    return r;
+- (id<CAMetalDrawable>)nextDrawable {
+    JJMetalBeforeNextDrawable();
+    id<CAMetalDrawable> drawable = %orig;
+    JJMetalAfterNextDrawable(drawable);
+    return drawable;
 }
 
 %end
 
 /* ============================================================
- *  从后台恢复时把 HUD 窗口重新挂到前台 scene 上
- * ============================================================ */
-
-/* ============================================================
  *  入口
  * ============================================================ */
 %ctor {
+    /* 未分组 hook（EAGLContext + CAMetalLayer）一次注册完。
+       Logos 只解析类名，比旧版 1.5s 后遍历全类表手写 swizzle 轻得多。 */
     %init;
 
     NSLog(@"[JJCheat] tweak 已加载 (pid=%d)", getpid());
@@ -98,16 +109,8 @@ static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
     if (!hasPresent) {
         NSLog(@"[JJCheat] 警告：拿不到 GL hook 点，抓帧将退化为 CARenderServer/CALayer，可能全黑");
     }
-
-    /* Metal 抓帧放到主线程延迟装：%ctor 阶段遍历全类表太重，容易把启动拖死 */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @try {
-            JJMetalInstallHooks();
-        } @catch (NSException *e) {
-            NSLog(@"[JJCheat] Metal hook 调用异常: %@", e);
-        }
-    });
+    /* 幂等诊断日志，确认 CAMetalLayer 类在 %ctor 时已可用 */
+    JJMetalInstallHooks();
 
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidBecomeActiveNotification
@@ -123,6 +126,7 @@ static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
         } @catch (NSException *e) {}
     }];
 
+    /* 冷启动慢时兜底拉起控制器（原来误挂在 UIApplication 的死 hook 里） */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         JJStartOnce();

@@ -27,6 +27,10 @@ static int                            s_glHookFrames   = 0;
 static int                            s_grabLogCount   = 0;
 static int                            s_rsFailStreak   = 0;
 static int                            s_blackFrames    = 0;
+/* 启动阶段 Metal 还没出帧时，CARenderServer / CALayer 都是主线程重活
+   （14MB 位图 + 1284x2778 全屏 renderInContext），roothide 下还必然全黑。
+   1.1.44：4Hz tick 下每 250ms 跑一次会把主线程打满，这里限到 1.5s 一次。 */
+static CFTimeInterval                 s_lastHeavyFallbackTs = 0;
 /* 最近一张内容有效的 Metal 帧：游戏停渲染时复用，避免掉进全屏 CALayer 回退 */
 static NSData *                       s_lastGoodMetal  = nil;
 static int                            s_lastGoodW      = 0;
@@ -68,13 +72,25 @@ static int                            s_lastGoodH      = 0;
     if (s_apiResolved) return;
     s_apiResolved = YES;
 
+    /* 先在 QuartzCore 这个明确 image 里找，避免 RTLD_DEFAULT 全局符号搜索
+       命中别的库同名符号；只有该 image 里没有时才退回全局兜底。 */
     void *qc = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_LAZY);
-    s_renderDisplay = (CARenderServerRenderDisplay_t)(qc ? dlsym(qc, "CARenderServerRenderDisplay") : NULL);
+    if (qc) {
+        s_renderDisplay = (CARenderServerRenderDisplay_t)dlsym(qc, "CARenderServerRenderDisplay");
+        s_getServerPort = (CARenderServerGetServerPort_t)dlsym(qc, "CARenderServerGetServerPort");
+        if (!s_getServerPort) {
+            s_getServerPort = (CARenderServerGetServerPort_t)dlsym(qc, "CARenderServerGetServerPort2");
+        }
+    }
     if (!s_renderDisplay) {
         s_renderDisplay = (CARenderServerRenderDisplay_t)dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
     }
-    s_getServerPort = (CARenderServerGetServerPort_t)dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
-    if (!s_getServerPort) s_getServerPort = (CARenderServerGetServerPort_t)dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort2");
+    if (!s_getServerPort) {
+        s_getServerPort = (CARenderServerGetServerPort_t)dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort");
+        if (!s_getServerPort) {
+            s_getServerPort = (CARenderServerGetServerPort_t)dlsym(RTLD_DEFAULT, "CARenderServerGetServerPort2");
+        }
+    }
 
     if (s_renderDisplay && s_getServerPort) {
         s_serverPort = s_getServerPort(MACH_PORT_NULL);
@@ -337,6 +353,12 @@ static BOOL JJFrameIsBlack(NSData *d, int w, int h) {
         [self logGrabSource:@"Metal(缓存)" data:s_lastGoodMetal w:&cw h:&ch];
         return s_lastGoodMetal;
     }
+
+    /* Metal 从未出过有效帧时才轮到重回退，且 1.5s 内最多一次。
+       一旦 s_lastGoodMetal 有值，上面的缓存分支已经返回，走不到这里。 */
+    CFTimeInterval fallbackNow = CACurrentMediaTime();
+    if (s_lastHeavyFallbackTs && fallbackNow - s_lastHeavyFallbackTs < 1.5) return nil;
+    s_lastHeavyFallbackTs = fallbackNow;
 
     /* ② CARenderServer：Metal 从未成功时才试，roothide 下常常静默返回全黑 */
     w = 0; h = 0;

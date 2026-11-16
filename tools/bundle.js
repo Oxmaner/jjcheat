@@ -259,22 +259,126 @@ function codesLegal(codes) {
 }
 
 /**
- * 兵种配额裁剪（1.1.43）
+ * 位置合理性校验（1.1.44）
  *
- * 真机 14:51 日志：开局只错了 4 个兵种（verifyDiff=4），其中一格把「马」认成
- * 「卒」，黑卒变成 6 个 > LIM 的 5，codesLegal 就把整盘判非法 → legalNow=false
- * → skipAnalyze=1 → 一条着法都出不来。少一个子可以忍，整盘作废不能忍。
- * 做法：某一类棋子超额时，把该类里置信度最低的几格清成空格，让盘面重新合法。
+ * codesLegal 只管「数量不超限」，拦不住「黑卒出现在自己底线」「红相过了河」
+ * 这类规则上不可能的盘面。15:10 真机 FEN 一路漂成 pnbaknb2 / 3k1rbp1 /
+ * 1RRaknbp1，全部数量合法但位置荒谬，引擎拿着这种盘面给的着法自然是乱的。
+ * 这里只写象棋硬规则（将帅仕士不出九宫、相象不过河、兵卒不后退），
+ * 不会误杀任何合法残局。
+ *
+ * @param {Array|Int8Array} codes 引擎坐标（红在下，row0=黑底线，row9=红底线）
+ */
+function codesPositionPlausible(codes) {
+  for (var i = 0; i < 90; i++) {
+    var v = codes[i];
+    if (!v) continue;
+    var r = (i / 9) | 0, c = i % 9;
+    var palace = (c >= 3 && c <= 5);
+    if (v === 1 && !(r >= 7 && palace)) return false;   // 红帅
+    if (v === 8 && !(r <= 2 && palace)) return false;   // 黑将
+    if (v === 2 && !(r >= 7 && palace)) return false;   // 红仕
+    if (v === 9 && !(r <= 2 && palace)) return false;   // 黑士
+    if (v === 3 && r < 5) return false;                 // 红相不过河
+    if (v === 10 && r > 4) return false;                // 黑象不过河
+    if (v === 7 && r > 6) return false;                 // 红兵不后退
+    if (v === 14 && r < 3) return false;                // 黑卒不后退
+  }
+  return true;
+}
+
+/** 棋盘 FEN → 90 格 codes（开局锚定用） */
+function boardFenToCodes(fen) {
+  var out = new Array(90).fill(0);
+  var rows = String(fen || '').split(' ')[0].split('/');
+  if (rows.length !== 10) return out;
+  for (var r = 0; r < 10; r++) {
+    var col = 0, line = rows[r];
+    for (var k = 0; k < line.length && col < 9; k++) {
+      var ch = line[k];
+      if (ch >= '1' && ch <= '9') { col += parseInt(ch, 10); continue; }
+      var v = PC2FEN_TABLE.indexOf(ch);
+      out[r * 9 + col] = v > 0 ? v : 0;
+      col++;
+    }
+  }
+  return out;
+}
+
+/**
+ * 一步棋差分分析（1.1.44 核心）
+ *
+ * 象棋每步只动一枚棋子。把本帧识别结果与「上一稳定盘面」比较：
+ *   - 找「有子→空」的起点 from 和「cur[to] === prev[from]」的终点 to；
+ *   - 额外变化格一律视为识别噪声，用锚盘值覆盖；
+ *   - 变化格数过多（>6）或找不到一步棋结构 → 整帧丢弃。
+ * 这样每帧落地的 codes 都严格由「锚盘 + 一步棋」生成，模板抖动再也带不偏盘面。
+ *
+ * @returns {{changed:number, move:object|null, noise:Array}}
+ */
+function analyzeStepDiff(prev, cur) {
+  var changed = [];
+  for (var i = 0; i < 90; i++) {
+    if ((prev[i] || 0) !== (cur[i] || 0)) changed.push(i);
+  }
+  if (changed.length === 0) return { changed: 0, move: null, noise: [] };
+  var none = { changed: changed.length, move: null, noise: changed };
+  if (changed.length > 6) return none;
+
+  var best = null;
+  for (var a = 0; a < changed.length; a++) {
+    var from = changed[a];
+    var piece = prev[from] || 0;
+    if (!piece || (cur[from] || 0) !== 0) continue;
+    for (var b = 0; b < changed.length; b++) {
+      if (b === a) continue;
+      var to = changed[b];
+      if ((cur[to] || 0) !== piece) continue;
+      var captured = prev[to] || 0;
+      if (captured === piece) continue;
+      // 不能吃己方棋子
+      if (captured && ((captured <= 7) === (piece <= 7))) continue;
+      var noise = changed.filter(function (x) { return x !== from && x !== to; });
+      var cand = { from: from, to: to, piece: piece, captured: captured, noise: noise };
+      if (!best || noise.length < best.noise.length) best = cand;
+    }
+  }
+  if (!best) return none;
+  return { changed: changed.length, move: best, noise: best.noise };
+}
+
+/**
+ * 两帧 codes 的差异格数（换局重锚用）。
+ * 真机模板每帧抖 3~8 格，逐格签名「完全相同」几乎不可能凑齐连续 3 帧；
+ * 改用差异格数阈值，既能让稳定局面收敛，又不会把单帧垃圾当新局。
+ * @param {Array|Int8Array} a 上一帧
+ * @param {Array|Int8Array} b 本帧
+ * @returns {number} 不同格数
+ */
+function countCodesDiff(a, b) {
+  var n = 0;
+  for (var i = 0; i < 90; i++) if ((a[i] || 0) !== (b[i] || 0)) n++;
+  return n;
+}
+
+/**
+ * 兵种配额裁剪（1.1.43 → 1.1.44）
+ *
+ * 1.1.43 把超额兵种直接清成空格，15:10 日志每帧 repaired=1~4，棋子被一帧帧
+ * 凭空删掉，盘面越来越残缺。1.1.44 改为「优先用模板候选替换成同阵营缺额兵种，
+ * 实在没有候选才清空格」，且绝不删将帅、单帧最多清 6 格。
  *
  * @param {Array|Int8Array} codes 90 格兵种编码
- * @param {Array} conf 每格模板置信度（低的先清）
- * @returns {{codes: Int8Array, repaired: number}}
+ * @param {Array} conf 每格模板置信度（低的先动）
+ * @param {Array} ranked 每格候选兵种（recognizer.lastRanked）
+ * @returns {{codes: Int8Array, repaired: number, replaced: number, dropped: number}}
  */
-function repairCodesQuota(codes, conf) {
+function repairCodesQuota(codes, conf, ranked) {
   var LIM = [0, 1, 2, 2, 2, 2, 2, 5];   // 将 仕 相 马 车 炮 兵
+  var MAX_DROP = 6;
   var out = new Int8Array(90);
   for (var i = 0; i < 90; i++) out[i] = codes[i] || 0;
-  var repaired = 0;
+  var repaired = 0, replaced = 0, dropped = 0;
   for (var side = 0; side < 2; side++) {
     var base = side === 0 ? 1 : 8;
     for (var t = 1; t <= 7; t++) {
@@ -284,14 +388,31 @@ function repairCodesQuota(codes, conf) {
       }
       var excess = list.length - LIM[t];
       if (excess <= 0) continue;
-      list.sort(function (a, b) { return a.conf - b.conf; });
+      list.sort(function (x, y) { return x.conf - y.conf; });
       for (var k = 0; k < excess; k++) {
-        out[list[k].sq] = 0;
+        var cell = list[k];
+        if (v === 1 || v === 8) continue;              // 将帅绝不删
+        var alt = 0;
+        var cand = ranked && ranked[cell.sq];
+        if (cand) {
+          for (var ri = 0; ri < cand.length; ri++) {
+            var a2 = cand[ri];
+            if (!a2 || a2 === v) continue;
+            if ((a2 <= 7) !== (side === 0)) continue; // 阵营必须一致
+            var at = a2 <= 7 ? a2 : a2 - 7;
+            var n2 = 0;
+            for (var z = 0; z < 90; z++) if (out[z] === a2) n2++;
+            if (n2 < LIM[at]) { alt = a2; break; }
+          }
+        }
+        if (!alt && dropped >= MAX_DROP) continue;
+        out[cell.sq] = alt;
+        if (alt) replaced++; else dropped++;
         repaired++;
       }
     }
   }
-  return { codes: out, repaired: repaired };
+  return { codes: out, repaired: repaired, replaced: replaced, dropped: dropped };
 }
 
 /* ============================================================
@@ -308,7 +429,18 @@ var session = {
   lastGridHash: 0,
   gridStable: 0,
   lastBoardFen: '',        // 上一帧的棋盘部分（用于判断局面是否变化）
-  sideToMoveNow: 'red'     // 当前该谁走
+  sideToMoveNow: 'red',    // 当前该谁走
+  // 1.1.44 盘面状态锚定：所有落地局面都由「锚盘 + 一步棋」生成
+  anchorCodes: null,       // 上一稳定盘面（引擎坐标，红在下）
+  anchorFen: '',           // 锚盘棋盘 FEN
+  prevAnchorFen: '',       // 走子前盘面（中文记谱用）
+  anchorFlipped: false,    // 建锚时的画面朝向
+  openingAnchor: null,     // 开局学习成功时记下的标准盘面
+  reseatPrev: null,        // 换局候选：上一帧 codes（做帧间差异比较）
+  reseatCount: 0,
+  anchorRejected: 0,       // 连续被丢弃的噪声帧
+  reseatDone: 0,           // 本帧刚完成换局重锚（诊断输出后置 0）
+  lastMoveText: ''         // 最近一步的 UCCI，供日志/HUD 诊断
 };
 
 var JJEngine = {
@@ -326,13 +458,21 @@ var JJEngine = {
     return true;
   },
 
-  /** 重置到指定局面（默认开局） */
-  reset: function (fen) {
+  /** 重置到指定局面（默认开局）。keepAnchor=true 用于 process 内部首次建 tracker，
+      不能把 learnBoard 刚建立的开局锚盘一起清掉。 */
+  reset: function (fen, keepAnchor) {
     session.tracker = new TRK.MoveTracker(fen || C.START_FEN);
     session.lastFen = session.tracker.fen;
     session.lastResult = null;
     session.lastGridHash = 0;
     session.gridStable = 0;
+    if (!keepAnchor) {
+      session.anchorCodes = null;
+      session.anchorFen = '';
+      session.openingAnchor = null;
+      session.lastBoardFen = '';
+      session.lastRawFen = '';
+    }
     // 逐格「上一稳定值」也清掉，否则换局后残留上一局的棋子
     session.stableCodes = null;
     session.lowStreak = null;
@@ -344,8 +484,16 @@ var JJEngine = {
     session.illegalStreak = 0;
     session.orientVote = null;
     session.orientCount = 0;
-    if (session.lastBoardFen !== undefined) session.lastBoardFen = '';
-    if (session.lastRawFen !== undefined) session.lastRawFen = '';
+    session.reseatPrev = null;
+    session.reseatCount = 0;
+    session.reseatDone = 0;
+    session.anchorRejected = 0;
+    session.prevAnchorFen = '';
+    session.lastMoveText = '';
+    if (!keepAnchor) {
+      session.lastBoardFen = '';
+      session.lastRawFen = '';
+    }
     session.searchKey = '';
     session.searchLevel = 0;
     session.lastBudget = 0;
@@ -452,6 +600,29 @@ var JJEngine = {
 
     var learned = session.recognizer.bgModel ? 1 : 0;
     var warmTh = session.recognizer.bgModel ? session.recognizer.bgModel.warmThreshold : -1;
+
+    // 【1.1.44 开局锚定】学习成功的画面就是标准开局。模板在黑方底线右侧四格
+    // 会稳定认错（15:10 日志 mismatch="5:11/9 6:12/10 7:14/11 8:10/12"），
+    // 过去只是把 mismatch 记进日志，随后每帧继续拿错误结果重算引擎。
+    // 现在直接把标准开局写成基线：后续 process 只允许「锚盘 + 一步棋」，
+    // 这四格从此不会被带偏，也不会再触发无意义的重算。
+    if (ok) {
+      var anchorEng = Array.prototype.slice.call(startMap);   // 引擎坐标（红在下）
+      session.anchorCodes = anchorEng;
+      session.anchorFen = codesToBoardFen(anchorEng);
+      session.anchorFlipped = !!flipped;
+      session.openingAnchor = anchorEng.slice();
+      session.lastBoardFen = session.anchorFen;
+      session.lastRawFen = session.anchorFen;
+      session.lastFen = C.START_FEN;
+      session.lastResult = null;
+      session.reseatCount = 0;
+      session.anchorRejected = 0;
+      // stableCodes 是屏幕坐标，供「低置信度沿用上一帧」用，也给正确基线
+      session.stableCodes = flipped
+        ? Array.prototype.slice.call(flipCodes(anchorEng))
+        : anchorEng.slice();
+    }
 
     return {
       learned: learned,
@@ -828,7 +999,8 @@ var JJEngine = {
   process: function (pixels, w, h, opts) {
     opts = opts || {};
     if (!session.recognizer) throw new Error('未标定');
-    if (!session.tracker) JJEngine.reset();
+    // 首次建 tracker 时保留 learnBoard 刚建立的开局锚盘
+    if (!session.tracker) JJEngine.reset(null, true);
 
     // 模板匹配需要 patch，所以这里必须采
     var stats = session.recognizer.sampleAll(pixels, w, h, true);
@@ -874,8 +1046,11 @@ var JJEngine = {
       var warm = st ? (st.warmR || 0) : 0;
       var okCell;
       if (!raw) {
-        // 判空：暖色占比确实很低才可信
-        okCell = (warm < 0.12);
+        // 【1.1.44】判空原来要求 warm<0.12，但木色棋盘空格的 warmR 本来就有
+        // 0.3~0.5，这条几乎永远不成立 → 走子的起点被「沿用上一帧」填回旧棋子，
+        // 一步棋永远凑不出来（离线回归第 4 帧复现）。改成看模板分数：
+        // 分数低 = 这格真的没字形，判空可信；分数高却判空才是矛盾帧。
+        okCell = (conf < 0.10) || (warm < 0.12);
       } else {
         okCell = (conf >= LOWCONF);
       }
@@ -897,9 +1072,10 @@ var JJEngine = {
 
     // 1.1.43：裁掉超额的兵种，避免「一个兵种错 → 整盘判非法 → 永不出着法」。
     // 必须在 detectOrientation / codesHash / rawFen 之前，让全链路用同一份 codes。
-    var quotaFix = { repaired: 0 };
+    var quotaFix = { repaired: 0, replaced: 0, dropped: 0 };
     if (cls.codes) {
-      quotaFix = repairCodesQuota(cls.codes, cls.conf);
+      var rankedNow = session.recognizer ? session.recognizer.lastRanked : null;
+      quotaFix = repairCodesQuota(cls.codes, cls.conf, rankedNow);
       cls.codes = quotaFix.codes;
       mergedCodes = Array.prototype.slice.call(cls.codes);
       if (cls.grid) {
@@ -968,6 +1144,116 @@ var JJEngine = {
 
     var grid = session.flipped ? flipGrid(cls.grid) : cls.grid;
 
+    // ============================================================
+    // 【1.1.44 盘面状态锚定】乱指挥 + 卡顿的共同根因
+    // ============================================================
+    // 15:10 真机日志：模板在同一静态局面每帧给出 3~8 个不同格，FEN 从开局一路
+    // 漂成「红车在黑方底线 / 黑卒在自己底线 / 炮变兵 / 红炮跑到黑方阵地」，于是
+    //   ① 每帧 moveDetected=true → 每帧重跑 ENG.analyze → JS 线程满载 → 游戏卡顿；
+    //   ② 引擎拿着垃圾盘面算 → 建议全是乱的。
+    // 象棋每步只动一枚棋子。这里把本帧 codes 与锚盘比较，只接受「一步棋」：
+    // 噪声帧整帧丢弃；合法一步则把其余抖动格用锚盘覆盖，再推进锚盘。
+    // 落地 codes 永远是一盘真棋，盘面不变时引擎命中缓存、一次都不重算。
+    var engCodes = session.flipped ? flipCodes(cls.codes) : cls.codes;
+    var stepInfo = { changed: 0, move: null, noise: [] };
+    var anchorRejected = 0;
+    var anchor = session.anchorCodes;
+
+    if (!anchor) {
+      // 没学过开局（中途进对局）：只有数量与位置都合理的盘面才配当锚盘
+      if (codesLegal(engCodes) && codesPositionPlausible(engCodes)) {
+        anchor = Array.prototype.slice.call(engCodes);
+        session.anchorCodes = anchor;
+        session.anchorFen = codesToBoardFen(anchor);
+        session.anchorFlipped = !!session.flipped;
+        session.lastBoardFen = session.anchorFen;
+        session.lastRawFen = session.anchorFen;
+        session.lastResult = null;
+      }
+    } else if (session.anchorFlipped !== !!session.flipped) {
+      // 画面朝向变了：旧锚盘坐标失效，按当前盘面重建。
+      // 但必须先确认当前盘面本身是一盘真棋 —— 否则一帧朝向抖动就把锚盘
+      // 换成垃圾盘面（15:10 日志里 FEN 一路漂成 pnbaknb2 的帮凶之一）。
+      // 不合法时只标噪声，本帧仍用旧锚覆盖，等朝向稳定/识别干净再重建。
+      if (codesLegal(engCodes) && codesPositionPlausible(engCodes)) {
+        anchor = Array.prototype.slice.call(engCodes);
+        session.anchorCodes = anchor;
+        session.anchorFen = codesToBoardFen(anchor);
+        session.anchorFlipped = !!session.flipped;
+        session.lastBoardFen = session.anchorFen;
+        session.lastResult = null;
+        session.reseatPrev = null;
+        session.reseatCount = 0;
+      } else {
+        anchorRejected = 1;
+      }
+    }
+
+    if (anchor) {
+      stepInfo = analyzeStepDiff(anchor, engCodes);
+      var reseat = false;
+      if (!stepInfo.move && stepInfo.changed > 0) {
+        // 找不到一步棋结构：连续 3 帧「彼此差异 ≤6 格」且都合法合理才允许换局。
+        // 旧版要求逐格签名完全一样，真机模板每帧抖 3~8 格，永远凑不齐 3 帧，
+        // 结果锚盘冻死在开局、对方走了也不更新。帧间差异阈值既能让稳定局面
+        // 收敛，又挡得住单帧垃圾；再叠加数量 + 位置双闸门兜底。
+        var frameDiff = session.reseatPrev
+          ? countCodesDiff(session.reseatPrev, engCodes) : 999;
+        session.reseatCount = (frameDiff <= 6)
+          ? (session.reseatCount || 0) + 1 : 1;
+        session.reseatPrev = Array.prototype.slice.call(engCodes);
+        if (session.reseatCount >= 3 && codesLegal(engCodes) &&
+            codesPositionPlausible(engCodes)) {
+          reseat = true;
+          anchor = Array.prototype.slice.call(engCodes);
+          session.anchorCodes = anchor;
+          session.anchorFen = codesToBoardFen(anchor);
+          session.lastBoardFen = '';
+          session.lastRawFen = '';
+          session.lastResult = null;
+          session.reseatCount = 0;
+          session.reseatPrev = null;
+          session.reseatDone = 1;   // 供 out 输出诊断（out 此时还没创建）
+        } else {
+          anchorRejected = 1;
+        }
+      } else {
+        // 盘面没变、或已找到一步棋结构：清空换局候选
+        session.reseatCount = 0;
+        session.reseatPrev = null;
+      }
+
+      if (!reseat) {
+        var nextAnchor = anchor.slice();
+        if (stepInfo.move) {
+          nextAnchor[stepInfo.move.from] = 0;
+          nextAnchor[stepInfo.move.to] = stepInfo.move.piece;
+          // 一步棋不该把相/兵/将推到规则外，否则宁可当作噪声丢弃
+          if (codesLegal(nextAnchor) && codesPositionPlausible(nextAnchor)) {
+            session.prevAnchorFen = session.anchorFen;   // 走子前盘面，供中文记谱
+            anchor = nextAnchor;
+            session.anchorCodes = nextAnchor;
+            session.anchorFen = codesToBoardFen(nextAnchor);
+            session.lastMoveText = C.sqToUcci(stepInfo.move.from) +
+                                   C.sqToUcci(stepInfo.move.to);
+          } else {
+            stepInfo = { changed: stepInfo.changed, move: null, noise: stepInfo.noise };
+            anchorRejected = 1;
+          }
+        }
+        // 用锚盘（可能已推进一步）覆盖本帧 codes/grid，噪声格一律不落地
+        var screenCodes = session.flipped ? flipCodes(anchor) : anchor;
+        for (var bc = 0; bc < 90; bc++) {
+          cls.codes[bc] = screenCodes[bc];
+          if (cls.grid) cls.grid[bc] = screenCodes[bc]
+            ? (screenCodes[bc] <= 7 ? 1 : 2) : 0;
+        }
+        mergedCodes = Array.prototype.slice.call(cls.codes);
+        grid = session.flipped ? flipGrid(cls.grid) : cls.grid;
+      }
+    }
+    session.anchorRejected = anchorRejected ? (session.anchorRejected || 0) + 1 : 0;
+
     // ★ 我执红还是执黑：由画面朝向决定（黑在下 = 我执黑，红在下 = 我执红）
     var mySideDetected = session.flipped ? 'black' : 'red';
     var bottomRed = mySideDetected === 'red' ? 1 : 0;
@@ -1002,8 +1288,28 @@ var JJEngine = {
       // 浮窗盖住了几格（浮窗自带洋红边框，引擎按边框算出来的，不是猜颜色）
       pipOverlap: (session.recognizer && session.recognizer.occludedCount) || 0,
       pipRect: (session.recognizer && session.recognizer.pipRect) || null,
-      hiddenCells: (session.recognizer && session.recognizer.occludedCount) || 0
+      hiddenCells: (session.recognizer && session.recognizer.occludedCount) || 0,
+      anchorRejected: anchorRejected ? 1 : 0,
+      diffChanged: stepInfo.changed,
+      reseat: session.reseatDone ? 1 : 0,
+      repairedCount: quotaFix.repaired,
+      replacedCount: quotaFix.replaced || 0,
+      droppedCount: quotaFix.dropped || 0
     };
+    session.reseatDone = 0;
+    // 日志里 15:11 起一直打「检测到走法 (null) (null)」：旧代码只在
+    // tracker.tryAdvance 分支填 move，主路径从来没填过。现在由锚定状态机直接给出。
+    if (stepInfo.move) {
+      out.move = session.lastMoveText ||
+                 (C.sqToUcci(stepInfo.move.from) + C.sqToUcci(stepInfo.move.to));
+      var mvTxt = JJEngine.moveInfo(
+        (session.prevAnchorFen || session.anchorFen) + ' ' +
+        (mySideDetected === 'red' ? 'w' : 'b') + ' - - 0 1',
+        out.move);
+      out.moveChinese = mvTxt.chinese || out.move;
+      out.moveFromSq = stepInfo.move.from;
+      out.moveToSq = stepInfo.move.to;
+    }
 
     // ★ 主路径：直接把识别出的兵种组回 FEN
     //   这才是象棋软件该有的做法 —— 不依赖「从开局一步步跟踪」，
@@ -1039,7 +1345,10 @@ var JJEngine = {
     //   真机抓屏偶尔会出几帧垃圾识别（满盘车、红帅变黑将之类）。
     //   与其把垃圾显示出去，不如继续显示上一帧合法盘面 ——
     //   你看到的永远是「一盘真棋」，不会是乱码盘。
-    var legalNow = cls.codes && codesLegal(session.flipped ? flipCodes(cls.codes) : cls.codes);
+    // 1.1.44：数量上限之外再加「位置合理性」，拦住 pnbaknb2 这类数量合法、
+    // 但黑卒蹲在自己底线 / 红相过河的荒谬盘面
+    var engForLegal = session.flipped ? flipCodes(cls.codes) : cls.codes;
+    var legalNow = cls.codes && codesLegal(engForLegal) && codesPositionPlausible(engForLegal);
     if (!legalNow) {
       session.legalStreak = 0;
       session.illegalStreak = (session.illegalStreak || 0) + 1;
@@ -1124,14 +1433,8 @@ var JJEngine = {
       //   现在没有识别结果就返回空串，让上层明确报「没认出来」。
       out.fen = session.lastRawFen || session.lastBoardFen || '';
       out.recognized = out.fen ? 1 : 0;
-      if (isStable) {
-        var mv2 = session.tracker.tryAdvance(grid, 1);
-        if (mv2 && !mv2.fail) {
-          out.moveDetected = true;
-          out.move = mv2.ucci;
-          out.moveChinese = mv2.chinese;
-        }
-      }
+      // 1.1.44：走法已由锚定状态机统一判定，不再让 tracker.tryAdvance 用
+      // 颜色网格另推一步 —— 它会绕过锚盘、把噪声帧误判成走子并重算引擎。
     }
     out.codesValid = codesOk ? 1 : 0;
     out.codesSettled = codesSettled ? 1 : 0;
@@ -1141,6 +1444,12 @@ var JJEngine = {
     out.illegalStreak = session.illegalStreak || 0;
     out.codesStableCount = session.codesStable || 0;
     out.repairedCount = quotaFix.repaired;
+    out.replacedCount = quotaFix.replaced || 0;
+    out.droppedCount = quotaFix.dropped || 0;
+    out.anchorRejected = anchorRejected ? 1 : 0;
+    out.anchorRejectedStreak = session.anchorRejected || 0;
+    out.diffChanged = stepInfo.changed;
+    out.anchorFen = session.anchorFen || '';
     out.flipped = session.flipped ? 1 : 0;
     out.skipReason = 'none';
 

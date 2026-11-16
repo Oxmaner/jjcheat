@@ -108,7 +108,9 @@ jobs:
           test -f "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.plist"
           test -f "/tmp/unpack/Library/Application Support/JJCheat/engine.js"
           test -x /tmp/unpack/usr/bin/jjcheat-fix
-          grep -q "cn.jj.chinachess" "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.plist"
+          # 源码 plist 是 XML，FINALPACKAGE 打包后可能转成 binary plist；
+          # plutil -p 两种格式都能解析，比直接 grep 二进制稳。
+          plutil -p "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.plist" | grep -q "cn.jj.chinachess"
           echo "--- install_name（roothide 应为 @loader_path/.jbroot/...）---"
           otool -D "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib"
           echo "--- 依赖（必须含 libroothide，否则 jbroot() 运行时解析不了）---"

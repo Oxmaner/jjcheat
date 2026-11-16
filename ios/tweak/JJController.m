@@ -213,13 +213,13 @@ static UIImage *JJLoadLogoImage(void) {
 }
 
 - (void)attach {
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-            if ([sc isKindOfClass:[UIWindowScene class]] &&
-                sc.activationState == UISceneActivationStateForegroundActive) {
-                self.windowScene = (UIWindowScene *)sc;
-                break;
-            }
+    /* 部署下限 iOS 14.0（Makefile TARGET / control firmware），connectedScenes
+       必然存在，@available(iOS 13.0, *) 恒真，按规范直接调用即可。 */
+    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+        if ([sc isKindOfClass:[UIWindowScene class]] &&
+            sc.activationState == UISceneActivationStateForegroundActive) {
+            self.windowScene = (UIWindowScene *)sc;
+            break;
         }
     }
     self.frame = [UIScreen mainScreen].bounds;
@@ -867,6 +867,8 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
            【1.1.43】旧判定还看 legalNow，但 legalNow=0 时配额裁剪已能修好盘面，
            再按它退避会把正常帧也拖进 2.5s 空转；现在只认 skipAnalyze。 */
         BOOL stalled = [result[@"skipAnalyze"] boolValue];
+        BOOL rejected = [result[@"anchorRejected"] boolValue];
+        BOOL moved = [result[@"moveDetected"] boolValue];
         if (stalled) {
             self2.processNotBefore = [[NSDate date] timeIntervalSince1970] + JJ_PROCESS_ILLEGAL_GAP;
             NSLog(@"[JJCheat] 识别未收敛：legalNow=%@ codesValid=%@ codesStable=%@ repaired=%@ illegalStreak=%@ skipReason=%@（退避 %.1fs）",
@@ -874,15 +876,21 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
                   result[@"codesStableCount"] ?: @"-", result[@"repairedCount"] ?: @"-",
                   result[@"illegalStreak"] ?: @"-", result[@"skipReason"] ?: @"-",
                   JJ_PROCESS_ILLEGAL_GAP);
+        } else if (rejected && !moved) {
+            /* 1.1.44：模板抖动帧已被锚盘丢弃，JS 直接复用上一结论。
+               再连着跑识别没意义，退避到下一张 Metal 帧再试。 */
+            self2.processNotBefore = [[NSDate date] timeIntervalSince1970] + JJ_PROCESS_NOISE_GAP;
         }
 
         [[JJHUDWindow shared] showResult:result gridPoints:self2.gridPtsCache fen:result[@"fen"] ?: @""];
 
-        if ([result[@"moveDetected"] boolValue]) {
-            NSLog(@"[JJCheat] 检测到走法 %@ %@ → FEN %@ | suggest=%@ legalNow=%@ repaired=%@",
+        if (moved) {
+            NSLog(@"[JJCheat] 检测到走法 %@ %@ → FEN %@ | suggest=%@ legalNow=%@ repaired=%@ diff=%@ rejected=%@ reseat=%@ anchor=%@",
                   result[@"move"], result[@"moveChinese"], result[@"fen"],
                   result[@"suggest"] ?: @"-", result[@"legalNow"] ?: @"-",
-                  result[@"repairedCount"] ?: @"-");
+                  result[@"repairedCount"] ?: @"-", result[@"diffChanged"] ?: @"-",
+                  result[@"anchorRejected"] ?: @"-", result[@"reseat"] ?: @"-",
+                  result[@"anchorFen"] ?: @"-");
         }
     }];
 }

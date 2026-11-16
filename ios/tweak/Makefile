@@ -23,7 +23,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = JJCheat
 
-JJCheat_FILES = Tweak.xm \
+JJCheat_FILES = Tweak.x \
                 JJController.m \
                 JJEngineBridge.m \
                 JJScreenGrabber.m \

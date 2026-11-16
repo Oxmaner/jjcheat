@@ -196,6 +196,8 @@
 @property (nonatomic, strong) UILabel *lineSub;
 @property (nonatomic, copy) void (^calibBlock)(NSArray<NSValue *> *);
 @property (nonatomic, strong) NSMutableArray<NSValue *> *calibPoints;
+/** 上一次 showResult 的内容指纹；相同就跳过整轮文本排版 + 90 格重绘 */
+@property (nonatomic, copy) NSString *lastResultKey;
 @end
 
 @implementation JJHUDWindow
@@ -247,13 +249,12 @@
 }
 
 - (void)attach {
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-            if ([sc isKindOfClass:[UIWindowScene class]] &&
-                sc.activationState == UISceneActivationStateForegroundActive) {
-                self.windowScene = (UIWindowScene *)sc;
-                break;
-            }
+    /* 部署下限 iOS 14.0，connectedScenes 必然存在，无需 @available 门控 */
+    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+        if ([sc isKindOfClass:[UIWindowScene class]] &&
+            sc.activationState == UISceneActivationStateForegroundActive) {
+            self.windowScene = (UIWindowScene *)sc;
+            break;
         }
     }
     self.frame = [UIScreen mainScreen].bounds;
@@ -265,6 +266,7 @@
 - (void)setMode:(JJHUDMode)mode {
     _mode = mode;
     self.hudView.mode = mode;
+    self.lastResultKey = nil;   // 切模式后下一帧结果必须重绘
     if (mode == JJHUDModeCalibrate) {
         self.hudView.calibPoints = @[];
         [self.calibPoints removeAllObjects];
@@ -277,6 +279,17 @@
         gridPoints:(NSArray<NSArray<NSNumber *> *> *)points
                fen:(NSString *)fen {
     if (self.mode != JJHUDModeDisplay) return;
+
+    /* 1.1.44：真机 process 每 1.5~2.5s 一轮，绝大多数帧结论完全相同。
+       旧版每轮都重排两条 UILabel + setNeedsDisplay（drawRect 里画 90 格网格
+       和箭头），主线程白烧。内容指纹没变就直接返回。 */
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%@|%@|%@|%@|%@",
+                     result[@"suggest"] ?: @"", result[@"from"] ?: @"",
+                     result[@"to"] ?: @"", result[@"scoreText"] ?: @"",
+                     result[@"depth"] ?: @"", result[@"sideToMove"] ?: @"",
+                     fen ?: @""];
+    if ([key isEqualToString:self.lastResultKey] && !self.topPanel.hidden) return;
+    self.lastResultKey = key;
 
     self.hudView.gridPts = points;
 
@@ -315,6 +328,7 @@
 }
 
 - (void)showStatus:(NSString *)text {
+    self.lastResultKey = nil;   // 状态条被改写，下次结果不能因指纹相同被跳过
     self.lineMain.text = text;
     self.lineSub.text = @"";
     self.topPanel.hidden = NO;
@@ -322,6 +336,7 @@
 
 - (void)setHUDHidden:(BOOL)hidden {
     self.hidden = hidden;
+    if (!hidden) self.lastResultKey = nil;
 }
 
 #pragma mark - 触摸（标定）

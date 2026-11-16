@@ -1,11 +1,17 @@
-{
-  Filter = {
-    Bundles = (
-      "cn.jj.chinachess",
-      "com.jj.jjchess",
-      "com.jjgame.jjchess",
-      "com.jj.jjgame",
-      "cn.jj.jjchess"
-    );
-  };
-}
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Filter</key>
+	<dict>
+		<key>Bundles</key>
+		<array>
+			<string>cn.jj.chinachess</string>
+			<string>com.jj.jjchess</string>
+			<string>com.jjgame.jjchess</string>
+			<string>com.jj.jjgame</string>
+			<string>cn.jj.jjchess</string>
+		</array>
+	</dict>
+</dict>
+</plist>

@@ -24,8 +24,9 @@
    App 容器里的 engine.js 优先级最高，而装新 deb 不会覆盖它（deb 只写 jbroot
    那份）。启动时自检，缺标记就自动用编进 dylib 的内嵌副本覆盖升级。
    1.1.40 = learnAndRefine；1.1.42 = skipAnalyze（识别未收敛时跳过引擎搜索）；
-   1.1.43 = skipReason（兵种配额裁剪 + 短路条件收紧，修 skipAnalyze 恒为 1 的死锁）。 */
-static NSString * const kJJEngineFeatureMark = @"skipReason";
+   1.1.43 = skipReason（兵种配额裁剪 + 短路条件收紧，修 skipAnalyze 恒为 1 的死锁）；
+   1.1.44 = anchorCodes（开局锚定 + 一步棋状态机，修 FEN 漂移导致的乱指挥与卡顿）。 */
+static NSString * const kJJEngineFeatureMark = @"anchorCodes";
 
 // roothide 适配：jbroot 每次越狱都会换一个随机路径，必须在运行时解析。
 // 非 roothide 构建（rootful/rootless）不引这个头，避免多出 libroothide 依赖。
@@ -36,6 +37,8 @@ static NSString * const kJJEngineFeatureMark = @"skipReason";
 @interface JJEngineBridge ()
 @property (nonatomic, strong) JSContext *ctx;
 @property (nonatomic, strong) dispatch_queue_t engineQueue;
+@property (nonatomic, strong) JSValue *pixelArray;      // 1.1.44 复用 14MB 像素缓冲
+@property (nonatomic, assign) NSUInteger pixelArrayLength;
 @property (nonatomic, assign) BOOL loaded;
 @property (nonatomic, assign) BOOL busy;
 @end
@@ -297,6 +300,10 @@ static NSString *JJContainerEnginePath(void) {
             JSValue *opts = [JSValue valueWithNewObjectInContext:ctx];
             opts[@"timeMs"] = @(timeMs);
             opts[@"maxDiff"] = @(1);
+            /* 1.1.44：真机 tweak 就是实时模式。旧版没传 live，JS 侧的
+               「低置信度沿用上一帧」会把走子起点填回旧棋子，一步棋永远认不出；
+               现在识别结果原样交给锚定状态机过滤，不再靠沿用机制挡抖动。 */
+            opts[@"live"] = @YES;
             JSValue *res = [fn callWithArguments:@[arrVal, @(w), @(h), opts]];
             if (res && !res.isUndefined && !res.isNull) {
                 result = [res toDictionary];
@@ -315,14 +322,25 @@ static NSString *JJContainerEnginePath(void) {
     NSUInteger need = (NSUInteger)w * (NSUInteger)h * 4;
     if (rgba.length < need) return nil;
 
-    JSGlobalContextRef gc = ctx.JSGlobalContextRef;
-    JSValueRef ex = NULL;
-    JSObjectRef typed = JSObjectMakeTypedArray(gc, kJSTypedArrayTypeUint8ClampedArray, need, &ex);
-    if (!typed || ex) return nil;
-    void *bytes = JSObjectGetTypedArrayBytesPtr(gc, typed, NULL);
+    /* 1.1.44：旧版每次 process 都新建 14MB typed array，用完立刻交给 GC，
+       真机上就是持续的 14MB 分配/回收 + 内存压力。engineQueue 是串行队列，
+       JS 侧 process 同步执行完才返回，所以这块缓冲可以安全复用。 */
+    JSValue *arr = self.pixelArray;
+    if (!arr || self.pixelArrayLength != need) {
+        JSGlobalContextRef gc = ctx.JSGlobalContextRef;
+        JSValueRef ex = NULL;
+        JSObjectRef typed = JSObjectMakeTypedArray(gc, kJSTypedArrayTypeUint8ClampedArray, need, &ex);
+        if (!typed || ex) return nil;
+        arr = [JSValue valueWithJSValueRef:typed inContext:ctx];
+        self.pixelArray = arr;
+        self.pixelArrayLength = need;
+    }
+    JSGlobalContextRef gc2 = ctx.JSGlobalContextRef;
+    JSValueRef arrRef = arr.JSValueRef;
+    void *bytes = JSObjectGetTypedArrayBytesPtr(gc2, (JSObjectRef)arrRef, NULL);
     if (!bytes) return nil;
     memcpy(bytes, rgba.bytes, need);
-    return [JSValue valueWithJSValueRef:typed inContext:ctx];
+    return arr;
 }
 
 - (NSArray<NSArray<NSNumber *> *> *)gridPoints {
