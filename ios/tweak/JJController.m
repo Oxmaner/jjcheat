@@ -62,6 +62,12 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     return self;
 }
 
+/* 未激活：半透明 + 提示「点我」；激活后：实心「象棋」 */
+- (void)setActive:(BOOL)active {
+    self.ball.alpha = active ? 1.0 : 0.55;
+    [self.ball setTitle:(active ? @"象\n棋" : @"点\n我") forState:UIControlStateNormal];
+}
+
 - (void)tapBall { if (self.onTap) self.onTap(); }
 
 - (void)lpBall:(UILongPressGestureRecognizer *)g {
@@ -107,6 +113,8 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
 @property (nonatomic, assign) BOOL hudVisible;
 @property (nonatomic, assign) BOOL learnedBoard;
 @property (nonatomic, assign) BOOL busy;
+/* 用户点过球、真正开始抓帧与识别（进 App 时只挂球，不工作） */
+@property (nonatomic, assign) BOOL activated;
 @property (nonatomic, assign) NSInteger tickCount;
 @property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *gridPtsCache;
 /* 标定得到的屏幕 point 坐标（原始值）；像素坐标按实际抓帧尺寸现算 */
@@ -137,16 +145,28 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
 }
 
 - (void)start {
-    NSLog(@"[JJCheat] 启动");
+    NSLog(@"[JJCheat] 待机：只挂悬浮球，不抓帧（进对局后点球开始）");
+    self.activated = NO;
+    self.state = JJCtrlStateIdle;
+    self.learnedBoard = NO;
+    [self setupBall];
+    [self.ballWindow setActive:NO];
+    /* 这里刻意不做：loadEngine / grabber.start / HUD attach / startTimer
+       避免在登录页、大厅、结算页上误学棋盘、误识别 */
+}
+
+/* 用户点球后才真正开工 */
+- (void)activate {
+    if (self.activated) return;
+    self.activated = YES;
+    [self.ballWindow setActive:YES];
+    NSLog(@"[JJCheat] 用户点球 → 开始抓帧与识别");
+
     [[JJScreenGrabber shared] start];
     [[JJEngineBridge shared] loadEngine];
-
     [[JJHUDWindow shared] attach];
     self.hudVisible = YES;
 
-    [self setupBall];
-
-    // 加载已保存的标定
     NSArray *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:JJ_KEY_CORNERS];
     if (saved.count == 4) {
         NSMutableArray *corners = [NSMutableArray array];
@@ -155,10 +175,11 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
                                  [NSNumber numberWithDouble:[p[1] doubleValue]]]];
         }
         self.pointCorners = corners;
-        [[JJEngineBridge shared] setCorners:corners];
+        self.lastFrameW = 0;
+        self.lastFrameH = 0;
         self.state = JJCtrlStateWaitingBoard;
         self.gridPtsCache = [[JJEngineBridge shared] gridPoints];
-        [[JJHUDWindow shared] showStatus:@"已就绪 · 进入一局新棋后自动开始"];
+        [[JJHUDWindow shared] showStatus:@"已就绪 · 进对局画面后自动学习"];
         [self startTimer];
     } else {
         [self recalibrate];
@@ -169,6 +190,7 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     [self.timer invalidate];
     self.timer = nil;
     self.state = JJCtrlStateIdle;
+    self.activated = NO;
     [[JJScreenGrabber shared] stop];
 }
 
@@ -178,11 +200,16 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
     __weak typeof(self) weakSelf = self;
     self.ballWindow.onTap = ^{
         __strong typeof(weakSelf) self2 = weakSelf;
-        self2.hudVisible = !self2.hudVisible;
+        if (!self2.activated) {          /* 第一次点：开工 */
+            [self2 activate];
+            return;
+        }
+        self2.hudVisible = !self2.hudVisible;   /* 之后：切换 HUD 显隐 */
         [[JJHUDWindow shared] setHUDHidden:!self2.hudVisible];
     };
     self.ballWindow.onLongPress = ^{
         __strong typeof(weakSelf) self2 = weakSelf;
+        if (!self2.activated) [self2 activate];
         [self2 recalibrate];
     };
     [self.ballWindow attach];

@@ -51,6 +51,13 @@ jobs:
             (echo "!! 16.5 SDK 没拿到，退回 Xcode SDK" && ls /tmp/sdks-master | head)
           ls "$THEOS/sdks" || true
 
+      - name: 版本号随构建递增
+        run: |
+          set -eux
+          VER="1.1.${GITHUB_RUN_NUMBER}"
+          /usr/bin/sed -i '' -E "s/^Version: .*/Version: ${VER}/" ios/tweak/control
+          grep '^Version:' ios/tweak/control
+
       - name: 打包引擎脚本 engine.js
         run: |
           set -eux
