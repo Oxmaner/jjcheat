@@ -1096,6 +1096,8 @@ class BoardRecognizer {
     let coreN = 0, coreInk = 0, coreRedInk = 0, coreDarkInk = 0;
     const PW = PATCH_W;
     let patchW = null, patchR = null, patchI = null, patchValid = null;
+    // 每 patch 像素的亮度均值与红/黑墨迹占比，供「自适应墨迹兜底」二次分割用
+    let patchL = null, patchRi = null, patchDi = null;
 
     // 纯绿像素过滤器（可走位置绿点、绿色高亮圈）
     const isPureGreen = (R, G, B) => (G > R + 30 && G > B + 30 && G > 90);
@@ -1104,6 +1106,9 @@ class BoardRecognizer {
       patchW = new Uint8Array(PW * PW);
       patchR = new Uint8Array(PW * PW);
       patchI = new Uint8Array(PW * PW);
+      patchL = new Float32Array(PW * PW);
+      patchRi = new Float32Array(PW * PW);
+      patchDi = new Float32Array(PW * PW);
       // 有效像素掩码：0 = 这一格像素是干扰（高亮圈 / 绿点 / 白边），
       // 模板比对时把它的权重归零，避免「上一步的高亮圈」把兵种带偏。
       patchValid = new Uint8Array(PW * PW);
@@ -1174,6 +1179,9 @@ class BoardRecognizer {
           patchW[idx] = (wN * 2 >= okN) ? 255 : 0;
           patchR[idx] = (rN * 2 >= okN) ? 255 : 0;
           patchI[idx] = (iN * 2 >= okN) ? 255 : 0;
+          patchL[idx] = lSum * inv;
+          patchRi[idx] = riN * inv;
+          patchDi[idx] = diN * inv;
 
           sumL += lSum * inv; n++;
           red += redN * inv;
@@ -1230,6 +1238,62 @@ class BoardRecognizer {
     }
 
     const denom = n > 0 ? n : 1;
+
+    /* ---- 自适应墨迹兜底（2.1.56）----------------------------------------
+     * 绝对阈值（isRedInk / isDarkInk）是按「参考截图」的亮度调的。真机抓帧
+     * 的棋盘与棋子亮度差很多时会出现一种很整齐的失败：棋子盘面（象牙白，
+     * L≈208）采得到，字却一个墨点都判不出来 —— matchCell 分数恒 0，
+     * 整盘棋子全被当空格丢掉，verifyDiff 正好等于开局子数（真机实测 32）。
+     *
+     * 这里只在「这一格明确有象牙白盘面（hi≥190）且对比度够（≥45）、
+     * 但绝对判据一个墨点都没抓到（<8/576）」时，用这一格自己的亮度分布
+     * 重新分割墨迹。原本能正常判的格子完全不受影响。
+     */
+    if (wantPatch && patchL && n > 0) {
+      let absInk = 0;
+      for (let i = 0, np = PW * PW; i < np; i++) if (patchI[i]) absInk++;
+      if (absInk < 8) {
+        let hi = 0, lo = 255;
+        for (let i = 0, np = PW * PW; i < np; i++) {
+          if (!patchValid[i]) continue;
+          const v = patchL[i];
+          if (v > hi) hi = v;
+          if (v < lo) lo = v;
+        }
+        const contrast = hi - lo;
+        if (hi >= 190 && contrast >= 45) {
+          const thr = lo + 0.40 * contrast;
+          let mInk = 0, mRed = 0, mDark = 0;
+          let kInk = 0, kRed = 0, kDark = 0;
+          for (let py = 0; py < PW; py++) {
+            for (let px = 0; px < PW; px++) {
+              const i = py * PW + px;
+              if (!patchValid[i]) continue;
+              const isInk = patchL[i] < thr;
+              patchI[i] = isInk ? 255 : 0;
+              if (!isInk) continue;
+              const isRed = patchRi[i] > patchDi[i];
+              mInk++;
+              if (isRed) mRed++; else mDark++;
+              if (py >= 6 && py <= 17 && px >= 6 && px <= 17) {
+                kInk++;
+                if (isRed) kRed++; else kDark++;
+              }
+            }
+          }
+          // 墨迹占了大半格 = 这是一块暗色物体而不是字形，放弃
+          if (mInk > n * 0.55) {
+            for (let i = 0, np = PW * PW; i < np; i++) patchI[i] = 0;
+          } else {
+            ink = mInk; redInk = mRed; darkInk = mDark;
+            if (coreN > 0) {
+              coreInk = kInk; coreRedInk = kRed; coreDarkInk = kDark;
+            }
+          }
+        }
+      }
+    }
+
     return {
       meanL: sumL / denom,
       redR: red / denom,

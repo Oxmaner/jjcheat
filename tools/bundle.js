@@ -475,9 +475,11 @@ var session = {
 
 var JJEngine = {
   version: '2.1.0',
-  /* 2.1.0 契约标记：ObjC 桥用它判断容器里的 engine.js 是否为本版
-     （旧版会被内嵌副本自动覆盖升级）。 */
-  featureMark: 'pikafishNative',
+  /* 2.1.56：契约标记带版本尾巴。
+     为什么必须变：JJVisionBridge 只在「容器里那份 engine.js 缺这个标记」时才覆盖升级，
+     标记不变 = 用户容器里 253886 字节的旧脚本永远不会被换掉，新识别逻辑根本跑不到。
+     新标记必须包含旧标记作为子串之外的前缀（旧脚本里没有 pikafishNative2156）。 */
+  featureMark: 'pikafishNative2156',
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
@@ -649,6 +651,40 @@ var JJEngine = {
     var learned = session.recognizer.bgModel ? 1 : 0;
     var warmTh = session.recognizer.bgModel ? session.recognizer.bgModel.warmThreshold : -1;
 
+    /* ---- 2.1.56 诊断：把 90 格的「墨迹 / 暖色 / 模板分 / 识别值」压成一条串 ----
+     * 真机 verifyDiff=32 恰好等于开局子数，说明整盘棋子被判空。仅凭这一点
+     * 分不清是「没采到墨迹」（阈值问题）还是「网格偏了」（几何问题），
+     * 所以这里按格给三码：
+     *   i = 墨迹占比 inkR*20（0~9，9 就是 0.45 以上）
+     *   w = 暖色占比 warmR*10
+     *   s = 模板分 conf*2
+     * 再附 90 个识别值（36 进制）。整条 360 字符，一条日志就能定位。
+     */
+    var ls = session.recognizer.lastStats || {};
+    var dConf = (clsV && clsV.conf) ? clsV.conf : null;
+    var diagI = '', diagW = '', diagS = '', codes36 = '';
+    for (var dq = 0; dq < 90; dq++) {
+      var ds = stats[dq];
+      var dCode = chkCodes ? chkCodes[dq] : (gotCodes ? gotCodes[dq] : 0);
+      codes36 += (dCode || 0).toString(36);
+      if (!ds || !ds.n) { diagI += '·'; diagW += '·'; diagS += '·'; continue; }
+      var vI = Math.min(9, Math.round((ds.inkR || 0) * 20));
+      var vW = Math.min(9, Math.round((ds.warmR || 0) * 10));
+      var vS = dConf ? Math.min(9, Math.round((dConf[dq] || 0) * 2)) : 0;
+      diagI += String(vI); diagW += String(vW); diagS += String(vS);
+    }
+    /* 棋盘外接框的宽高比：标准河盘 8 列 9 行 = 0.889。
+       真机自动标定给出过 0.94，说明四角落到了木框上，格点必然整体错位。 */
+    var gridAspect = 0;
+    try {
+      var gc = session.corners || session.recognizer.corners;
+      if (gc && gc.length === 4) {
+        var gW = ((gc[1][0] - gc[0][0]) + (gc[2][0] - gc[3][0])) / 2;
+        var gH = ((gc[3][1] - gc[0][1]) + (gc[2][1] - gc[1][1])) / 2;
+        gridAspect = gH > 0.5 ? Math.round(gW / gH * 1000) / 1000 : 0;
+      }
+    } catch (eA) { gridAspect = 0; }
+
     // 【1.1.44 开局锚定】学习成功的画面就是标准开局。模板在黑方底线右侧四格
     // 会稳定认错（15:10 日志 mismatch="5:11/9 6:12/10 7:14/11 8:10/12"），
     // 过去只是把 mismatch 记进日志，随后每帧继续拿错误结果重算引擎。
@@ -688,6 +724,21 @@ var JJEngine = {
       mySide: session.flipped ? 'black' : 'red',
       diffNormal: verifyDiff,
       diffFlipped: flipped ? verifyDiff : -1,
+      /* 2.1.56 采样几何与亮度：cell 约 137、radius 约 47 才算正常；
+         gain 是 estimateGain 把整帧拉到模板亮度用的增益（0.55~1.9）。 */
+      cell: Math.round((ls.cell || 0) * 10) / 10,
+      radius: ls.radius || 0,
+      gain: Math.round((ls.gain || 0) * 100) / 100,
+      meanL: Math.round((function () {
+        var t = 0, c = 0;
+        for (var q = 0; q < 90; q++) { if (stats[q] && stats[q].n) { t += stats[q].meanL; c++; } }
+        return c ? t / c : 0;
+      })()),
+      gridAspect: gridAspect,
+      diagI: diagI,
+      diagW: diagW,
+      diagS: diagS,
+      codes36: codes36,
       bottomRed: bRed,
       bottomBlack: bBlk,
       topRed: tRed,

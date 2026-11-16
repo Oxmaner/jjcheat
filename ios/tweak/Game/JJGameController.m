@@ -619,6 +619,24 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
         self.learnFailCount++;
         NSLog(@"[JJCheat] 学习校验未通过 verifyDiff=%@ ok=%@（第 %ld 次）",
               info[@"verifyDiff"], info[@"ok"] ?: @"-", (long)self.learnFailCount);
+        /* 2.1.56 诊断：真机 verifyDiff=32 恰好等于开局子数 = 整盘棋子被判空。
+           光看这个数字分不清「墨迹没采到」还是「网格偏了」，所以把几何
+           （cell/radius/gridAspect）、亮度（gain/meanL）和 90 格的
+           墨迹/暖色/模板分三张图一次打全。 */
+        NSLog(@"[JJCheat] 学习诊断 cell=%@ radius=%@ gain=%@ meanL=%@ aspect=%@ "
+               "warmTh=%@ flipped=%@ redN=%@ blkN=%@ 底红黑=%@/%@ 顶红黑=%@/%@",
+              info[@"cell"] ?: @"-", info[@"radius"] ?: @"-",
+              info[@"gain"] ?: @"-", info[@"meanL"] ?: @"-",
+              info[@"gridAspect"] ?: @"-", info[@"warmThreshold"] ?: @"-",
+              info[@"flipped"] ?: @"-", info[@"redN"] ?: @"-", info[@"blkN"] ?: @"-",
+              info[@"bottomRed"] ?: @"-", info[@"bottomBlack"] ?: @"-",
+              info[@"topRed"] ?: @"-", info[@"topBlack"] ?: @"-");
+        NSLog(@"[JJCheat] 墨迹图 i=%@", info[@"diagI"] ?: @"-");
+        NSLog(@"[JJCheat] 暖色图 w=%@", info[@"diagW"] ?: @"-");
+        NSLog(@"[JJCheat] 模板分 s=%@", info[@"diagS"] ?: @"-");
+        NSLog(@"[JJCheat] 识别值 c=%@ gotFen=%@", info[@"codes36"] ?: @"-",
+              info[@"gotFen"] ?: @"-");
+        NSLog(@"[JJCheat] 差异格 %@", info[@"mismatch"] ?: @"-");
         [[JJCalibrator shared] dumpSamplesWithPixels:rgba width:w height:h];
         if (self.calibrationPending && [[JJCalibrator shared] hasSnapshot] &&
             self.learnFailCount >= JJ_CALIB_ROLLBACK_FAILS) {
@@ -660,8 +678,11 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     self.lastSearchFen = nil;
     self.engineResult = nil;
     self.engineGen++;
-    NSLog(@"[JJCheat] 棋盘学习完成 verifyDiff=%@ ok=1 · 下一帧立即出建议",
-          info[@"verifyDiff"]);
+    NSLog(@"[JJCheat] 棋盘学习完成 verifyDiff=%@ ok=1 · 下一帧立即出建议 "
+           "（cell=%@ radius=%@ gain=%@ aspect=%@ 底红黑=%@/%@）",
+          info[@"verifyDiff"], info[@"cell"] ?: @"-", info[@"radius"] ?: @"-",
+          info[@"gain"] ?: @"-", info[@"gridAspect"] ?: @"-",
+          info[@"bottomRed"] ?: @"-", info[@"bottomBlack"] ?: @"-");
 }
 
 - (void)rollbackCalibration {
