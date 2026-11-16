@@ -77,6 +77,14 @@ static void JJStartOnce(void) {
 
     NSLog(@"[JJCheat] tweak 已加载 (pid=%d)", getpid());
 
+    // 抓帧链路自检：GL hook 装不上就只能掉到 CALayer，而 CALayer 抓 GL/Metal 游戏恒为黑
+    Class eagl = NSClassFromString(@"EAGLContext");
+    BOOL hasPresent = eagl && [eagl instancesRespondToSelector:@selector(presentRenderbuffer:)];
+    NSLog(@"[JJCheat] EAGLContext=%p presentRenderbuffer:=%@", eagl, hasPresent ? @"有" : @"没有");
+    if (!hasPresent) {
+        NSLog(@"[JJCheat] 警告：拿不到 GL hook 点，抓帧将退化为 CARenderServer/CALayer，可能全黑");
+    }
+
     [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidBecomeActiveNotification
                     object:nil

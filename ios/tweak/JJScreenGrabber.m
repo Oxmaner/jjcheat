@@ -22,6 +22,9 @@ static CARenderServerRenderDisplay_t  s_renderDisplay  = NULL;
 static mach_port_t                    s_serverPort     = MACH_PORT_NULL;
 static BOOL                           s_apiResolved    = NO;
 static BOOL                           s_apiUsable      = NO;
+static int                            s_glHookFrames   = 0;
+static int                            s_grabLogCount   = 0;
+static int                            s_rsFailStreak   = 0;
 
 @interface JJScreenGrabber () {
     IOSurfaceRef   _surface;
@@ -187,6 +190,14 @@ static void swapRB(uint32_t *p, size_t count) {
     _glW = w; _glH = h;
     _glFrameTimestamp = CACurrentMediaTime();
     os_unfair_lock_unlock(&_lock);
+
+    if ((s_glHookFrames++ % 60) == 0) {
+        const uint8_t *p = (const uint8_t *)flipped.bytes;
+        size_t c = (size_t)(h / 2) * (size_t)w * 4 + (size_t)(w / 2) * 4;
+        int r = -1, g = -1, b = -1;
+        if (p && c + 2 < (size_t)need) { r = p[c]; g = p[c + 1]; b = p[c + 2]; }
+        NSLog(@"[JJCheat] GL hook 第 %d 帧 %dx%d 中心像素=(%d,%d,%d)", s_glHookFrames, w, h, r, g, b);
+    }
 }
 
 - (NSData *)grabViaGLCacheWithWidth:(int *)outW height:(int *)outH {
@@ -236,12 +247,33 @@ static void swapRB(uint32_t *p, size_t count) {
     return out;
 }
 
+/* 抓帧来源 + 一个像素样本（每 20 次打一条，避免刷屏） */
+- (void)logGrabSource:(NSString *)src data:(NSData *)d w:(int *)outW h:(int *)outH {
+    if ((s_grabLogCount++ % 20) != 0) return;
+    int w = outW ? *outW : 0, h = outH ? *outH : 0;
+    const uint8_t *p = (const uint8_t *)d.bytes;
+    size_t c = (size_t)(h / 2) * (size_t)w * 4 + (size_t)(w / 2) * 4;
+    int r = -1, g = -1, b = -1;
+    if (p && c + 2 < d.length) { r = p[c]; g = p[c + 1]; b = p[c + 2]; }
+    NSLog(@"[JJCheat] 抓帧来源=%@ %dx%d 中心像素=(%d,%d,%d)", src, w, h, r, g, b);
+}
+
 - (NSData *)grabRGBAWithWidth:(int *)outW height:(int *)outH {
     NSData *d = [self grabViaRenderServerWithWidth:outW height:outH];
-    if (d && d.length) return d;
+    if (d.length) {
+        s_rsFailStreak = 0;
+        [self logGrabSource:@"CARenderServer" data:d w:outW h:outH];
+        return d;
+    }
+    if (s_apiUsable && ++s_rsFailStreak >= 3) {
+        s_apiUsable = NO;
+        NSLog(@"[JJCheat] CARenderServer 连续 3 次失败，永久降级（roothide 下 App 沙箱常见）");
+    }
     d = [self grabViaGLCacheWithWidth:outW height:outH];
-    if (d && d.length) return d;
-    return [self grabViaLayerWithWidth:outW height:outH];
+    if (d.length) { [self logGrabSource:@"GL-hook" data:d w:outW h:outH]; return d; }
+    d = [self grabViaLayerWithWidth:outW height:outH];
+    if (d.length) [self logGrabSource:@"CALayer" data:d w:outW h:outH];
+    return d;
 }
 
 - (void)dealloc {
