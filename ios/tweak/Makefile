@@ -69,19 +69,24 @@ endif
 include $(THEOS_MAKE_PATH)/tweak.mk
 
 # ------------------------------------------------------------
-#  打包前体检：引擎必须在 layout 里，否则装到手机上必然启动失败
+#  打包前体检：引擎两个产物都必须在 layout 里，否则装到手机上必然启动失败
+#  （2026 版 Pikafish 不内嵌 NNUE，权重是独立文件）
 #  用 JJ_SKIP_ENGINE_CHECK=1 可以跳过（只编 UI 时用）
 # ------------------------------------------------------------
-PIKA_BIN := $(THEOS_PROJECT_DIR)/layout/Library/Application Support/JJCheat/Pikafish/pikafish
+PIKA_DIR := $(THEOS_PROJECT_DIR)/layout/Library/Application Support/JJCheat/Pikafish
+PIKA_BIN := $(PIKA_DIR)/pikafish
+PIKA_NET := $(PIKA_DIR)/pikafish.nnue
 
 before-package::
 	@if [ "$(JJ_SKIP_ENGINE_CHECK)" != "1" ]; then \
-	    if [ ! -f "$(PIKA_BIN)" ]; then \
-	        echo "!! 缺少 Pikafish 可执行文件: $(PIKA_BIN)"; \
-	        echo "!! 先跑 engine/build-ios.sh，或用 JJ_SKIP_ENGINE_CHECK=1 跳过"; \
-	        exit 1; \
-	    fi; \
-	    echo ">> Pikafish: $$(wc -c < '$(PIKA_BIN)' | tr -d ' ') 字节"; \
+	    for f in "$(PIKA_BIN)" "$(PIKA_NET)"; do \
+	        if [ ! -f "$$f" ]; then \
+	            echo "!! 缺少引擎文件: $$f"; \
+	            echo "!! 先跑 engine/build-ios.sh，或用 JJ_SKIP_ENGINE_CHECK=1 跳过"; \
+	            exit 1; \
+	        fi; \
+	        echo ">> $$(basename "$$f"): $$(wc -c < "$$f" | tr -d ' ') 字节"; \
+	    done; \
 	fi
 
 after-install::

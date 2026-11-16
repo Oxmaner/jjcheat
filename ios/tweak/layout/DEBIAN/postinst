@@ -13,6 +13,7 @@ set +e
 APP_DIR="/Library/Application Support/JJCheat"
 ENGINE="$APP_DIR/engine.js"
 PIKA="$APP_DIR/Pikafish/pikafish"
+NET="$APP_DIR/Pikafish/pikafish.nnue"
 
 if [ -f "$ENGINE" ]; then
     echo "[JJCheat] postinst: engine.js 就位（$(wc -c < "$ENGINE" 2>/dev/null | tr -d ' ') 字节）"
@@ -29,6 +30,13 @@ if [ -f "$PIKA" ]; then
     fi
 else
     echo "[JJCheat] postinst: !! 包里没有 Pikafish，插件会一直提示「引擎未安装」"
+fi
+
+if [ -f "$NET" ]; then
+    chmod 0644 "$NET" 2>/dev/null
+    echo "[JJCheat] postinst: NNUE 权重就位（$(wc -c < "$NET" 2>/dev/null | tr -d ' ') 字节）"
+else
+    echo "[JJCheat] postinst: !! 包里没有 pikafish.nnue，引擎会启动即退出"
 fi
 
 echo "[JJCheat] postinst: 完成 —— 记得到 Bootstrap 的 App List 打开 JJ象棋 注入开关"

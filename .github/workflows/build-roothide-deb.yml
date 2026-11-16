@@ -128,6 +128,7 @@ jobs:
           dpkg-deb -x "$DEB" /tmp/unpack
           DYLIB="/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib"
           PIKA="/tmp/unpack/Library/Application Support/JJCheat/Pikafish/pikafish"
+          NET="/tmp/unpack/Library/Application Support/JJCheat/Pikafish/pikafish.nnue"
           test -f "$DYLIB"
           test -f "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.plist"
           test -f "/tmp/unpack/Library/Application Support/JJCheat/engine.js"
@@ -140,9 +141,13 @@ jobs:
             *) echo "!! pikafish 不是 arm64 Mach-O"; exit 1 ;;
           esac
           SIZE=$(wc -c < "$PIKA" | tr -d ' ')
-          test "$SIZE" -gt 20000000 || (echo "!! pikafish 只有 $SIZE 字节，NNUE 没嵌进去"; exit 1)
           echo "pikafish = $SIZE 字节"
           codesign -dv "$PIKA" 2>&1 | head -3 || true
+          # 2026 版 Pikafish 不内嵌 NNUE，权重必须独立随包（~48MB）
+          test -f "$NET" || (echo "!! 包里没有 pikafish.nnue，引擎启动即退出" && exit 1)
+          NETSIZE=$(wc -c < "$NET" | tr -d ' ')
+          test "$NETSIZE" -gt 20000000 || (echo "!! pikafish.nnue 只有 $NETSIZE 字节"; exit 1)
+          echo "pikafish.nnue = $NETSIZE 字节"
           # 源码 plist 是 XML，FINALPACKAGE 打包后可能转成 binary plist；
           # plutil -p 两种格式都能解析，比直接 grep 二进制稳。
           plutil -p "/tmp/unpack/Library/MobileSubstrate/DynamicLibraries/JJCheat.plist" | grep -q "cn.jj.chinachess"

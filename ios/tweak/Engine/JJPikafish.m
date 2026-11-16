@@ -359,10 +359,16 @@ static NSString *const kPikaLog = @"[JJCheat][Pika]";
 - (void)handleLineOnQueue:(NSString *)line {
     if ([line hasPrefix:@"uciok"]) {
         self.sawUciok = YES;
-        /* 手机资源画像：单线程、小哈希。EvalFile 不设 ——
-           Pikafish 构建时已把默认 NNUE 内嵌（make 的 net 目标先于 build），
-           引擎默认用它；即便没有内嵌，引擎也会从二进制同目录找
-           pikafish.nnue（安装器整个目录复制，两种情况都通）。 */
+        /* 手机资源画像：单线程、小哈希。
+           EvalFile 必须显式指定：Pikafish 2026 版已取消编译期内嵌 NNUE
+           （network.cpp 里没有 INCBIN 分支），只在 {cwd, 二进制所在目录}
+           里按默认名 pikafish.nnue 找。安装器把两个文件放在同一目录，
+           理论上不设也能找到；这里再显式设一次绝对路径，把「spawn 时
+           argv[0] 是相对路径 / 容器被重定向」这类边角情况一起堵掉。 */
+        NSString *netPath = [JJPikafishInstaller netPathInContainer];
+        if (netPath.length) {
+            [self writeLine:[NSString stringWithFormat:@"setoption name EvalFile value %@", netPath]];
+        }
         [self writeLine:@"setoption name Threads value 1"];
         [self writeLine:[NSString stringWithFormat:@"setoption name Hash value %d",
                          JJ_PIKA_HASH_MB]];

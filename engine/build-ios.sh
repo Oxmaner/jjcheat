@@ -30,6 +30,7 @@ MIN_IOS="${PIKA_MIN_IOS:-14.0}"
 NFORCE="${PIKA_FORCE:-0}"
 DEST_DIR="$ROOT/ios/tweak/layout/Library/Application Support/JJCheat/Pikafish"
 DEST="$DEST_DIR/pikafish"
+DEST_NET="$DEST_DIR/pikafish.nnue"
 
 log() { printf '\033[1;36m>> %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31m!! %s\033[0m\n' "$*" >&2; exit 1; }
@@ -92,6 +93,9 @@ else
 fi
 
 # ---------- 校验 ----------
+# 注意：Pikafish 2026 版不再把 NNUE 编进二进制（network.cpp 无 INCBIN，
+# 只在 {cwd, 二进制目录} 里找 pikafish.nnue），所以可执行文件只有 ~800KB，
+# 权重是单独一个 ~48MB 的文件，两个都必须随包走。
 log "校验产物"
 FILEINFO="$(file -b pikafish)"
 echo "    $FILEINFO"
@@ -99,9 +103,12 @@ case "$FILEINFO" in
     *Mach-O*arm64*) ;;
     *) die "产物不是 arm64 Mach-O：$FILEINFO" ;;
 esac
+[ -s pikafish.nnue ] || die "缺 pikafish.nnue"
+NET_SIZE="$(wc -c < pikafish.nnue | tr -d ' ')"
+[ "$NET_SIZE" -gt 20000000 ] || die "pikafish.nnue 只有 $NET_SIZE 字节，下载不完整"
 SIZE="$(wc -c < pikafish | tr -d ' ')"
-[ "$SIZE" -gt 20000000 ] || die "体积只有 $SIZE 字节，NNUE 大概没嵌进去（正常 30~60MB）"
-log "体积  : $SIZE 字节"
+log "可执行 : $SIZE 字节"
+log "权重   : $NET_SIZE 字节"
 
 # ---------- 签名 ----------
 if command -v ldid >/dev/null; then
@@ -116,8 +123,11 @@ codesign -dv pikafish 2>&1 | sed 's/^/    /' || true
 # ---------- 落盘 ----------
 mkdir -p "$DEST_DIR"
 cp -f pikafish "$DEST"
+cp -f pikafish.nnue "$DEST_NET"
 chmod 0755 "$DEST"
-log "已放置: $DEST"
-log "sha256: $(shasum -a 256 "$DEST" | cut -d' ' -f1)"
+chmod 0644 "$DEST_NET"
+log "已放置: $DEST  +  $DEST_NET"
+log "sha256(bin): $(shasum -a 256 "$DEST" | cut -d' ' -f1)"
+log "sha256(net): $(shasum -a 256 "$DEST_NET" | cut -d' ' -f1)"
 echo
 echo "下一步：cd ios/tweak && make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide"
