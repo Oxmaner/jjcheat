@@ -15,13 +15,23 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <CoreFoundation/CFBase.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** 取最新一帧 RGBA（5 秒内有效），没有则 nil；调用即视为已消费，允许再读一帧 */
+/** 取最新一帧 RGBA；调用即视为已消费，允许读帧队列再取一张。
+    2.0.0：这里不再按时间判过期（1.1.44 的 5s 过期与上层退避叠加，
+    导致 frame=0 B 却永久复用旧帧）。新鲜度由 JJMetalFrameIsFresh 单独判断，
+    上层只在序号变化且帧确实新鲜时才喂给 JS。 */
 NSData *JJMetalFrameCopy(int *outW, int *outH);
+
+/** 当前缓存帧是否在 JJ_FRAME_MAX_AGE 内；过期帧一律不许进入识别链路 */
+BOOL JJMetalFrameIsFresh(void);
+
+/** 当前缓存帧的年龄（秒），用于诊断日志 */
+CFTimeInterval JJMetalFrameAge(void);
 
 /** 已成功出帧的序号；上层用它跳过「同一帧重复喂给 JS」的白工 */
 uint64_t JJMetalFrameSerial(void);

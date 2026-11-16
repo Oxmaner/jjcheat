@@ -31,10 +31,13 @@ static int                            s_blackFrames    = 0;
    （14MB 位图 + 1284x2778 全屏 renderInContext），roothide 下还必然全黑。
    1.1.44：4Hz tick 下每 250ms 跑一次会把主线程打满，这里限到 1.5s 一次。 */
 static CFTimeInterval                 s_lastHeavyFallbackTs = 0;
-/* 最近一张内容有效的 Metal 帧：游戏停渲染时复用，避免掉进全屏 CALayer 回退 */
+/* 最近一张内容有效的 Metal 帧：游戏停渲染时短暂复用，避免掉进全屏 CALayer 回退。
+   2.0.0 必须带时间戳：1.1.44 这张缓存永久有效，16:00 真机日志里 12 分钟
+   都在拿同一张旧图跑模板匹配 → 间歇性卡顿 + 新对局再也识别不出来。 */
 static NSData *                       s_lastGoodMetal  = nil;
 static int                            s_lastGoodW      = 0;
 static int                            s_lastGoodH      = 0;
+static CFTimeInterval                 s_lastGoodTs     = 0;
 
 @interface JJScreenGrabber () {
     IOSurfaceRef   _surface;
@@ -238,6 +241,10 @@ static void swapRB(uint32_t *p, size_t count) {
 }
 
 - (NSData *)grabViaMetalWithWidth:(int *)outW height:(int *)outH {
+    /* 2.0.0：新鲜度硬闸门。1.1.44 让 JJMetalFrameCopy 自带 5s 过期，
+       与上层退避叠加后恒返回 nil，再被下面的永久缓存兜住 → 静默死锁。
+       现在过期就直接不给帧，上层宁可跳过这一轮也不拿旧图跑 JS。 */
+    if (!JJMetalFrameIsFresh()) return nil;
     NSData *d = JJMetalFrameCopy(outW, outH);
     static int s_metalLog = 0;
     if ((s_metalLog++ % 25) == 0) {
@@ -335,27 +342,31 @@ static BOOL JJFrameIsBlack(NSData *d, int w, int h) {
         s_lastGoodMetal = d;
         s_lastGoodW = w;
         s_lastGoodH = h;
+        s_lastGoodTs = CACurrentMediaTime();
         if (outW) *outW = w;
         if (outH) *outH = h;
         [self logGrabSource:@"Metal" data:d w:outW h:outH];
         return d;
     }
 
-    /* Metal 曾经稳定出过帧就不再回退。
-       结算页 / 对方思考时游戏会停渲染，旧逻辑会因为「帧过期」掉到
-       CARenderServer（roothide 下静默全黑）再到 CALayer——后者要在主线程
-       全屏 renderInContext，既卡又只拿到一张全黑图，JS 还会白跑一轮模板匹配。
-       复用上一张有效帧，配合上层 JJMetalFrameSerial 去重，代价为零。 */
-    if (s_lastGoodMetal.length) {
+    /* 复用窗口只有 JJ_FRAME_MAX_AGE 秒。超时就返回 nil，让上层整轮跳过：
+       局面静止时本来就不该跑识别，拿一张过期画面反而会误导锚定状态机。
+       上层还有帧序号 + 画面指纹双重去重，这里复用也不会造成重复计算。 */
+    BOOL goodIsFresh = s_lastGoodMetal.length &&
+        (CACurrentMediaTime() - s_lastGoodTs <= JJ_FRAME_MAX_AGE);
+    if (goodIsFresh) {
         int cw = s_lastGoodW, ch = s_lastGoodH;
         if (outW) *outW = cw;
         if (outH) *outH = ch;
         [self logGrabSource:@"Metal(缓存)" data:s_lastGoodMetal w:&cw h:&ch];
         return s_lastGoodMetal;
     }
+    /* 只要 Metal 曾经出过有效帧，就永远不再走 CARenderServer / CALayer：
+       roothide 下前者静默全黑，后者要在主线程全屏 renderInContext（14MB 位图），
+       是 1.1.44 之前「间歇性卡顿」最重的一块。缓存过期宁可空一轮等下一张 Metal 帧。 */
+    if (s_lastGoodMetal.length) return nil;
 
-    /* Metal 从未出过有效帧时才轮到重回退，且 1.5s 内最多一次。
-       一旦 s_lastGoodMetal 有值，上面的缓存分支已经返回，走不到这里。 */
+    /* Metal 从未出过有效帧时才轮到重回退，且 1.5s 内最多一次。 */
     CFTimeInterval fallbackNow = CACurrentMediaTime();
     if (s_lastHeavyFallbackTs && fallbackNow - s_lastHeavyFallbackTs < 1.5) return nil;
     s_lastHeavyFallbackTs = fallbackNow;

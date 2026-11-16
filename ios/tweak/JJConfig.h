@@ -12,17 +12,30 @@
 #define JJ_THINK_MS_MIN         50
 #define JJ_THINK_MS_MAX         3000
 
-/* 抓帧频率（每秒）。每帧都要跑 90 格采样 + 86 模板比对 + 浮窗扫描，
-   8 fps 时 JS 线程几乎没空闲；4 fps 仍远快于落子动画（~200ms）。 */
-#define JJ_SCAN_FPS             4
+/* 2.0.0：tick 只做「帧序号 + 稀疏指纹」两件极轻的检查，真正重活由新帧触发。
+   2Hz 足够跟上落子动画（~200ms），也把主线程定时器唤醒次数减半。 */
+#define JJ_SCAN_FPS             2
 
-/* process 调用节流（秒）。一次 process 在真机上要数秒，回调刚落地就立刻
-   发下一帧会让引擎队列永不清空；识别未收敛时再退避更久，避免空转烧 CPU。 */
-#define JJ_PROCESS_MIN_GAP      0.8
+/* 帧保鲜：Metal 帧超过这个秒数就不能再喂给 JS。
+   16:00 真机日志里 1.1.44 的 s_lastGoodMetal 无时间戳、永久复用同一张旧图，
+   导致 12 分钟里真实画面再没进过识别；这个上限就是那类静默死锁的硬闸门。 */
+#define JJ_FRAME_MAX_AGE        4.0
+
+/* Metal 读帧间隔（秒）：在专用低优先级队列里执行，不占游戏渲染调用栈。
+   与上层是否处理解耦，避免 1.1.44「上层一退避就再也不读新帧」的死锁。 */
+#define JJ_METAL_READ_INTERVAL  1.5
+
+/* 画面指纹阈值：90 个交叉点 × 3 通道的累计绝对差低于此值就认为「画面没变」，
+   整轮跳过 JS 识别与引擎搜索（静态局面零开销，根治间歇性卡顿）。
+   取偏低值：误触发只是多跑一次识别，漏检会直接导致「对方走完不给提示」。 */
+#define JJ_FRAME_DIFF_THRESHOLD 260
+
+/* process 调用节流（秒）。2.0 起帧序号 + 指纹已经保证不重复喂同一帧，
+   这里只留一道很小的保险，防止回调刚落地又立刻发下一轮。 */
+#define JJ_PROCESS_MIN_GAP      0.2
+/* 盘面彻底不可信（JS 明确 skipAnalyze）时才退避，正常噪声帧不再退避：
+   噪声帧由 JS 侧锚盘覆盖并命中结论缓存，退避只会拖慢真实走子的响应。 */
 #define JJ_PROCESS_ILLEGAL_GAP  2.5
-/* 锚定状态机判定为噪声帧（anchorRejected）时的退避：JS 已命中结论缓存，
-   再跑一轮 90 格模板匹配纯属白烧 CPU；与 Metal 抓帧 1.5s 间隔对齐。 */
-#define JJ_PROCESS_NOISE_GAP    1.5
 #define JJ_LEARN_RETRY_GAP      3.0
 /* 学习连续失败上限：超过就停下来提示用户切回开局画面，不再无限重试 */
 #define JJ_LEARN_MAX_FAIL       6

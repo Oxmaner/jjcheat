@@ -54,7 +54,7 @@ jobs:
       - name: 版本号随构建递增
         run: |
           set -eux
-          VER="1.1.${GITHUB_RUN_NUMBER}"
+          VER="2.0.${GITHUB_RUN_NUMBER}"
           /usr/bin/sed -i '' -E "s/^Version: .*/Version: ${VER}/" ios/tweak/control
           grep '^Version:' ios/tweak/control
 

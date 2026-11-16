@@ -283,19 +283,23 @@
     /* 1.1.44：真机 process 每 1.5~2.5s 一轮，绝大多数帧结论完全相同。
        旧版每轮都重排两条 UILabel + setNeedsDisplay（drawRect 里画 90 格网格
        和箭头），主线程白烧。内容指纹没变就直接返回。 */
-    NSString *key = [NSString stringWithFormat:@"%@|%@|%@|%@|%@|%@|%@",
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%@|%@|%@|%@|%@|%@|%@",
                      result[@"suggest"] ?: @"", result[@"from"] ?: @"",
                      result[@"to"] ?: @"", result[@"scoreText"] ?: @"",
                      result[@"depth"] ?: @"", result[@"sideToMove"] ?: @"",
-                     fen ?: @""];
+                     fen ?: @"", result[@"waitingOpponent"] ?: @"",
+                     result[@"ply"] ?: @""];
     if ([key isEqualToString:self.lastResultKey] && !self.topPanel.hidden) return;
     self.lastResultKey = key;
 
     self.hudView.gridPts = points;
 
+    /* 2.0.0：JJ 象棋红方先行。我方执黑时开局第一手归对方，
+       轮到对方就不画箭头、不显示建议，避免「乱指挥」。 */
+    BOOL waiting = [result[@"waitingOpponent"] boolValue];
     NSNumber *from = result[@"from"];
     NSNumber *to = result[@"to"];
-    BOOL hasMove = (from && to && from.integerValue >= 0 && to.integerValue >= 0);
+    BOOL hasMove = !waiting && (from && to && from.integerValue >= 0 && to.integerValue >= 0);
     self.hudView.fromSq = hasMove ? from.integerValue : -1;
     self.hudView.toSq = hasMove ? to.integerValue : -1;
 
@@ -317,9 +321,10 @@
         mate = [NSString stringWithFormat:@"  杀 %ld 步", (long)labs(mateN.integerValue)];
     }
 
-    self.lineMain.text = hasMove
-        ? [NSString stringWithFormat:@"%@   %@", cn, scoreText]
-        : @"等待对方走子…";
+    self.lineMain.text = waiting
+        ? @"等待对方先走（红先黑后）"
+        : (hasMove ? [NSString stringWithFormat:@"%@   %@", cn, scoreText]
+                   : @"等待对方走子…");
     self.lineSub.text = [NSString stringWithFormat:@"%@胜率 %d%% %@  深%ld%@",
                          side, wr, bar, (long)depth.integerValue, mate];
 

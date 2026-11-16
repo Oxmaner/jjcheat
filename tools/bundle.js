@@ -362,6 +362,24 @@ function countCodesDiff(a, b) {
 }
 
 /**
+ * 占位差异：只比「有子 / 无子」，忽略兵种认错。
+ * 2.0.0 新局判据用它区分两种情况：
+ *   - 回到的确是标准开局：32 枚棋子都在正确位置，模板最多把兵种认错 → 占位差 0；
+ *   - 开局刚走了两步：起点两格变空、终点两格多子 → 占位差 4。
+ * 只用 countCodesDiff 会把后者（差 4 格）误判成新局，离线回归 A4 实测踩到。
+ * @param {Array|Int8Array} a
+ * @param {Array|Int8Array} b
+ * @returns {number} 占位不同的格数
+ */
+function countOccupancyDiff(a, b) {
+  var n = 0;
+  for (var i = 0; i < 90; i++) {
+    if (((a[i] || 0) !== 0) !== ((b[i] || 0) !== 0)) n++;
+  }
+  return n;
+}
+
+/**
  * 兵种配额裁剪（1.1.43 → 1.1.44）
  *
  * 1.1.43 把超额兵种直接清成空格，15:10 日志每帧 repaired=1~4，棋子被一帧帧
@@ -415,6 +433,14 @@ function repairCodesQuota(codes, conf, ranked) {
   return { codes: out, repaired: repaired, replaced: replaced, dropped: dropped };
 }
 
+/* 2.0.0 换局重锚门槛：与锚盘差异小于这个数、又不成一步棋结构，
+   一律判为模板噪声直接丢弃。16:00 日志里首帧 diff=4 就触发 reseat，
+   把学习刚锚定的标准开局换成错误盘面，是「新对局识别不了」的帮凶。 */
+var JJ_RESEAT_MIN_DIFF = 8;
+/* 连续被丢弃多少帧后，允许一次「大变化 + 双合法」盘面强制重锚，
+   防止中途进对局时 3 帧稳定条件永远凑不齐而卡死。 */
+var JJ_RESEAT_REJECT_LIMIT = 12;
+
 /* ============================================================
  *  全局会话状态（单例）
  * ============================================================ */
@@ -440,11 +466,17 @@ var session = {
   reseatCount: 0,
   anchorRejected: 0,       // 连续被丢弃的噪声帧
   reseatDone: 0,           // 本帧刚完成换局重锚（诊断输出后置 0）
-  lastMoveText: ''         // 最近一步的 UCCI，供日志/HUD 诊断
+  lastMoveText: '',        // 最近一步的 UCCI，供日志/HUD 诊断
+  // 2.0.0 红先黑后：JJ 象棋「由执红棋的一方先走，双方轮流走一步」。
+  // movePly = 本局已发生的走子数；偶数轮到红(w)、奇数轮到黑(b)。
+  // 我方执黑时开局 ply=0 归对方先走，此时不出建议（用户明确要求）。
+  movePly: 0,
+  plyGuessed: 0,           // 中途进对局时轮次只能假设，日志可追溯
+  newGame: 0               // 本帧识别到「回到标准开局」并已重锚
 };
 
 var JJEngine = {
-  version: '1.0.0',
+  version: '2.0.0',
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
@@ -493,6 +525,9 @@ var JJEngine = {
     if (!keepAnchor) {
       session.lastBoardFen = '';
       session.lastRawFen = '';
+      session.movePly = 0;
+      session.plyGuessed = 0;
+      session.newGame = 0;
     }
     session.searchKey = '';
     session.searchLevel = 0;
@@ -618,6 +653,9 @@ var JJEngine = {
       session.lastResult = null;
       session.reseatCount = 0;
       session.anchorRejected = 0;
+      // 学习成功 = 一局新棋从标准开局开始，红方先走
+      session.movePly = 0;
+      session.plyGuessed = 0;
       // stableCodes 是屏幕坐标，供「低置信度沿用上一帧」用，也给正确基线
       session.stableCodes = flipped
         ? Array.prototype.slice.call(flipCodes(anchorEng))
@@ -1158,6 +1196,36 @@ var JJEngine = {
     var stepInfo = { changed: 0, move: null, noise: [] };
     var anchorRejected = 0;
     var anchor = session.anchorCodes;
+    session.newGame = 0;
+
+    /* 【2.0.0 新局识别】16:00 真机日志：换一局新棋后 12 分钟没有任何走法日志。
+       旧架构只在「与锚盘差一步棋」时推进，新局开局盘面与上一局的中局锚盘
+       相差十几格，既不满足一步结构、又因噪声帧锁死换局重锚 → 永久静默。
+       学习阶段已把标准开局存进 openingAnchor；这里只要识别结果接近开局，
+       且当前锚盘明显不是开局，就直接重置锚盘与轮次，一帧即可恢复。 */
+    /* 判据必须看「占位」而不是兵种：开局走两步后与标准开局也只差 4 格，
+       用 countCodesDiff<=4 会把正常走子误判成新局（离线回归 A4 实测）。
+       真新局的 32 枚棋子位置全对，占位差为 0，只有兵种可能被模板认错。
+       另一个条件保证不会在「本来就是开局」时每帧重复重置。 */
+    if (session.openingAnchor && anchor && codesLegal(engCodes) &&
+        countOccupancyDiff(session.openingAnchor, engCodes) <= 2 &&
+        (session.movePly > 0 || countOccupancyDiff(anchor, session.openingAnchor) > 0)) {
+      session.newGame = 1;
+      anchor = session.openingAnchor.slice();
+      session.anchorCodes = anchor;
+      session.anchorFen = codesToBoardFen(anchor);
+      session.anchorFlipped = !!session.flipped;
+      session.movePly = 0;
+      session.plyGuessed = 0;
+      session.lastBoardFen = session.anchorFen;
+      session.lastRawFen = session.anchorFen;
+      session.lastFen = '';
+      session.lastResult = null;
+      session.prevAnchorFen = '';
+      session.reseatCount = 0;
+      session.reseatPrev = null;
+      session.anchorRejected = 0;
+    }
 
     if (!anchor) {
       // 没学过开局（中途进对局）：只有数量与位置都合理的盘面才配当锚盘
@@ -1169,6 +1237,10 @@ var JJEngine = {
         session.lastBoardFen = session.anchorFen;
         session.lastRawFen = session.anchorFen;
         session.lastResult = null;
+        /* 没学过开局（中途进对局）：轮次无从得知，假设正好轮到我方，
+           让用户立刻能拿到建议；plyGuessed=1 供日志追溯。 */
+        session.movePly = session.flipped ? 1 : 0;
+        session.plyGuessed = 1;
       }
     } else if (session.anchorFlipped !== !!session.flipped) {
       // 画面朝向变了：旧锚盘坐标失效，按当前盘面重建。
@@ -1184,6 +1256,8 @@ var JJEngine = {
         session.lastResult = null;
         session.reseatPrev = null;
         session.reseatCount = 0;
+        session.movePly = session.flipped ? 1 : 0;
+        session.plyGuessed = 1;
       } else {
         anchorRejected = 1;
       }
@@ -1192,18 +1266,20 @@ var JJEngine = {
     if (anchor) {
       stepInfo = analyzeStepDiff(anchor, engCodes);
       var reseat = false;
-      if (!stepInfo.move && stepInfo.changed > 0) {
-        // 找不到一步棋结构：连续 3 帧「彼此差异 ≤6 格」且都合法合理才允许换局。
-        // 旧版要求逐格签名完全一样，真机模板每帧抖 3~8 格，永远凑不齐 3 帧，
-        // 结果锚盘冻死在开局、对方走了也不更新。帧间差异阈值既能让稳定局面
-        // 收敛，又挡得住单帧垃圾；再叠加数量 + 位置双闸门兜底。
+      if (!stepInfo.move && stepInfo.changed >= JJ_RESEAT_MIN_DIFF) {
+        // 2.0.0：只有「大变化」才可能是换局 / 中途进对局。
+        // 1.1.44 只要 changed>0 就进换局候选，真机首帧 diff=4 的模板噪声
+        // 连着 3 帧（旧帧缓存）就把学习刚锚定的标准开局 reseat 成错误盘面。
         var frameDiff = session.reseatPrev
           ? countCodesDiff(session.reseatPrev, engCodes) : 999;
         session.reseatCount = (frameDiff <= 6)
           ? (session.reseatCount || 0) + 1 : 1;
         session.reseatPrev = Array.prototype.slice.call(engCodes);
-        if (session.reseatCount >= 3 && codesLegal(engCodes) &&
-            codesPositionPlausible(engCodes)) {
+        var plausibleNow = codesLegal(engCodes) && codesPositionPlausible(engCodes);
+        // 超时兜底：连续被丢弃 >=12 帧说明「3 帧稳定」在真机抖动下凑不齐，
+        // 只要当前盘面是一盘真棋就强制重锚一次，避免中途进对局永久静默。
+        var forced = (session.anchorRejected || 0) >= JJ_RESEAT_REJECT_LIMIT;
+        if (plausibleNow && (session.reseatCount >= 3 || forced)) {
           reseat = true;
           anchor = Array.prototype.slice.call(engCodes);
           session.anchorCodes = anchor;
@@ -1211,12 +1287,23 @@ var JJEngine = {
           session.lastBoardFen = '';
           session.lastRawFen = '';
           session.lastResult = null;
+          session.lastFen = '';
           session.reseatCount = 0;
           session.reseatPrev = null;
           session.reseatDone = 1;   // 供 out 输出诊断（out 此时还没创建）
+          // 重锚后若就是标准开局 → 红方先走；否则轮次未知，假设轮到我方
+          var backToOpening = session.openingAnchor &&
+            countCodesDiff(session.openingAnchor, engCodes) <= 4;
+          session.movePly = backToOpening ? 0 : (session.flipped ? 1 : 0);
+          session.plyGuessed = backToOpening ? 0 : 1;
         } else {
           anchorRejected = 1;
         }
+      } else if (!stepInfo.move && stepInfo.changed > 0) {
+        // 小幅抖动且不构成一步棋 = 纯噪声：整帧丢弃，且不累计换局候选
+        anchorRejected = 1;
+        session.reseatCount = 0;
+        session.reseatPrev = null;
       } else {
         // 盘面没变、或已找到一步棋结构：清空换局候选
         session.reseatCount = 0;
@@ -1236,6 +1323,10 @@ var JJEngine = {
             session.anchorFen = codesToBoardFen(nextAnchor);
             session.lastMoveText = C.sqToUcci(stepInfo.move.from) +
                                    C.sqToUcci(stepInfo.move.to);
+            /* 红先黑后：每落地一步走子，轮次翻面。这也是「我执黑要等对面
+               先手」的依据 —— 开局 ply=0 归红方，对面走完 ply=1 才轮到我。 */
+            session.movePly = (session.movePly || 0) + 1;
+            session.plyGuessed = 0;
           } else {
             stepInfo = { changed: stepInfo.changed, move: null, noise: stepInfo.noise };
             anchorRejected = 1;
@@ -1258,6 +1349,15 @@ var JJEngine = {
     var mySideDetected = session.flipped ? 'black' : 'red';
     var bottomRed = mySideDetected === 'red' ? 1 : 0;
     var bottomBlack = mySideDetected === 'black' ? 1 : 0;
+
+    /* 【2.0.0 红先黑后】JJ 象棋规则：由执红棋的一方先走，双方轮流走一步。
+       旧版把 FEN 的走子方写死成「永远我方」，于是我执黑时开局第一手明明
+       归对方，插件却照样给我出着法。现在按 movePly 奇偶推真实轮次；
+       轮到对方就完全不调引擎、不画箭头，顺带省掉一半的搜索开销。 */
+    var turnChar = (session.movePly % 2 === 0) ? 'w' : 'b';
+    var myTurnChar = mySideDetected === 'red' ? 'w' : 'b';
+    var waitingOpponent = (turnChar !== myTurnChar);
+    var prevTurnChar = ((session.movePly - 1) % 2 === 0) ? 'w' : 'b';
 
     // 1) 尝试推进一步棋
     // ★ 画面稳定性检测
@@ -1292,6 +1392,11 @@ var JJEngine = {
       anchorRejected: anchorRejected ? 1 : 0,
       diffChanged: stepInfo.changed,
       reseat: session.reseatDone ? 1 : 0,
+      newGame: session.newGame ? 1 : 0,
+      ply: session.movePly || 0,
+      plyGuessed: session.plyGuessed ? 1 : 0,
+      turn: turnChar,
+      waitingOpponent: waitingOpponent ? 1 : 0,
       repairedCount: quotaFix.repaired,
       replacedCount: quotaFix.replaced || 0,
       droppedCount: quotaFix.dropped || 0
@@ -1304,7 +1409,7 @@ var JJEngine = {
                  (C.sqToUcci(stepInfo.move.from) + C.sqToUcci(stepInfo.move.to));
       var mvTxt = JJEngine.moveInfo(
         (session.prevAnchorFen || session.anchorFen) + ' ' +
-        (mySideDetected === 'red' ? 'w' : 'b') + ' - - 0 1',
+        prevTurnChar + ' - - 0 1',
         out.move);
       out.moveChinese = mvTxt.chinese || out.move;
       out.moveFromSq = stepInfo.move.from;
@@ -1409,16 +1514,13 @@ var JJEngine = {
       if (!session.stableCodes) session.stableCodes = mergedCodes.slice();
       codesOk = true;
 
-      // FEN 的走子方一律取「我方」。
-      // 之前绕了一个 session.sideToMoveNow 变量，它和 mySide 会不同步，
-      // 结果就是「显示我执红、却一直说等对方走」。
-      // 你的诉求是「告诉我我该走哪步」，所以引擎永远站在我方算。
-      directFen = session.lastBoardFen + ' ' +
-        (mySideDetected === 'red' ? 'w' : 'b') + ' - - 0 1';
+      // 2.0.0：走子方按真实轮次（红先黑后），不再写死「永远我方」。
+      // 轮到对方时下面会整段跳过引擎搜索，HUD 显示「等待对方先走」。
+      directFen = session.lastBoardFen + ' ' + turnChar + ' - - 0 1';
       // 浮窗显示用「屏幕原样」的 FEN：你执黑时它就是黑在下，
       // 跟你眼睛看到的完全一致。算棋用的是 directFen（内部坐标，红永远在下）。
       out.fen = (session.lastRawFen || session.lastBoardFen) + ' ' +
-        (mySideDetected === 'red' ? 'w' : 'b') + ' - - 0 1';
+        turnChar + ' - - 0 1';
       out.recognized = 1;
       out.conf90 = session.recognizer.lastConf || null;
       out.tops90 = session.recognizer.lastRanked || null;
@@ -1473,11 +1575,28 @@ var JJEngine = {
       out.depth = 0;
       return out;
     }
+    /* 2.0.0：轮到对方（典型是我方执黑的开局第一手）时整段跳过搜索。
+       既不乱指挥，也把「双方轮流」里本来属于对方的一半 CPU 开销彻底省掉。
+       不是 skipAnalyze：上层不会因此退避，对方一落子下一帧就能立刻出建议。 */
+    if (waitingOpponent) {
+      session.lastResult = null;
+      session.lastFen = '';
+      out.skipReason = 'waitingOpponent';
+      out.sideToMove = turnChar === 'w' ? 'red' : 'black';
+      out.suggest = '';
+      out.suggestChinese = '';
+      out.from = -1;
+      out.to = -1;
+      out.scoreText = '+0.00';
+      out.winrate = 50;
+      out.depth = 0;
+      return out;
+    }
     // codesOk=false 时别退回开局 FEN：优先复用上一次算棋用的局面（命中缓存、
     // 不重算），否则用上一合法盘面组一次。
     var analyzeFen = directFen || session.lastFen ||
         ((session.lastBoardFen || session.tracker.fen.split(' ')[0]) + ' ' +
-         (mySideDetected === 'red' ? 'w' : 'b') + ' - - 0 1');
+         turnChar + ' - - 0 1');
     if (out.moveDetected || !session.lastResult || session.lastFen !== analyzeFen) {
       var t0 = Date.now();
       // 开局库：命中就照谱走，一眼出着、也不算棋（跟鹏飞「库:」一样）

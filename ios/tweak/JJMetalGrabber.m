@@ -1,28 +1,38 @@
 //
 //  JJMetalGrabber.m
-//  JJCheat —— Metal 抓帧（1.1.44）
+//  JJCheat —— Metal 抓帧（2.0.0 重构：渲染线程零拷贝）
 //
-//  实测：这游戏不走 presentDrawable 家族（三个变体都 hook 上了，调用次数却停在 65），
-//  但 CAMetalLayer -nextDrawable 每帧都在调。所以：
+//  实测：这游戏不走 presentDrawable 家族，但 CAMetalLayer -nextDrawable 每帧都调。
 //    第 N 帧 nextDrawable 拿到 drawable → 记住它的 IOSurface（CFRetain）
-//    第 N+1 帧 nextDrawable 之前 → 读这个 IOSurface（此时内容已渲染完、还没被复用）
+//    第 N+1 帧 nextDrawable 之前 → 读这个 IOSurface（内容已渲染完、还没被复用）
 //  好处：不依赖 present、不往渲染线程里塞 blit、拿到的就是游戏画面（不含 HUD）。
 //
-//  【1.1.44 架构变更】
-//   - hook 本身迁到 Tweak.x 的 `%hook CAMetalLayer`（%orig 自动处理原实现），
-//     本文件不再有 method_setImplementation / 全类表遍历，也不再遍历 present 家族。
-//     本游戏实测 present 计数冻结在 65~78，那段代码纯属启动开销与误伤风险。
-//   - pending surface 全部走 gSurfLock：JJMetalSetCaptureEnabled 在主线程、
-//     nextDrawable 在渲染线程，1.1.43 之前两边无锁并发，关插件时可能 UAF。
-//   - 按需读帧：上一帧还没被上层取走就不再做 14MB 拷贝，读帧间隔 1.0→1.5s。
+//  【2.0.0 架构变更：从源头治卡顿】
+//   16:00 真机日志显示 1.1.44 全程 frame=0 B、s_lastGoodMetal 永久复用同一张旧图。
+//   根因是两层缺陷叠加：
+//     ① JJMetalFrameCopy 有 5s 过期，而 tick 被多重退避拖到 6s 才来取 → 恒返回 nil；
+//     ② JJScreenGrabber 的缓存帧无时间戳，于是每 6s 拿 12 分钟前的旧帧重跑模板匹配。
+//   同时 JJReadSurface 的 14MB memcpy + 350 万次 R/B 交换跑在**游戏渲染调用栈**里，
+//   每 1.5s 让游戏掉一次帧 —— 这才是「间歇性卡顿」的物理来源。
+//
+//   现在：
+//     - nextDrawable 只做「取出 pending + dispatch_async」，渲染线程零字节拷贝；
+//     - 14MB 读回 + BGRA→RGBA 全部移到专用低优先级串行队列，与游戏帧率彻底解耦；
+//     - 读帧与上层处理解耦：固定低频产出新帧，上层用「序号 + 指纹」决定是否跑 JS，
+//       上层退避/跳过不再导致读帧链路静默死锁（删掉 1.1.44 的 gFrameConsumed 闸门）；
+//     - 帧缓存不再自带过期返回，改由 JJMetalFrameIsFresh 显式判定新鲜度。
 //
 
 #import "JJMetalGrabber.h"
+#import "JJConfig.h"
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <IOSurface/IOSurface.h>
 #import <os/lock.h>
+#import <stdatomic.h>
+
+#pragma mark - 帧缓存与状态
 
 static NSData *gFrame = nil;
 static int gFrameW = 0;
@@ -30,31 +40,39 @@ static int gFrameH = 0;
 static CFTimeInterval gFrameTs = 0;
 static os_unfair_lock gLock = OS_UNFAIR_LOCK_INIT;
 
-static int gNextDrawableCount = 0;
-static int gCaptureCount = 0;
-static int gCaptureFail = 0;
-static int gSurfaceMiss = 0;
+static volatile int gNextDrawableCount = 0;   // 仅渲染线程写，日志线程读
+static int gCaptureCount = 0;                 // gLock 保护
+static int gCaptureFail = 0;                  // gLock 保护
+static volatile int gSurfaceMiss = 0;
 
 /* 抓帧总开关：默认关。待机（只挂悬浮球）和插件关闭时真的不读帧。 */
 static volatile BOOL gCaptureEnabled = NO;
-/* 1 = 上一帧已被上层消费，渲染线程可以再读一帧；0 = 新帧还在缓存里没被取走。
-   旧版按固定频率硬读，JS 还没空处理就又拷一张 14MB，纯烧渲染线程。 */
-static volatile int gFrameConsumed = 1;
 
-/* 读一帧 = 14MB memcpy + 350 万次 32 位 R/B 交换，跑在游戏渲染调用栈里。
-   真机 process 实际 2~3 秒才一次，1.5s 一帧足够，别再 0.2s/1.0s 硬刷。 */
+/* 读帧在独立队列执行；原子标志防止队列里堆积多个 14MB 拷贝任务。
+   写 1 只在渲染线程、写 0 只在读帧队列，用 CAS 避免两者交错。 */
+static atomic_int gReadBusy = 0;
 static CFTimeInterval gLastReadTs = 0;
-static const CFTimeInterval kJJReadInterval = 1.5;
 
-/* pending surface 的所有访问都必须经过这把锁 */
+/* pending surface 的所有访问都必须经过这把锁：
+   JJMetalSetCaptureEnabled 在主线程、nextDrawable 在渲染线程。 */
 static os_unfair_lock gSurfLock = OS_UNFAIR_LOCK_INIT;
 static IOSurfaceRef gPendingSurface = NULL;
 static int gPendingW = 0;
 static int gPendingH = 0;
 
-/* 老版本 Unity 的 drawable 自身直接实现了 -iosurface（私有 selector），
-   补一个局部协议后用括号语法调用，替代 methodForSelector + 函数指针强转。
-   不给 NSObject 加分类：那会污染进程内所有对象的方法解析。
+/** 专用读帧队列（QOS_UTILITY：低于游戏渲染，高于纯后台）。只创建一次。 */
+static dispatch_queue_t JJReadQueue(void) {
+    static dispatch_once_t once;
+    static dispatch_queue_t q = NULL;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.fujiang.jjcheat.readframe", DISPATCH_QUEUE_SERIAL);
+        dispatch_set_target_queue(q, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    });
+    return q;
+}
+
+/* 老版本 Unity 的 drawable 自身直接实现了 -iosurface（私有 selector）。
+   补一个局部协议后用括号语法调用；不给 NSObject 加分类，避免污染全进程方法解析。
    MTLTexture 的 -iosurface 已在 <Metal/MTLTexture.h> 公开声明，无需重复。 */
 @protocol JJMetalIOSurfaceProviding <NSObject>
 - (nullable IOSurfaceRef)iosurface;
@@ -90,7 +108,7 @@ static void JJDropPending(void) {
     if (s) CFRelease(s);
 }
 
-#pragma mark - IOSurface 读取
+#pragma mark - IOSurface 读取（只在 gReadQueue 上执行）
 
 static IOSurfaceRef JJDrawableSurface(id drawable) {
     if (!drawable) return NULL;
@@ -108,10 +126,13 @@ static IOSurfaceRef JJDrawableSurface(id drawable) {
     return NULL;
 }
 
+/** 把一帧 IOSurface 读成 RGBA。调用者持有 s 的所有权，本函数不释放。 */
 static void JJReadSurface(IOSurfaceRef s, int w, int h) {
     if (!gCaptureEnabled || !s || w <= 0 || h <= 0) return;
     if (IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL) != KERN_SUCCESS) {
+        os_unfair_lock_lock(&gLock);
         gCaptureFail++;
+        os_unfair_lock_unlock(&gLock);
         return;
     }
 
@@ -119,7 +140,9 @@ static void JJReadSurface(IOSurfaceRef s, int w, int h) {
     void *base = IOSurfaceGetBaseAddress(s);
     if (!base) {
         IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+        os_unfair_lock_lock(&gLock);
         gCaptureFail++;
+        os_unfair_lock_unlock(&gLock);
         return;
     }
 
@@ -137,8 +160,7 @@ static void JJReadSurface(IOSurfaceRef s, int w, int h) {
     }
     IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
 
-    /* IOSurface 是 BGRA，转 RGBA。
-       用 32 位整字一次交换 R/B，比逐字节循环少 2/3 的内存访问：
+    /* IOSurface 是 BGRA，转 RGBA。32 位整字一次交换 R/B：
        arm64 小端下 BGRA 内存序 B,G,R,A 读成 uint32 = A<<24|R<<16|G<<8|B。 */
     uint32_t *p32 = (uint32_t *)dst;
     size_t n32 = need / 4;
@@ -152,14 +174,13 @@ static void JJReadSurface(IOSurfaceRef s, int w, int h) {
     gFrameW = w;
     gFrameH = h;
     gFrameTs = CACurrentMediaTime();
+    gCaptureCount++;          // 序号只在「新帧真正就绪」时推进
     os_unfair_lock_unlock(&gLock);
-    gCaptureCount++;
-    gFrameConsumed = 0;
 }
 
 #pragma mark - Logos hook 的两个钩子（由 Tweak.x 调用）
 
-/** %orig 之前：把上一帧的 surface 读掉（或丢弃），立即释放 */
+/** %orig 之前：取出上一帧 surface，交给读帧队列；渲染线程零拷贝、零循环。 */
 void JJMetalBeforeNextDrawable(void) {
     gNextDrawableCount++;
     if (gNextDrawableCount == 1) {
@@ -174,13 +195,21 @@ void JJMetalBeforeNextDrawable(void) {
     if (!s) return;
 
     CFTimeInterval now = CACurrentMediaTime();
-    /* 按需读帧 + 时间节流：上一帧没被消费就别再拷 14MB，
-       游戏掉帧时也不会因为帧号变化反复触发读回。 */
-    if (gFrameConsumed && (now - gLastReadTs >= kJJReadInterval)) {
-        JJReadSurface(s, w, h);
+    /* 与上层是否处理完全解耦：固定低频产出新帧，读帧队列空闲就派发。
+       1.1.44 的 gFrameConsumed 让「上层一退避就永久不读帧」，已删除。 */
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&gReadBusy, &expected, 1) &&
+        (now - gLastReadTs >= JJ_METAL_READ_INTERVAL)) {
         gLastReadTs = now;
+        dispatch_async(JJReadQueue(), ^{
+            JJReadSurface(s, w, h);
+            CFRelease(s);
+            atomic_store(&gReadBusy, 0);
+        });
+    } else {
+        if (expected == 0) atomic_store(&gReadBusy, 0);  // 抢到了但间隔没到，还回去
+        CFRelease(s);          // 这一帧不需要读，直接丢弃（渲染线程无开销）
     }
-    CFRelease(s);
 }
 
 /** %orig 之后：记住本次 drawable 的 surface，等下一帧读 */
@@ -197,25 +226,30 @@ void JJMetalAfterNextDrawable(id drawable) {
 #pragma mark - 对外
 
 NSData *JJMetalFrameCopy(int *outW, int *outH) {
-    /* 必须无条件放行：上层 tick 被 busy / 退避挡住时不会走到这里，缓存帧可能
-       一直过期；若只在「取到有效帧」时才置 1，gFrameConsumed 会永久卡在 0，
-       渲染线程再也不读新帧 —— 整个抓帧链路静默死锁。 */
-    gFrameConsumed = 1;
-
     os_unfair_lock_lock(&gLock);
     NSData *d = gFrame;
     int w = gFrameW, h = gFrameH;
-    CFTimeInterval ts = gFrameTs;
     os_unfair_lock_unlock(&gLock);
 
     if (!d.length || w <= 0 || h <= 0) return nil;
-    /* 结算页/对方思考时游戏会降帧甚至停渲染，5s 内复用上一张有效帧，
-       避免掉进 CALayer 全屏 renderInContext（主线程重活 + 全黑帧）。 */
-    if (CACurrentMediaTime() - ts > 5.0) return nil;
-
     if (outW) *outW = w;
     if (outH) *outH = h;
     return d;
+}
+
+BOOL JJMetalFrameIsFresh(void) {
+    os_unfair_lock_lock(&gLock);
+    BOOL has = (gFrame.length > 0 && gFrameW > 0 && gFrameH > 0);
+    CFTimeInterval ts = gFrameTs;
+    os_unfair_lock_unlock(&gLock);
+    return has && (CACurrentMediaTime() - ts <= JJ_FRAME_MAX_AGE);
+}
+
+CFTimeInterval JJMetalFrameAge(void) {
+    os_unfair_lock_lock(&gLock);
+    CFTimeInterval ts = gFrameTs;
+    os_unfair_lock_unlock(&gLock);
+    return ts > 0 ? (CACurrentMediaTime() - ts) : -1.0;
 }
 
 uint64_t JJMetalFrameSerial(void) {
@@ -226,11 +260,14 @@ uint64_t JJMetalFrameSerial(void) {
 }
 
 NSString *JJMetalStatus(void) {
-    /* 保持 1.1.42 起的日志字段顺序，HANDOFF 的判读基准不用改 */
+    os_unfair_lock_lock(&gLock);
+    int cap = gCaptureCount, fail = gCaptureFail, miss = gSurfaceMiss, nd = gNextDrawableCount;
+    os_unfair_lock_unlock(&gLock);
+    /* 保持 1.1.42 起的字段顺序，新增 age/readBusy 便于判读 2.0 抓帧链路 */
     return [NSString stringWithFormat:
-            @"nextDrawable=%d present=0 captured=%d fail=%d surfaceMiss=%d origMissing=0 enabled=%d",
-            gNextDrawableCount, gCaptureCount, gCaptureFail, gSurfaceMiss,
-            gCaptureEnabled ? 1 : 0];
+            @"nextDrawable=%d present=0 captured=%d fail=%d surfaceMiss=%d origMissing=0 enabled=%d age=%.1fs readBusy=%d",
+            nd, cap, fail, miss, gCaptureEnabled ? 1 : 0,
+            JJMetalFrameAge(), atomic_load(&gReadBusy)];
 }
 
 void JJMetalSetCaptureEnabled(BOOL enabled) {
@@ -241,8 +278,9 @@ void JJMetalSetCaptureEnabled(BOOL enabled) {
         gFrame = nil;
         gFrameW = 0;
         gFrameH = 0;
+        gFrameTs = 0;
         os_unfair_lock_unlock(&gLock);
-        gFrameConsumed = 1;
+        gLastReadTs = 0;
     }
     NSLog(@"[JJCheat] Metal 抓帧开关=%@", enabled ? @"开" : @"关");
 }
@@ -254,6 +292,6 @@ void JJMetalInstallHooks(void) {
     logged = YES;
     Class layerCls = NSClassFromString(@"CAMetalLayer");
     BOOL exists = layerCls && [layerCls instancesRespondToSelector:@selector(nextDrawable)];
-    NSLog(@"[JJCheat] Metal hook(Logos): CAMetalLayer=%@ nextDrawable=%@ present 家族=已移除",
+    NSLog(@"[JJCheat] Metal hook(Logos): CAMetalLayer=%@ nextDrawable=%@ present 家族=已移除 读帧=独立队列",
           layerCls ? @"有" : @"没有", exists ? @"可 hook" : @"不可 hook");
 }

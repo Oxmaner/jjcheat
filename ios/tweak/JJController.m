@@ -262,6 +262,9 @@ static UIImage *JJLoadLogoImage(void) {
 @property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *finalCorners;
 /* 帧去重：Metal 没出新帧就不重复喂 JS（每帧 14MB 拷贝 + 90 格模板匹配） */
 @property (nonatomic, assign) uint64_t lastFrameSerial;
+/* 2.0.0 画面指纹：90 个交叉点的 RGB 快照。新帧但画面没变时整轮跳过 JS，
+   这是「静态局面零开销」的关键，也是 16:00 日志里 12 分钟旧帧空转的根治点。 */
+@property (nonatomic, strong) NSData *lastFingerprint;
 /* 学习失败退避：learnAndRefine 要几百 ms~几秒，不能每 250ms 重跑一次 */
 @property (nonatomic, assign) NSTimeInterval lastLearnAttempt;
 /* 学习静默失败计数：每 5 次留一条日志，杜绝「没提示又没日志」的黑洞 */
@@ -656,6 +659,53 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
     return pts;
 }
 
+/* ------------------------------------------------------------
+ *  2.0.0 画面指纹（主线程极轻计算，替代「每帧全量跑 JS 模板匹配」）
+ *
+ *  在 90 个棋盘交叉点各取 3×3 邻域 RGB 均值，得到 270 个 int32。
+ *  一次采样的成本约 810 次字节读取，远低于 90 格×86 模板匹配；
+ *  画面没变（对方思考、看棋、静态棋盘）时整轮 process 直接跳过。
+ * ------------------------------------------------------------ */
+#define JJ_FP_POINTS  90
+#define JJ_FP_VALUES  (JJ_FP_POINTS * 3)
+
+static BOOL JJFrameFingerprint(NSData *rgba, int w, int h,
+                               NSArray *corners, int32_t *out) {
+    if (!rgba.length || corners.count != 4 || w <= 0 || h <= 0) return NO;
+    const uint8_t *p = (const uint8_t *)rgba.bytes;
+    NSUInteger len = rgba.length;
+    for (int r = 0; r < 10; r++) {
+        for (int c = 0; c < 9; c++) {
+            CGPoint g = JJGridPt(corners, r, c);
+            int x = (int)g.x, y = (int)g.y;
+            int idx = (r * 9 + c) * 3;
+            if (x < 2 || y < 2 || x >= w - 2 || y >= h - 2) {
+                out[idx] = out[idx + 1] = out[idx + 2] = 0;
+                continue;
+            }
+            int sr = 0, sg = 0, sb = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    NSUInteger o = ((NSUInteger)(y + dy) * (NSUInteger)w + (NSUInteger)(x + dx)) * 4;
+                    if (o + 2 < len) { sr += p[o]; sg += p[o + 1]; sb += p[o + 2]; }
+                }
+            }
+            out[idx] = sr / 9; out[idx + 1] = sg / 9; out[idx + 2] = sb / 9;
+        }
+    }
+    return YES;
+}
+
+/** 两帧指纹的累计绝对差；低于 JJ_FRAME_DIFF_THRESHOLD 视为同一画面 */
+static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
+    int d = 0;
+    for (int i = 0; i < JJ_FP_VALUES; i++) {
+        int v = (int)(a[i] - b[i]);
+        d += (v < 0) ? -v : v;
+    }
+    return d;
+}
+
 /**
  * 学习 + 四角自校准：整段丢到引擎队列异步跑，回调回主线程。
  *
@@ -776,6 +826,25 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
     // 抓帧尺寸可能和 nativeBounds 不一致（roothide 下走 GL-hook），标定按实际尺寸重算
     [self applyCornersForFrameWidth:w height:h];
 
+    /* 2.0.0 帧差驱动：Metal 出了一张新帧，但棋盘画面根本没变 → 整轮跳过。
+       16:00 真机日志里 1.1.44 每 6s 拿同一张旧图跑一次 90×86 模板匹配 +
+       引擎搜索，就是「间歇性卡顿」的来源。静态局面现在连 JS 都不调。 */
+    if (self.learnedBoard) {
+        NSArray *fpCorners = self.finalCorners.count == 4
+            ? self.finalCorners : [self cornersForWidth:w height:h];
+        if (fpCorners.count == 4) {
+            int32_t sample[JJ_FP_VALUES];
+            if (JJFrameFingerprint(rgba, w, h, fpCorners, sample)) {
+                if (self.lastFingerprint.length == sizeof(sample) &&
+                    JJFrameFingerprintDiff((const int32_t *)self.lastFingerprint.bytes,
+                                           sample) < JJ_FRAME_DIFF_THRESHOLD) {
+                    return;
+                }
+                self.lastFingerprint = [NSData dataWithBytes:sample length:sizeof(sample)];
+            }
+        }
+    }
+
     // ---- 学习阶段：整段异步，主线程一步都不等 ----
     if (!self.learnedBoard) {
         /* 失败退避 3s：learnAndRefine 要几秒，旧逻辑每 250ms 重跑一次，
@@ -824,6 +893,8 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
             }
             self2.learnedBoard = YES;
             self2.state = JJCtrlStateRunning;
+            /* 学习阶段的画面不作数：清掉指纹，保证学成后第一帧一定进 process */
+            self2.lastFingerprint = nil;
             NSArray *fc = info[@"finalCorners"];
             if ([fc isKindOfClass:[NSArray class]] && fc.count == 4) {
                 self2.finalCorners = fc;
@@ -867,29 +938,29 @@ static CGPoint JJGridPt(NSArray *corners, int r, int c) {
            【1.1.43】旧判定还看 legalNow，但 legalNow=0 时配额裁剪已能修好盘面，
            再按它退避会把正常帧也拖进 2.5s 空转；现在只认 skipAnalyze。 */
         BOOL stalled = [result[@"skipAnalyze"] boolValue];
-        BOOL rejected = [result[@"anchorRejected"] boolValue];
         BOOL moved = [result[@"moveDetected"] boolValue];
         if (stalled) {
+            /* 只在 JS 明确判「盘面不可信」时退避。
+               2.0.0 删掉噪声帧退避：噪声帧已由锚盘覆盖并命中结论缓存，
+               再叠加 1.5s 退避只会让真实走子的响应慢一拍；帧序号 + 指纹
+               已经保证不会重复喂同一张画面。 */
             self2.processNotBefore = [[NSDate date] timeIntervalSince1970] + JJ_PROCESS_ILLEGAL_GAP;
             NSLog(@"[JJCheat] 识别未收敛：legalNow=%@ codesValid=%@ codesStable=%@ repaired=%@ illegalStreak=%@ skipReason=%@（退避 %.1fs）",
                   result[@"legalNow"] ?: @"-", result[@"codesValid"] ?: @"-",
                   result[@"codesStableCount"] ?: @"-", result[@"repairedCount"] ?: @"-",
                   result[@"illegalStreak"] ?: @"-", result[@"skipReason"] ?: @"-",
                   JJ_PROCESS_ILLEGAL_GAP);
-        } else if (rejected && !moved) {
-            /* 1.1.44：模板抖动帧已被锚盘丢弃，JS 直接复用上一结论。
-               再连着跑识别没意义，退避到下一张 Metal 帧再试。 */
-            self2.processNotBefore = [[NSDate date] timeIntervalSince1970] + JJ_PROCESS_NOISE_GAP;
         }
 
         [[JJHUDWindow shared] showResult:result gridPoints:self2.gridPtsCache fen:result[@"fen"] ?: @""];
 
         if (moved) {
-            NSLog(@"[JJCheat] 检测到走法 %@ %@ → FEN %@ | suggest=%@ legalNow=%@ repaired=%@ diff=%@ rejected=%@ reseat=%@ anchor=%@",
+            NSLog(@"[JJCheat] 检测到走法 %@ %@ → FEN %@ | suggest=%@ legalNow=%@ repaired=%@ diff=%@ rejected=%@ reseat=%@ ply=%@ wait=%@ anchor=%@",
                   result[@"move"], result[@"moveChinese"], result[@"fen"],
                   result[@"suggest"] ?: @"-", result[@"legalNow"] ?: @"-",
                   result[@"repairedCount"] ?: @"-", result[@"diffChanged"] ?: @"-",
                   result[@"anchorRejected"] ?: @"-", result[@"reseat"] ?: @"-",
+                  result[@"ply"] ?: @"-", result[@"waitingOpponent"] ?: @"-",
                   result[@"anchorFen"] ?: @"-");
         }
     }];
