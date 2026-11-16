@@ -2,12 +2,17 @@
 //  JJHUDWindow.m
 //  JJCheat
 //
+//  2.1.0 布局（顶部一条 56pt 面板）：
+//    ① 记谱行   炮二平五                         +0.35
+//    ② 状态行   引擎 就绪 · 深 18 · 1.2M · 胜率 62% ██████░░░░
+//
 
 #import "JJHUDWindow.h"
 #import "JJConfig.h"
+#import <math.h>
 
 /* ============================================================
- *  绘制视图
+ *  绘制视图（棋盘网格 + 走法箭头 + 标定覆盖层）
  * ============================================================ */
 @interface JJHUDView : UIView
 @property (nonatomic, assign) NSInteger fromSq;      // -1 = 无
@@ -15,7 +20,6 @@
 @property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *gridPts; // 屏幕像素
 @property (nonatomic, strong) NSArray<NSValue *> *calibPoints;         // point
 @property (nonatomic, assign) JJHUDMode mode;
-@property (nonatomic, copy) NSString *statusText;
 @end
 
 @implementation JJHUDView
@@ -192,8 +196,9 @@
 @interface JJHUDWindow () <UIGestureRecognizerDelegate>
 @property (nonatomic, strong) JJHUDView *hudView;
 @property (nonatomic, strong) UIView *topPanel;
-@property (nonatomic, strong) UILabel *lineMain;
-@property (nonatomic, strong) UILabel *lineSub;
+@property (nonatomic, strong) UILabel *lineMain;      // 中文记谱 / 状态
+@property (nonatomic, strong) UILabel *lineScore;     // 右侧分值
+@property (nonatomic, strong) UILabel *lineSub;       // 引擎状态 + 深度 + 胜率条
 @property (nonatomic, copy) void (^calibBlock)(NSArray<NSValue *> *);
 @property (nonatomic, strong) NSMutableArray<NSValue *> *calibPoints;
 /** 上一次 showResult 的内容指纹；相同就跳过整轮文本排版 + 90 格重绘 */
@@ -225,21 +230,35 @@
         [self.rootViewController.view addSubview:_hudView];
 
         // 顶部信息面板
-        _topPanel = [[UIView alloc] initWithFrame:CGRectMake(8, 8, self.bounds.size.width - 16, JJ_HUD_TOP_HEIGHT)];
+        CGFloat panelW = self.bounds.size.width - 16.0;
+        _topPanel = [[UIView alloc] initWithFrame:CGRectMake(8, 8, panelW, JJ_HUD_TOP_HEIGHT)];
         _topPanel.backgroundColor = JJ_COLOR_PANEL_BG;
         _topPanel.layer.cornerRadius = 10;
         _topPanel.layer.masksToBounds = YES;
         _topPanel.userInteractionEnabled = NO;
         [self.rootViewController.view addSubview:_topPanel];
 
-        _lineMain = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, _topPanel.bounds.size.width - 24, 24)];
+        CGFloat scoreW = 96.0;
+        _lineMain = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, panelW - 24 - scoreW - 6, 26)];
         _lineMain.font = [UIFont boldSystemFontOfSize:19];
         _lineMain.textColor = JJ_COLOR_TEXT_MAIN;
+        _lineMain.adjustsFontSizeToFitWidth = YES;
+        _lineMain.minimumScaleFactor = 0.75;
         [_topPanel addSubview:_lineMain];
 
-        _lineSub = [[UILabel alloc] initWithFrame:CGRectMake(12, 28, _topPanel.bounds.size.width - 24, 18)];
+        _lineScore = [[UILabel alloc] initWithFrame:CGRectMake(panelW - 12 - scoreW, 6, scoreW, 26)];
+        _lineScore.font = [UIFont monospacedDigitSystemFontOfSize:18 weight:UIFontWeightBold];
+        _lineScore.textColor = JJ_COLOR_TEXT_MAIN;
+        _lineScore.textAlignment = NSTextAlignmentRight;
+        _lineScore.adjustsFontSizeToFitWidth = YES;
+        _lineScore.minimumScaleFactor = 0.7;
+        [_topPanel addSubview:_lineScore];
+
+        _lineSub = [[UILabel alloc] initWithFrame:CGRectMake(12, 32, panelW - 24, 18)];
         _lineSub.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightMedium];
         _lineSub.textColor = JJ_COLOR_TEXT_SUB;
+        _lineSub.adjustsFontSizeToFitWidth = YES;
+        _lineSub.minimumScaleFactor = 0.75;
         [_topPanel addSubview:_lineSub];
 
         _topPanel.hidden = YES;
@@ -275,64 +294,98 @@
     [self.hudView setNeedsDisplay];
 }
 
+- (void)invalidateResultCache {
+    self.lastResultKey = nil;
+}
+
+/* 胜率条：用方块直观显示，0..10 格 */
+static NSString *JJWinrateBar(NSInteger wr) {
+    NSInteger filled = (NSInteger)lround(MAX(0, MIN(100, wr)) / 10.0);
+    NSMutableString *bar = [NSMutableString stringWithCapacity:10];
+    for (NSInteger i = 0; i < 10; i++) [bar appendString:(i < filled ? @"█" : @"░")];
+    return bar;
+}
+
+/* 节点数：1234567 -> 1.2M，方便塞进一行 */
+static NSString *JJFormatNodes(NSInteger nodes) {
+    if (nodes <= 0) return @"-";
+    if (nodes >= 1000000) return [NSString stringWithFormat:@"%.1fM", nodes / 1000000.0];
+    if (nodes >= 1000) return [NSString stringWithFormat:@"%.0fK", nodes / 1000.0];
+    return [NSString stringWithFormat:@"%ld", (long)nodes];
+}
+
 - (void)showResult:(NSDictionary *)result
         gridPoints:(NSArray<NSArray<NSNumber *> *> *)points
                fen:(NSString *)fen {
     if (self.mode != JJHUDModeDisplay) return;
 
-    /* 1.1.44：真机 process 每 1.5~2.5s 一轮，绝大多数帧结论完全相同。
-       旧版每轮都重排两条 UILabel + setNeedsDisplay（drawRect 里画 90 格网格
-       和箭头），主线程白烧。内容指纹没变就直接返回。 */
-    NSString *key = [NSString stringWithFormat:@"%@|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@",
+    /* 真机 process 每 1~2s 一轮，绝大多数帧结论完全相同。
+       内容指纹没变就直接返回，省掉文本排版与 90 格网格重绘。 */
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@|%@",
                      result[@"suggest"] ?: @"", result[@"from"] ?: @"",
                      result[@"to"] ?: @"", result[@"scoreText"] ?: @"",
-                     result[@"depth"] ?: @"", result[@"sideToMove"] ?: @"",
-                     fen ?: @"", result[@"waitingOpponent"] ?: @"",
-                     result[@"ply"] ?: @"", result[@"skipAnalyze"] ?: @"",
-                     result[@"skipReason"] ?: @""];
+                     result[@"depth"] ?: @"", result[@"nodes"] ?: @"",
+                     result[@"sideToMove"] ?: @"", fen ?: @"",
+                     result[@"waitingOpponent"] ?: @"", result[@"ply"] ?: @"",
+                     result[@"skipAnalyze"] ?: @"", result[@"engineState"] ?: @"",
+                     result[@"enginePending"] ?: @""];
     if ([key isEqualToString:self.lastResultKey] && !self.topPanel.hidden) return;
     self.lastResultKey = key;
 
     self.hudView.gridPts = points;
 
-    /* 2.0.0：JJ 象棋红方先行。我方执黑时开局第一手归对方，
+    /* JJ 象棋红方先行。我方执黑时开局第一手归对方，
        轮到对方就不画箭头、不显示建议，避免「乱指挥」。 */
     BOOL waiting = [result[@"waitingOpponent"] boolValue];
-    /* 2.0.1：盘面不可信时明确告诉用户怎么自救，别只显示「等待对方走子…」
-       让人以为插件卡住（16:43 日志里 skipReason=illegal 循环时毫无提示）。 */
+    /* 盘面不可信时明确告诉用户怎么自救，别只显示「等待对方走子…」 */
     BOOL stalled = [result[@"skipAnalyze"] boolValue];
+    BOOL pending = [result[@"enginePending"] boolValue];
     NSNumber *from = result[@"from"];
     NSNumber *to = result[@"to"];
     BOOL hasMove = !waiting && !stalled &&
-        (from && to && from.integerValue >= 0 && to.integerValue >= 0);
+        (from && to && from.integerValue >= 0 && to.integerValue >= 0 &&
+         from.integerValue < 90 && to.integerValue < 90);
     self.hudView.fromSq = hasMove ? from.integerValue : -1;
     self.hudView.toSq = hasMove ? to.integerValue : -1;
 
     NSString *cn = result[@"suggestChinese"] ?: @"";
-    NSString *scoreText = result[@"scoreText"] ?: @"+0.00";
-    NSNumber *winrate = result[@"winrate"] ?: @(50);
+    NSString *scoreText = result[@"scoreText"] ?: @"";
+    NSNumber *winrate = result[@"winrate"] ?: @(-1);
     NSNumber *depth = result[@"depth"] ?: @(0);
-    NSString *side = [result[@"sideToMove"] isEqual:@"red"] ? @"红方" : @"黑方";
+    NSNumber *nodes = result[@"nodes"] ?: @(0);
+    NSString *side = [result[@"sideToMove"] isEqual:@"black"] ? @"黑方" : @"红方";
+    NSString *engine = result[@"engineState"] ?: @"";
+    if (!engine.length) engine = pending ? @"思考中" : @"-";
 
-    // 胜率条：用 emoji 方块直观显示
-    int wr = winrate.intValue;
-    int filled = (int)round(wr / 10.0);
-    NSMutableString *bar = [NSMutableString string];
-    for (int i = 0; i < 10; i++) [bar appendString:(i < filled ? @"█" : @"░")];
-
-    NSString *mate = @"";
-    NSNumber *mateN = result[@"mate"];
-    if (mateN && mateN.integerValue != 0) {
-        mate = [NSString stringWithFormat:@"  杀 %ld 步", (long)labs(mateN.integerValue)];
+    // ---- 第一行：记谱 + 分值 ----
+    if (stalled) {
+        self.lineMain.text = @"识别未收敛 · 点悬浮球【自动标定】";
+        self.lineScore.text = @"";
+    } else if (waiting) {
+        self.lineMain.text = hasMove ? cn : @"等待对方走子（红先黑后）";
+        self.lineScore.text = scoreText;
+    } else if (hasMove) {
+        self.lineMain.text = cn;
+        self.lineScore.text = scoreText;
+    } else if (pending) {
+        self.lineMain.text = @"引擎思考中…";
+        self.lineScore.text = @"";
+    } else {
+        self.lineMain.text = @"视角未对齐 · 请回开局画面";
+        self.lineScore.text = @"";
     }
 
-    self.lineMain.text = stalled
-        ? @"识别未收敛 · 请点悬浮球【自动标定】"
-        : (waiting ? @"等待对方先走（红先黑后）"
-                   : (hasMove ? [NSString stringWithFormat:@"%@   %@", cn, scoreText]
-                              : @"等待对方走子…"));
-    self.lineSub.text = [NSString stringWithFormat:@"%@胜率 %d%% %@  深%ld%@",
-                         side, wr, bar, (long)depth.integerValue, mate];
+    // ---- 第二行：引擎状态 + 深度 + 节点 + 胜率 ----
+    NSMutableString *sub = [NSMutableString stringWithFormat:@"%@ · 引擎 %@", side, engine];
+    if (depth.integerValue > 0) [sub appendFormat:@" · 深 %ld", (long)depth.integerValue];
+    if (nodes.integerValue > 0) [sub appendFormat:@" · %@", JJFormatNodes(nodes.integerValue)];
+    if (winrate.integerValue >= 0) {
+        [sub appendFormat:@" · %ld%% %@", (long)winrate.integerValue,
+                          JJWinrateBar(winrate.integerValue)];
+    } else if (pending) {
+        [sub appendString:@" · 正在搜索"];
+    }
+    self.lineSub.text = sub;
 
     self.topPanel.hidden = NO;
     [self.hudView setNeedsDisplay];
@@ -341,6 +394,7 @@
 - (void)showStatus:(NSString *)text {
     self.lastResultKey = nil;   // 状态条被改写，下次结果不能因指纹相同被跳过
     self.lineMain.text = text;
+    self.lineScore.text = @"";
     self.lineSub.text = @"";
     self.topPanel.hidden = NO;
 }

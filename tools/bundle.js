@@ -12,13 +12,14 @@ const path = require('path');
 const SRC = path.join(__dirname, '..', 'src');
 const OUT_DIR = path.join(__dirname, '..', 'dist');
 
+/* 2.1.0：JS 只做视觉识别与状态机。搜索已迁到独立进程 Pikafish
+   （ObjC 侧 JJPikafish），cst/eval、cst/search、cst/book 不再打包。
+   cst/position + cst/notation 保留：process 里「检测到走法」的中文记谱
+   仍由它们产出（不依赖搜索器）。 */
 const ENTRY_FILES = [
   'cst/constants',
   'cst/position',
   'cst/notation',
-  'cst/eval',
-  'cst/search',
-  'cst/book',
   'vision/templates',
   'vision/recognizer',
   'vision/tracker'
@@ -105,10 +106,6 @@ function __resolve(fromId, reqPath) {
 var C = __require('cst/constants');
 var POS = __require('cst/position');
 var NOTE = __require('cst/notation');
-var ENG = __require('cst/search');
-var BOOK = __require('cst/book');
-// 把开局库装进搜索器：命中库就照谱走（跟鹏飞「库:」一样）
-ENG.setBook && ENG.setBook(BOOK);
 var REC = __require('vision/recognizer');
 var TRK = __require('vision/tracker');
 
@@ -476,7 +473,10 @@ var session = {
 };
 
 var JJEngine = {
-  version: '2.0.1',
+  version: '2.1.0',
+  /* 2.1.0 契约标记：ObjC 桥用它判断容器里的 engine.js 是否为本版
+     （旧版会被内嵌副本自动覆盖升级）。 */
+  featureMark: 'pikafishNative',
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
@@ -496,6 +496,7 @@ var JJEngine = {
     session.tracker = new TRK.MoveTracker(fen || C.START_FEN);
     session.lastFen = session.tracker.fen;
     session.lastResult = null;
+    session.lastDispatchedFen = '';
     session.lastGridHash = 0;
     session.gridStable = 0;
     if (!keepAnchor) {
@@ -529,9 +530,6 @@ var JJEngine = {
       session.plyGuessed = 0;
       session.newGame = 0;
     }
-    session.searchKey = '';
-    session.searchLevel = 0;
-    session.lastBudget = 0;
     return session.tracker.fen;
   },
 
@@ -665,6 +663,7 @@ var JJEngine = {
       session.lastRawFen = session.anchorFen;
       session.lastFen = C.START_FEN;
       session.lastResult = null;
+      session.lastDispatchedFen = '';
       session.reseatCount = 0;
       session.anchorRejected = 0;
       // 学习成功 = 一局新棋从标准开局开始，红方先走
@@ -972,30 +971,9 @@ var JJEngine = {
   },
 
   /**
-   * 这一步在这个局面里到底合不合法
-   *
-   * 为什么必须有：云库（chessdb）对「该谁走」的理解和我们不一定一致，
-   * 一旦 FEN 的走子方或朝向有偏差，它给的可能是对方的着法 ——
-   * 界面上就会出现「兵七退一」这种红兵往回走的鬼话。
-   * 这里直接用它自己的走法生成器核对一遍，不合法就丢掉，退回本机引擎。
-   */
-  isLegalMove: function (fen, ucci) {
-    try {
-      var pos = new POS.Position(fen);
-      var s = new ENG.Searcher();
-      var roots = s._rootMoves(pos);
-      for (var i = 0; i < roots.length; i++) {
-        if (C.mvToUcci(roots[i]) === String(ucci)) return 1;
-      }
-      return 0;
-    } catch (e) {
-      return 0;
-    }
-  },
-
-  /**
    * 把一步 UCCI 着法翻译成中文着法 + 起止格
-   * （云库返回的是 move:c0e2 这种，界面上要「相三进五」）
+   * （2.1.0：检测到的走法用它出中文记谱；引擎建议的中文记谱由
+   *  ObjC 侧 JJMoveCodec 原生产出，不经过这里）
    */
   moveInfo: function (fen, ucci) {
     try {
@@ -1042,11 +1020,16 @@ var JJEngine = {
   },
 
   /**
-   * 主流程：喂一帧 RGBA 像素，返回识别 + 建议
+   * 主流程：喂一帧 RGBA 像素，返回识别结果（2.1.0 起只识别、不搜索）
+   *
+   * 契约变化：suggest/scoreText/depth 等搜索字段全部移除。轮到我方且盘面
+   * 可信时输出 needSearch=1 + searchFen（引擎坐标 FEN，红在下 + w/b 走子方），
+   * 由 ObjC 侧 JJPikafish 拿去问独立进程 Pikafish；局面没变就输出 needSearch=0，
+   * 上层沿用上一次的引擎结论（原生缓存）。
    * @param {Uint8ClampedArray|Uint8Array} pixels RGBA
    * @param {number} w
    * @param {number} h
-   * @param {object} opts { timeMs, autoReset }
+   * @param {object} opts { live }
    * @returns {object}
    */
   process: function (pixels, w, h, opts) {
@@ -1240,6 +1223,7 @@ var JJEngine = {
       session.lastRawFen = session.anchorFen;
       session.lastFen = '';
       session.lastResult = null;
+      session.lastDispatchedFen = '';
       session.prevAnchorFen = '';
       session.reseatCount = 0;
       session.reseatPrev = null;
@@ -1256,6 +1240,7 @@ var JJEngine = {
         session.lastBoardFen = session.anchorFen;
         session.lastRawFen = session.anchorFen;
         session.lastResult = null;
+        session.lastDispatchedFen = '';
         /* 没学过开局（中途进对局）：轮次无从得知，假设正好轮到我方，
            让用户立刻能拿到建议；plyGuessed=1 供日志追溯。 */
         session.movePly = session.flipped ? 1 : 0;
@@ -1273,6 +1258,7 @@ var JJEngine = {
         session.anchorFlipped = !!session.flipped;
         session.lastBoardFen = session.anchorFen;
         session.lastResult = null;
+        session.lastDispatchedFen = '';
         session.reseatPrev = null;
         session.reseatCount = 0;
         session.movePly = session.flipped ? 1 : 0;
@@ -1307,6 +1293,7 @@ var JJEngine = {
           session.lastRawFen = '';
           session.lastResult = null;
           session.lastFen = '';
+          session.lastDispatchedFen = '';
           session.reseatCount = 0;
           session.reseatPrev = null;
           session.reseatDone = 1;   // 供 out 输出诊断（out 此时还没创建）
@@ -1481,6 +1468,7 @@ var JJEngine = {
         session.lastBoardFen = '';
         session.lastRawFen = '';
         session.lastResult = null;
+        session.lastDispatchedFen = '';
         session.illegalStreak = 0;
       }
     } else {
@@ -1520,6 +1508,7 @@ var JJEngine = {
         session.lastFenUpdateTime = nowMs;
         out.moveDetected = true;
         session.lastResult = null;    // 强制重算
+        session.lastDispatchedFen = '';
         session.stableCodes = mergedCodes.slice();
       } else if (!session.lastBoardFen) {
         // 第一次进来先落地，不占用限流
@@ -1585,127 +1574,34 @@ var JJEngine = {
     if (!legalNow || !cls.codes || !codesUsable(cls.codes)) {
       out.skipAnalyze = 1;
       out.skipReason = !legalNow ? 'illegal' : 'empty';
-      out.suggest = '';
-      out.suggestChinese = '';
-      out.from = -1;
-      out.to = -1;
-      out.scoreText = '+0.00';
-      out.winrate = 50;
-      out.depth = 0;
+      out.needSearch = 0;
+      out.searchFen = '';
       return out;
     }
     /* 2.0.0：轮到对方（典型是我方执黑的开局第一手）时整段跳过搜索。
-       既不乱指挥，也把「双方轮流」里本来属于对方的一半 CPU 开销彻底省掉。
        不是 skipAnalyze：上层不会因此退避，对方一落子下一帧就能立刻出建议。 */
     if (waitingOpponent) {
       session.lastResult = null;
       session.lastFen = '';
+      session.lastDispatchedFen = '';
       out.skipReason = 'waitingOpponent';
       out.sideToMove = turnChar === 'w' ? 'red' : 'black';
-      out.suggest = '';
-      out.suggestChinese = '';
-      out.from = -1;
-      out.to = -1;
-      out.scoreText = '+0.00';
-      out.winrate = 50;
-      out.depth = 0;
+      out.needSearch = 0;
+      out.searchFen = '';
       return out;
     }
-    // codesOk=false 时别退回开局 FEN：优先复用上一次算棋用的局面（命中缓存、
-    // 不重算），否则用上一合法盘面组一次。
-    var analyzeFen = directFen || session.lastFen ||
+    /* 2.1.0：搜索已迁出 JS。这里只把「该问引擎的局面」交给 ObjC：
+       - 轮到我方 + 盘面合法 → searchFen（引擎坐标，红在下 + w/b 走子方）
+       - 同一局面只发一次（lastDispatchedFen 去重），上层原生缓存结论；
+         换局 / 等待对方 / 重锚都会清 lastDispatchedFen，保证必发新请求。 */
+    var analyzeFen = directFen ||
         ((session.lastBoardFen || session.tracker.fen.split(' ')[0]) + ' ' +
          turnChar + ' - - 0 1');
-    if (out.moveDetected || !session.lastResult || session.lastFen !== analyzeFen) {
-      var t0 = Date.now();
-      // 开局库：命中就照谱走，一眼出着、也不算棋（跟鹏飞「库:」一样）
-      var bookHit = BOOK.lookup(analyzeFen);
-      var res = bookHit
-        ? { bestmove: bookHit.ucci, score: 0, winrate: 0.5, depth: 0, nodes: 0, pv: [bookHit.ucci] }
-        : ENG.analyze(analyzeFen, { timeMs: opts.timeMs || 800 });
-      var pos = new POS.Position(analyzeFen);
-      var mv = C.ucciToMv(res.bestmove);
-
-      // 完整缓存：中文着法、起止格、分值、胜率、深度、走子方
-      // 否则下一帧走缓存分支时，着法就丢了，浮窗会退回「识别中…」
-      session.lastFen = analyzeFen;
-      session.lastResult = {
-        bestmove: res.bestmove,
-        chinese: res.bestmove ? NOTE.mvToChinese(pos.board, mv, pos.side) : '',
-        from: res.bestmove ? C.mvFrom(mv) : -1,
-        to: res.bestmove ? C.mvTo(mv) : -1,
-        score: res.score,
-        scoreText: (res.score >= 0 ? '+' : '') + (res.score / 100).toFixed(2),
-        winrate: Math.round(res.winrate * 1000) / 10,
-        depth: res.depth,
-        pv: res.pv,
-        nodes: res.nodes,
-        mate: res.mate,
-        sideToMove: pos.side === C.RED ? 'red' : 'black',
-        book: bookHit ? 1 : 0
-      };
-
-      var c = session.lastResult;
-      out.suggest = c.bestmove;
-      out.suggestChinese = c.chinese;
-      out.from = c.from;
-      out.to = c.to;
-      out.score = c.score;
-      out.scoreText = c.scoreText;
-      out.winrate = c.winrate;
-      out.depth = c.depth;
-      out.pv = c.pv;
-      out.nodes = c.nodes;
-      out.elapsed = Date.now() - t0;
-      out.sideToMove = c.sideToMove;
-      out.mate = c.mate;
-    } else {
-      // 局面没变：直接把上一次的完整结论端出来，不要清空
-      var c2 = session.lastResult || {};
-      out.suggest = c2.bestmove || '';
-      out.suggestChinese = c2.chinese || '';
-      out.from = (c2.from === undefined) ? -1 : c2.from;
-      out.to = (c2.to === undefined) ? -1 : c2.to;
-      out.score = c2.score || 0;
-      out.scoreText = c2.scoreText || '+0.00';
-      out.winrate = (c2.winrate === undefined) ? 50 : c2.winrate;
-      out.depth = c2.depth || 0;
-      out.sideToMove = c2.sideToMove || 'red';
-      out.mate = c2.mate || 0;
-    }
+    out.searchFen = analyzeFen;
+    out.needSearch = (analyzeFen !== session.lastDispatchedFen) ? 1 : 0;
+    if (out.needSearch) session.lastDispatchedFen = analyzeFen;
 
     return out;
-  },
-
-  /** 直接分析一个 FEN（不走视觉） */
-  /**
-   * 多候选着法：界面上的「思考列表」
-   * 返回 {bestmove, score, depth, nodes, ms, rows:[{move, chinese, score, winrate, depth}]}
-   */
-  analyzeTop: function (fen, opts) {
-    try {
-      return ENG.analyzeTop(fen, opts || {});
-    } catch (e) {
-      return { bestmove: '', score: 0, depth: 0, nodes: 0, ms: 0, rows: [] };
-    }
-  },
-  analyzeFen: function (fen, timeMs) {
-    var res = ENG.analyze(fen, { timeMs: timeMs || 1000 });
-    var pos = new POS.Position(fen);
-    var mv = C.ucciToMv(res.bestmove);
-    return {
-      bestmove: res.bestmove,
-      chinese: res.bestmove ? NOTE.mvToChinese(pos.board, mv, pos.side) : '',
-      score: res.score,
-      scoreText: (res.score >= 0 ? '+' : '') + (res.score / 100).toFixed(2),
-      winrate: Math.round(res.winrate * 1000) / 10,
-      depth: res.depth,
-      pv: res.pv,
-      nodes: res.nodes,
-      mate: res.mate,
-      from: res.bestmove ? C.mvFrom(mv) : -1,
-      to: res.bestmove ? C.mvTo(mv) : -1
-    };
   },
 
   /** 当前局面 */

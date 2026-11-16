@@ -4,11 +4,13 @@
  * 用法：node tools/regression.js
  * 依赖：先执行 node tools/bundle.js 生成 dist/engine.js
  *
- * 用 stub recognizer 直接喂 90 格 codes，绕开像素与标定，专测识别状态机：
- *   A 执红：红先手 / 走子轮次 / 噪声门槛 / 静止缓存 / 新局重锚
- *   B 执黑：开局必须等红方先走，对方落子后才出建议
+ * 2.1.0 契约：JS 只识别不搜索。process 输出 needSearch/searchFen，
+ * 建议着法由 ObjC 侧 JJPikafish 独立进程产出 —— 本回归专测识别状态机：
+ *   A 执红：红先手 / 走子轮次 / 噪声门槛 / 派出去重 / 新局重锚
+ *   B 执黑：开局必须等红方先走，对方落子后才需要搜索
  *   C 中途进对局：连续 3 帧稳定后换局重锚
  *   D 中局误点自动标定：失败的学习不得污染已收敛锚盘（16:43 真机日志）
+ *   E 坐标契约：searchFen 必须是引擎坐标（红在下）且与识别盘面一致
  *
  * 这些场景全部来自真机日志里踩过的坑，改状态机时务必保持全绿。
  */
@@ -102,11 +104,17 @@ function makeFixture(src, blackBottom) {
   /** 喂一帧并打印关键诊断字段 */
   function frame(label, codes, expect) {
     engCodes = codes;
-    const r = JJ.process(px, 1, 1, { timeMs: 10, live: true });
-    console.log('%s | turn=%s ply=%s wait=%s newGame=%s rejected=%s reseat=%s diff=%s | %s | suggest=%s',
+    const r = JJ.process(px, 1, 1, { live: true });
+    console.log('%s | turn=%s ply=%s wait=%s newGame=%s rejected=%s reseat=%s diff=%s | search=%s fen=%s',
       label, r.turn, r.ply, r.waitingOpponent, r.newGame, r.anchorRejected,
       r.reseat, r.diffChanged,
-      r.elapsed === undefined ? '缓存/跳过' : '重算', r.suggest || '-');
+      r.needSearch, (r.searchFen || '').split(' ')[0]);
+    /* 2.1.0 硬约束：JS 不得再输出任何搜索结论字段 */
+    for (const k of ['suggest', 'suggestChinese', 'scoreText', 'winrate', 'depth', 'pv', 'nodes', 'elapsed']) {
+      if (k in r) throw new Error('process 输出残留搜索字段: ' + k);
+    }
+    if (r.needSearch === undefined) throw new Error('process 缺少 needSearch 字段');
+    if (r.needSearch && !r.searchFen) throw new Error('needSearch=1 但 searchFen 为空');
     if (expect) expect(r);
     return r;
   }
@@ -134,12 +142,12 @@ function makeFixture(src, blackBottom) {
 function main() {
   const src = loadEngineSource();
 
-  console.log('========== A. 执红：红先手 + 走子轮次 + 噪声门槛 ==========');
+  console.log('========== A. 执红：红先手 + 走子轮次 + 噪声门槛 + 派出去重 ==========');
   const A = makeFixture(src, false);
   A.learnOpening(true);
   A.frame('A1 开局静止', A.S0.slice(), r => {
     if (r.waitingOpponent) throw new Error('执红开局应轮到我');
-    if (!r.suggest) throw new Error('执红开局应出建议');
+    if (!r.needSearch) throw new Error('执红开局应派发搜索（needSearch=1）');
     if (r.reseat) throw new Error('开局帧不该 reseat');
   });
   const noise = A.S0.slice();
@@ -147,15 +155,15 @@ function main() {
   A.frame('A2 4 格噪声', noise, r => {
     if (!r.anchorRejected) throw new Error('噪声帧未丢弃');
     if (r.reseat) throw new Error('小噪声不该触发换局重锚');
-    if (!r.suggest) throw new Error('噪声帧应沿用上一结论');
+    if (r.needSearch) throw new Error('同一局面不该重复派发搜索');
   });
   const step1 = A.S0.slice(); step1[54] = 0; step1[45] = 7;   // 红兵进一
   A.frame('A3 我方走子', step1, r => {
     if (!r.moveDetected || !r.move) throw new Error('走子没检测到');
     if (r.ply !== 1) throw new Error('ply 未推进');
     if (!r.waitingOpponent) throw new Error('我方走完应轮到对方');
-    if (r.suggest) throw new Error('轮到对方不该出建议');
-    if (r.elapsed !== undefined) throw new Error('轮到对方仍在跑引擎搜索');
+    if (r.needSearch) throw new Error('轮到对方不该派发搜索');
+    if (r.skipReason !== 'waitingOpponent') throw new Error('skipReason 应为 waitingOpponent');
   });
   A.frame('A3b 走一步后静止', step1.slice(), r => {
     if (r.newGame) throw new Error('走一步后的静止帧不该被判成新局');
@@ -165,17 +173,17 @@ function main() {
   A.frame('A4 对方走子', step2, r => {
     if (r.ply !== 2) throw new Error('ply 未推进到 2');
     if (r.waitingOpponent) throw new Error('对方走完应轮到我');
-    if (!r.suggest) throw new Error('轮到我没出建议');
+    if (!r.needSearch) throw new Error('轮到我应派发搜索');
     if (r.newGame) throw new Error('开局走两步不该被误判成新局');
   });
   A.frame('A5 静止帧', step2.slice(), r => {
-    if (r.elapsed !== undefined) throw new Error('静止帧又重算了');
+    if (r.needSearch) throw new Error('静止帧重复派发搜索');
   });
   A.frame('A6 回到新局开局', A.S0.slice(), r => {
     if (r.newGame !== 1) throw new Error('新局没被识别');
     if (r.ply !== 0) throw new Error('新局轮次没归零');
     if (r.waitingOpponent) throw new Error('新局执红应轮到我');
-    if (!r.suggest) throw new Error('新局应立刻出建议');
+    if (!r.needSearch) throw new Error('新局应立刻派发搜索');
   });
 
   console.log('');
@@ -184,15 +192,14 @@ function main() {
   B.learnOpening(false);
   B.frame('B1 执黑开局', B.S0.slice(), r => {
     if (!r.waitingOpponent) throw new Error('执黑开局必须等红方先走');
-    if (r.suggest) throw new Error('执黑开局不该给建议');
-    if (r.elapsed !== undefined) throw new Error('等待时仍在跑引擎');
+    if (r.needSearch) throw new Error('执黑开局不该派发搜索');
     if (r.turn !== 'w') throw new Error('开局走子方应为红 w');
   });
   const bstep = B.S0.slice(); bstep[54] = 0; bstep[45] = 7;
   B.frame('B2 对方先手后', bstep, r => {
     if (!r.moveDetected) throw new Error('没检测到对方先手');
     if (r.waitingOpponent) throw new Error('对方走完应轮到我');
-    if (!r.suggest) throw new Error('轮到我没出建议');
+    if (!r.needSearch) throw new Error('轮到我应派发搜索');
   });
 
   console.log('');
@@ -244,14 +251,50 @@ function main() {
   });
   const s2 = s1.slice(); s2[27] = 0; s2[36] = 14;   // 对方黑卒进一
   E.frame('D3 对方走子', s2, r => {
-    if (!r.suggest) throw new Error('失败重标定后应能继续出建议');
+    if (!r.needSearch) throw new Error('失败重标定后应能继续派发搜索');
     if (r.skipAnalyze) throw new Error('失败重标定不该导致 skipAnalyze');
     if (r.ply !== 2) throw new Error('失败重标定后轮次未推进');
   });
 
   console.log('');
+  console.log('========== E. 坐标契约：searchFen 必须是引擎坐标（红在下） ==========');
+  const F = makeFixture(src, false);
+  F.learnOpening(false);
+  F.frame('E1 开局待搜', F.S0.slice(), r => {
+    if (!r.searchFen) throw new Error('应有 searchFen');
+    const rows = r.searchFen.split(' ')[0].split('/');
+    if (rows[9] !== 'RNBAKABNR') throw new Error('引擎坐标红方必须在 FEN 第10行: ' + rows[9]);
+    if (r.searchFen.split(' ')[1] !== 'w') throw new Error('开局走子方应为红 w');
+  });
+  const mv1 = F.S0.slice(); mv1[54] = 0; mv1[45] = 7;   // 我红兵进一
+  F.frame('E2 我走完（不派发）', mv1, r => {
+    if (r.needSearch) throw new Error('轮到对方不该派发');
+  });
+  const mv2 = mv1.slice(); mv2[27] = 0; mv2[36] = 14;   // 对方黑卒进一
+  F.frame('E3 对方走完（派发）', mv2, r => {
+    if (!r.needSearch) throw new Error('轮到我应派发搜索');
+    const rows = r.searchFen.split(' ')[0].split('/');
+    if (rows[9] !== 'RNBAKABNR') throw new Error('红方仍应在最下: ' + rows[9]);
+    if (r.searchFen.split(' ')[1] !== 'w') throw new Error('轮到红方，走子方应为 w');
+    /* 黑卒 row3col0 → row4col0：FEN 第 5 行(row4) 首列应为 p，第 4 行(row3) 首列为空 */
+    if (rows[4][0] !== 'p') throw new Error('黑卒应落在 row4: ' + rows[4]);
+  });
+  /* 执黑视角：searchFen 仍必须是「红在下」的引擎坐标（识别层已把画面翻回） */
+  const G = makeFixture(src, true);
+  G.learnOpening(false);
+  const gstep = G.S0.slice(); gstep[54] = 0; gstep[45] = 7;   // 对方红兵先手
+  G.frame('E4 执黑·对方先手后', gstep, r => {
+    if (!r.needSearch) throw new Error('轮到我应派发搜索');
+    if (!r.searchFen) throw new Error('应有 searchFen');
+    const rows = r.searchFen.split(' ')[0].split('/');
+    if (rows[9][0] !== 'R') throw new Error('引擎坐标红方必须在 FEN 最下（第10行）');
+    if (rows[9] !== 'RNBAKABNR') throw new Error('执黑时红方仍应原样在底: ' + rows[9]);
+    if (r.searchFen.split(' ')[1] !== 'b') throw new Error('红走完应轮到黑 b');
+  });
+
+  console.log('');
   console.log('全部通过 OK  engine.js = %d 字节, mark=%s',
-    fs.statSync(ENGINE).size, /calibRejected/.test(src) ? 'calibRejected OK' : 'MISSING');
+    fs.statSync(ENGINE).size, /pikafishNative/.test(src) ? 'pikafishNative OK' : 'MISSING');
 }
 
 main();

@@ -1,15 +1,15 @@
 //
 //  Tweak.x
-//  JJCheat —— 注入 JJ象棋 进程，抓画面、算棋、在棋盘上标注
+//  JJCheat 2.1.0 —— 注入 JJ象棋 进程，抓画面、交 Pikafish 算棋、在棋盘上标箭头
 //
-//  1.1.44（Logos 审查修复）：
-//   - 本文件没有 C++ / MSHookIvar，按规范用 .x（Objective-C）而非 .xm。
-//   - 删掉 %hook UIApplication -application:didFinishLaunchingWithOptions:。
-//     那是 UIApplicationDelegate 协议方法，UIApplication 类根本不实现，
-//     这段 hook 永不触发；启动本来就是 %ctor 里的 3s dispatch_after 兜底。
-//   - CAMetalLayer -nextDrawable 从 JJMetalGrabber.m 的手写
-//     method_setImplementation 迁回 %hook + %orig；删掉 presentDrawable
-//     家族的全类表遍历（真机计数冻结在 65，纯启动开销 + 误伤风险）。
+//  本文件只做三件事：
+//    1) hook EAGLContext -presentRenderbuffer*（GL 备用抓帧通道）
+//    2) hook CAMetalLayer -nextDrawable（Metal 主通道）
+//    3) %ctor 里拉起 JJGameController
+//
+//  业务逻辑一律不在 Logos 文件里：抓帧在 Capture/，识别在 Vision/，
+//  棋力在 Engine/，状态机与 UI 在 Game/ 与 UI/。这样 %hook 段永远是纯转发，
+//  出问题时能一眼判断是「hook 没触发」还是「上层逻辑不对」。
 //
 
 #import <UIKit/UIKit.h>
@@ -19,10 +19,10 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 
-#import "JJController.h"
-#import "JJScreenGrabber.h"
+#import "JJGameController.h"
+#import "JJVisionBridge.h"
 #import "JJHUDWindow.h"
-#import "JJEngineBridge.h"
+#import "JJScreenGrabber.h"
 #import "JJMetalGrabber.h"
 
 static BOOL gJJStarted = NO;
@@ -31,7 +31,7 @@ static void JJStartOnce(void) {
     if (gJJStarted) return;
     gJJStarted = YES;
     @try {
-        [[JJController shared] start];
+        [[JJGameController shared] start];
     } @catch (NSException *e) {
         NSLog(@"[JJCheat] 启动异常: %@", e);
     }
@@ -41,21 +41,28 @@ static void JJStartOnce(void) {
  *  OpenGL ES 抓帧（备用通道）
  *  cocos2d-x 用 EAGL 渲染，presentRenderbuffer 之后帧缓冲还在，
  *  此时 glReadPixels 可以拿到完整游戏画面。
+ *
+ *  2.1.0 起 Metal 通道可用的机型上这套永远不生效
+ *  （JJMetalCaptureEnabled() 为真时屏蔽回退，roothide 下 GL/CALayer 常全黑）。
+ *
+ *  抓帧节流函数放在 %hook 之外：%hook 块里只留被 hook 的方法，
+ *  非 hook 的 C 代码留在文件作用域，出问题时一眼能分清哪段是 Logos 管的。
  * ============================================================ */
+static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
+    static unsigned int sThrottle = 0;
+    if (((sThrottle++) & 3u) != 0u) return;   /* 每 4 帧抓一次 */
+    if (JJMetalCaptureEnabled()) return;      /* Metal 通道已启用，别走全黑回退 */
+    @try {
+        [[JJScreenGrabber shared] captureGLContext:ctx target:target];
+    } @catch (NSException *e) {
+        /* 静默：抓帧失败由上层帧保鲜机制兜底 */
+    }
+}
+
 %hook EAGLContext
 
 /* 抓帧统一入口：在 %orig 之前读，此时 renderbuffer 还是刚渲染完的内容；
    放在 %orig 之后的话，present 已经把 buffer 换走，读出来就是黑的。 */
-static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
-    static unsigned int sThrottle = 0;
-    if (((sThrottle++) & 3u) != 0u) return;   /* 每 4 帧抓一次 */
-    @try {
-        [[JJScreenGrabber shared] captureGLContext:ctx target:target];
-    } @catch (NSException *e) {
-        /* 静默 */
-    }
-}
-
 - (BOOL)presentRenderbuffer:(NSUInteger)target {
     JJCaptureThrottled(self, target);
     return %orig;
@@ -80,7 +87,7 @@ static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
  *  实测这游戏只走 -nextDrawable，不走 presentDrawable 家族。
  *  第 N 帧 %orig 前读上一帧的 IOSurface（此时内容已渲染完、还没被复用），
  *  %orig 后记住本次 drawable 的 surface，交给第 N+1 帧。
- *  开关关闭时 JJMetal* 两个函数都只透传，不做 14MB 拷贝/字节交换。
+ *  14MB 读回在专用 QOS_UTILITY 队列执行，渲染线程只做零拷贝登记。
  * ============================================================ */
 %hook CAMetalLayer
 
@@ -97,19 +104,22 @@ static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
  *  入口
  * ============================================================ */
 %ctor {
-    /* 未分组 hook（EAGLContext + CAMetalLayer）一次注册完。
-       Logos 只解析类名，比旧版 1.5s 后遍历全类表手写 swizzle 轻得多。 */
+    /* 两个未分组 hook 一次注册完。Logos 只解析类名，
+       比手写 method_setImplementation + 全类表遍历轻得多。 */
     %init;
 
-    NSLog(@"[JJCheat] tweak 已加载 (pid=%d)", getpid());
+    NSLog(@"[JJCheat] tweak 已加载 (pid=%d, 2.1.0 pikafish)", getpid());
 
+    /* 诊断日志：只报事实，不做分支。
+       EAGLContext 一定存在、presentRenderbuffer: 一定有实现，
+       真正决定抓帧走哪条路的是「游戏到底调不调这个 selector」——
+       那个只有跑起来才知道，所以不在这里猜。 */
     Class eagl = NSClassFromString(@"EAGLContext");
-    BOOL hasPresent = eagl && [eagl instancesRespondToSelector:@selector(presentRenderbuffer:)];
-    NSLog(@"[JJCheat] EAGLContext=%p presentRenderbuffer:=%@", eagl, hasPresent ? @"有" : @"没有");
-    if (!hasPresent) {
-        NSLog(@"[JJCheat] 警告：拿不到 GL hook 点，抓帧将退化为 CARenderServer/CALayer，可能全黑");
-    }
-    /* 幂等诊断日志，确认 CAMetalLayer 类在 %ctor 时已可用 */
+    NSLog(@"[JJCheat] EAGLContext=%@ presentRenderbuffer:=%@ metalHook=%@",
+          eagl ? @"有" : @"没有",
+          (eagl && [eagl instancesRespondToSelector:@selector(presentRenderbuffer:)]) ? @"有" : @"没有",
+          JJMetalCaptureEnabled() ? @"开" : @"关");
+
     JJMetalInstallHooks();
 
     [[NSNotificationCenter defaultCenter]
@@ -126,7 +136,7 @@ static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
         } @catch (NSException *e) {}
     }];
 
-    /* 冷启动慢时兜底拉起控制器（原来误挂在 UIApplication 的死 hook 里） */
+    /* 冷启动慢时兜底拉起控制器 */
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         JJStartOnce();

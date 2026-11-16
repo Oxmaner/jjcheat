@@ -1,19 +1,27 @@
 #!/bin/sh
-# JJCheat roothide prerm
-# 卸载时把注入到 .app 里的 engine.js 撤掉（只删和我们那份完全一致的）
+# JJCheat 2.1.0 roothide prerm
+#
+# 2.0 起插件不再往 .app 里写文件，这里的清理只为收拾 1.x 时代
+# jjcheat-fix 留下的残余（只删和我们那份完全一致的，绝不碰别的文件）。
 set +e
-ENGINE="/Library/Application Support/JJCheat/engine.js"
+
+APP_DIR="/Library/Application Support/JJCheat"
+ENGINE="$APP_DIR/engine.js"
+PIKA="$APP_DIR/Pikafish/pikafish"
 ROOTFS="${JJ_ROOTFS:-/rootfs}"
 APPS="$ROOTFS/var/containers/Bundle/Application"
 
-[ -f "$ENGINE" ] || exit 0
+# 卸载前停掉引擎进程，否则正在跑的 pikafish 会短暂变成孤儿
+if [ -f "$PIKA" ]; then
+    killall -9 pikafish 2>/dev/null || true
+fi
 
 for app in "$APPS"/*/*.app; do
     [ -d "$app" ] || continue
     target="$app/engine.js"
     [ -f "$target" ] || continue
-    if cmp -s "$ENGINE" "$target"; then
-        rm -f "$target" && echo "[JJCheat] prerm: 已移除 $target"
+    if [ -f "$ENGINE" ] && cmp -s "$ENGINE" "$target"; then
+        rm -f "$target" && echo "[JJCheat] prerm: 已移除 1.x 残留 $target"
     fi
 done
 exit 0

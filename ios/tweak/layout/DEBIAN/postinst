@@ -1,18 +1,36 @@
 #!/bin/sh
-# JJCheat roothide postinst
+# JJCheat 2.1.0 roothide postinst
 #
-# 方案 B：engine.js 已经编进 tweak 的 dylib，Tweak 首次运行会自动把它释放到
-# 目标 App 自己的沙箱目录（<容器>/Library/Application Support/JJCheat/engine.js），
-# 所以安装脚本不再需要往 .app 里搬文件（那样会破坏 App 的代码签名）。
+# 2.1.0 只做三件事：
+#   1) 确认 engine.js（识别脚本，已内嵌 dylib 作兜底）就位
+#   2) 给 Pikafish 可执行文件补执行权限（deb 打包时保留不了 0755 的情况兜底）
+#   3) 重启 SpringBoard 让注入生效
 #
-# jjcheat-fix 保留着，仅供手动排查用（可选，不调用）。
+# 注意：不再往 .app 里搬任何文件。写 .app 会破坏 App 的代码签名，
+# 2.0 起 engine.js 改走「App 容器优先 + dylib 内嵌副本兜底」。
 set +e
-ENGINE="/Library/Application Support/JJCheat/engine.js"
+
+APP_DIR="/Library/Application Support/JJCheat"
+ENGINE="$APP_DIR/engine.js"
+PIKA="$APP_DIR/Pikafish/pikafish"
+
 if [ -f "$ENGINE" ]; then
-    echo "[JJCheat] postinst: $ENGINE 就位（$(wc -c < "$ENGINE" 2>/dev/null | tr -d ' ') 字节）"
+    echo "[JJCheat] postinst: engine.js 就位（$(wc -c < "$ENGINE" 2>/dev/null | tr -d ' ') 字节）"
 else
-    echo "[JJCheat] postinst: 包内 engine.js 缺失，但 dylib 内嵌副本仍可工作"
+    echo "[JJCheat] postinst: engine.js 缺失，但 dylib 内嵌副本仍可工作"
 fi
+
+if [ -f "$PIKA" ]; then
+    chmod 0755 "$PIKA" 2>/dev/null
+    chown 0:0 "$PIKA" 2>/dev/null
+    echo "[JJCheat] postinst: Pikafish 就位（$(wc -c < "$PIKA" 2>/dev/null | tr -d ' ') 字节）"
+    if [ ! -x "$PIKA" ]; then
+        echo "[JJCheat] postinst: !! Pikafish 无法执行，检查 deb 是否被剥离权限"
+    fi
+else
+    echo "[JJCheat] postinst: !! 包里没有 Pikafish，插件会一直提示「引擎未安装」"
+fi
+
 echo "[JJCheat] postinst: 完成 —— 记得到 Bootstrap 的 App List 打开 JJ象棋 注入开关"
 killall -9 SpringBoard 2>/dev/null || true
 exit 0

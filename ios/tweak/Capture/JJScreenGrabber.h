@@ -1,4 +1,4 @@
-//
+﻿//
 //  JJScreenGrabber.h
 //  JJCheat
 //

@@ -80,4 +80,15 @@
 /* 插件图标：随 deb 落到 jbroot 下，悬浮球优先用它，读不到回退文字「象棋」 */
 #define JJ_LOGO_REL_PATH        @"Library/Application Support/JJCheat/logo.png"
 
+/* ============================================================
+ *  2.1.0 Pikafish 独立引擎
+ * ============================================================ */
+/* deb 内引擎目录（相对 jbroot）与可执行名 */
+#define JJ_PIKA_DIR_REL         @"Library/Application Support/JJCheat/Pikafish"
+#define JJ_PIKA_BIN_NAME        @"pikafish"
+/* 哈希表 MB。手机别给太大：64MB 独立进程内存，游戏本体不受影响 */
+#define JJ_PIKA_HASH_MB         64
+/* 引擎状态小圆点刷新间隔（秒） */
+#define JJ_ENGINE_DOT_GAP       2.0
+
 #endif /* JJConfig_h */
