@@ -117,7 +117,7 @@ else
     SRC_LIST="$WORK/sources.txt"
     find . -name '*.cpp' ! -name 'main.cpp' ! -path './universal/*' | sort > "$SRC_LIST"
     ENGINE_COUNT="$(wc -l < "$SRC_LIST" | tr -d ' ')"
-    log "编译中（$ENGINE_COUNT 个引擎文件 + 1 个桥接层，架构: $ARCH_LIST）"
+    log "编译中（$ENGINE_COUNT 个引擎文件 + 1 个桥接层，架构: ${ARCH_LIST}）"
     rm -rf "$OBJ"
     mkdir -p "$OBJ"
 
