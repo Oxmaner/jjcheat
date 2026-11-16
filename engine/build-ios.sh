@@ -6,9 +6,8 @@
 #  本机 Windows 只能做语法检查，这一环永远交给 GitHub Actions 的 macos-15。
 #
 #  产物：
-#    ios/tweak/Engine/lib/libpikafish.a        引擎 + 桥接层（链进 JJCheat.dylib）
-#    ios/tweak/Engine/jjpika_shim.h            桥接层头文件
-#    ios/tweak/layout/.../pikafish.nnue        NNUE 权重（随包分发）
+#    ios/tweak/Engine/lib/libpikafish.a    引擎 + 桥接层（链进 JJCheat.dylib）
+#    ios/tweak/layout/.../pikafish.nnue    NNUE 权重（随包分发）
 #
 #  为什么不再是可执行文件：
 #    2.1.51 真机日志证明 iOS App 沙盒不允许对自己容器与 jbroot 下的二进制
@@ -83,7 +82,7 @@ NET_SIZE="$(wc -c < pikafish.nnue | tr -d ' ')"
 log "权重   : $NET_SIZE 字节"
 
 # ---------- 编译静态库 ----------
-# 关键 flag 说明：
+# 关键 flag：
 #  -fno-exceptions   Pikafish 全库按无异常编译（官方 Makefile 同款）
 #  -fPIC             要链进 dylib，必须位置无关（不能沿用可执行版本的
 #                    -mdynamic-no-pic，那会让链接直接报错）
@@ -94,61 +93,78 @@ CXXSTD="-std=c++17"
 CFLAGS_COMMON="$TARGET_FLAGS $CXXSTD -O3 -DNDEBUG -fno-exceptions -fPIC -funroll-loops \
  -DIS_64BIT -DUSE_NEON=8 -DUSE_PTHREADS -fno-strict-aliasing"
 
-if [ -f "$LIB_OUT" ] && [ "$NFORCE" != "1" ] \
-   && [ "$LIB_OUT" -nt pikafish.nnue ] && [ "$LIB_OUT" -nt "$SHIM_SRC" ]; then
-    log "已存在静态库且比网络新，跳过编译（PIKA_FORCE=1 可强制重编）"
+needs_build() {
+    [ "$NFORCE" = "1" ] && return 0
+    [ -f "$LIB_OUT" ] || return 0
+    [ "$LIB_OUT" -nt pikafish.nnue ] || return 0
+    [ "$LIB_OUT" -nt "$SHIM_SRC" ] || return 0
+    # 库存在但桥接符号缺失（上次编到一半）→ 重编
+    nm -g "$LIB_OUT" 2>/dev/null | grep -q " T _jjpika_start$" || return 0
+    return 1
+}
+
+if ! needs_build; then
+    log "静态库已是最新，跳过编译（PIKA_FORCE=1 可强制重编）"
 else
-    JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-    log "编译中（-j${JOBS}，全量约 3~6 分钟）"
+    log "编译中（共 $(find . -name '*.cpp' ! -name 'main.cpp' ! -path './universal/*' | wc -l | tr -d ' ') 个引擎文件 + 1 个桥接层）"
     rm -rf "$OBJ"
     mkdir -p "$OBJ"
 
-    # 先编引擎，再编桥接层。
-    # 排除 main.cpp（入口由桥接层提供）与 universal/（那是给 x86/riscv 的
-    # 通用二进制入口桩，官方 Makefile 也只在 UNIVERSAL_BINARY 时才编）。
-    find . -name '*.cpp' ! -name 'main.cpp' ! -path './universal/*' -print > "$WORK/sources.txt"
-    echo "$SHIM_SRC" >> "$WORK/sources.txt"
-    wc -l < "$WORK/sources.txt" | tr -d ' ' | sed 's/^/   源文件数: /'
+    # 逐个编译，不用 xargs + export -f：非交互 bash 下函数导出的行为不稳，
+    # 而且顺序编译更容易在日志里定位是哪个文件出的问题（总计约 30~60s）。
+    IDX=0
+    FAILED=0
+    while IFS= read -r f; do
+        IDX=$((IDX + 1))
+        obj="$OBJ/$(printf '%03d' "$IDX").o"
+        if ! "$CLANGXX" $CFLAGS_COMMON -c "$f" -o "$obj" 2>"$obj.log"; then
+            echo "!! 编译失败: $f"
+            grep -E "error:" "$obj.log" | head -6 || cat "$obj.log" | head -20
+            FAILED=$((FAILED + 1))
+            continue
+        fi
+        rm -f "$obj.log"
+    done < <(find . -name '*.cpp' ! -name 'main.cpp' ! -path './universal/*' | sort)
+    [ "$FAILED" -eq 0 ] || die "$FAILED 个文件编译失败"
 
-    # 每个 .cpp 一个 .o，文件名用路径哈希避免同名（如两个 debug.cpp）
-    build_one() {
-        src_path="$1"
-        rel="${src_path#./}"
-        rel="${rel#$ROOT/}"
-        obj="$OBJ/$(printf '%s' "$rel" | shasum -a 256 | cut -c1-16).o"
-        extra=""
-        case "$rel" in
-            *jjpika_shim.cpp) extra="-I$SRC/src" ;;
-        esac
-        "$CLANGXX" $CFLAGS_COMMON $extra -c "$src_path" -o "$obj" 2>>"$WORK/build.log"
-    }
-    export -f build_one
-    export CLANGXX CFLAGS_COMMON OBJ SRC WORK ROOT
-
-    : > "$WORK/build.log"
-    if ! xargs -P "$JOBS" -I{} bash -c 'build_one "$@"' _ {} < "$WORK/sources.txt"; then
-        tail -40 "$WORK/build.log"
-        die "编译失败，完整日志: $WORK/build.log"
+    # 桥接层单独编（要额外加引擎源码目录进 include path）
+    log "编译桥接层 jjpika_shim.cpp"
+    IDX=$((IDX + 1))
+    SHIM_OBJ="$OBJ/$(printf '%03d' "$IDX").o"
+    if ! "$CLANGXX" $CFLAGS_COMMON -I"$SRC/src" -c "$SHIM_SRC" -o "$SHIM_OBJ" 2>"$WORK/shim.log"; then
+        grep -E "error:" "$WORK/shim.log" | head -10 || cat "$WORK/shim.log" | head -40
+        die "桥接层编译失败（日志: $WORK/shim.log）"
     fi
+
+    OBJ_COUNT="$(ls "$OBJ"/*.o 2>/dev/null | wc -l | tr -d ' ')"
+    log "目标文件: $OBJ_COUNT 个"
+    [ "$OBJ_COUNT" -ge 30 ] || die "只产出 $OBJ_COUNT 个 .o，明显不对"
 
     log "归档 libpikafish.a"
     mkdir -p "$LIB_OUT_DIR"
     rm -f "$LIB_OUT"
-    /usr/bin/libtool -static -o "$LIB_OUT" "$OBJ"/*.o 2>>"$WORK/build.log" \
-        || die "libtool 归档失败，日志: $WORK/build.log"
+    /usr/bin/libtool -static -o "$LIB_OUT" "$OBJ"/*.o \
+        || die "libtool 归档失败"
 fi
 
 [ -s "$LIB_OUT" ] || die "没有产出 $LIB_OUT"
 LIB_SIZE="$(wc -c < "$LIB_OUT" | tr -d ' ')"
 log "静态库 : $LIB_SIZE 字节"
 
-# 桥接层符号必须在库里
-for sym in jjpika_start jjpika_stop jjpika_send jjpika_recv; do
+# 桥接层符号必须在库里（缺一个就说明桥接层没编进来）
+MISSING=0
+for sym in jjpika_start jjpika_stop jjpika_send jjpika_recv jjpika_running; do
     if ! nm -g "$LIB_OUT" 2>/dev/null | grep -q " T _${sym}$"; then
-        die "静态库里缺符号 _${sym}"
+        echo "!! 静态库里缺符号 _${sym}"
+        MISSING=$((MISSING + 1))
     fi
 done
-log "符号齐全: jjpika_start/stop/send/recv"
+if [ "$MISSING" -ne 0 ]; then
+    echo "--- 库里前 20 个外部符号 ---"
+    nm -g "$LIB_OUT" 2>/dev/null | grep " T " | head -20
+    die "桥接层符号不全（缺 $MISSING 个）"
+fi
+log "符号齐全: jjpika_start/stop/send/recv/running"
 
 # ---------- 落盘 ----------
 mkdir -p "$DEST_DIR"
