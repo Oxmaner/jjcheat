@@ -312,7 +312,7 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
             [c addObject:@[@([p[0] doubleValue] + dx), @([p[1] doubleValue] + dy)]];
         }
         [[JJEngineBridge shared] setCorners:c];
-        NSDictionary *info = [self learnWithAutoRefine:rgba width:w height:h];
+        NSDictionary *info = [[JJEngineBridge shared] learnBoardWithPixels:rgba width:w height:h];
         NSInteger diff = [info[@"verifyDiff"] integerValue];
         if (diff < bestDiff) {
             bestDiff = diff;
@@ -424,7 +424,7 @@ typedef NS_ENUM(NSInteger, JJCtrlState) {
 
     // 学习阶段需要带 patch 采样
     if (!self.learnedBoard) {
-        NSDictionary *info = [[JJEngineBridge shared] learnBoardWithPixels:rgba width:w height:h];
+        NSDictionary *info = [self learnWithAutoRefine:rgba width:w height:h];
         if (info && [info[@"templateCount"] integerValue] > 0) {
             self.learnedBoard = YES;
             self.state = JJCtrlStateRunning;
