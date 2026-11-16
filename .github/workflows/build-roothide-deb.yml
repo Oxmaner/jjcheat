@@ -131,18 +131,3 @@ jobs:
           name: JJCheat-engine-js
           path: dist/engine.js
           if-no-files-found: error
-
-      - name: 发布 Release（手机直接下 deb）
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: roothide-build-${{ github.run_number }}
-          name: JJCheat roothide build #${{ github.run_number }}
-          body: |
-            roothide 适配构建（THEOS_PACKAGE_SCHEME=roothide，iphoneos-arm64e）
-
-            - Tweak: `/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib`（roothide 的 jbroot 内）
-            - 目标 App: `cn.jj.chinachess`
-            - engine.js：包内一份 + `postinst` 自动复制进 .app；App 更新后执行 `jjcheat-fix` 重做
-            - 安装后记得在 Bootstrap → App List 打开 JJ象棋 的注入开关
-          files: ios/tweak/packages/*.deb
-          fail_on_unmatched_files: true
