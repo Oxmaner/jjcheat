@@ -13,6 +13,9 @@ permissions:
 
 env:
   PIKA_TAG: Pikafish-2026-09-06
+  # NNUE 权重指纹（脚本拉的 master-net 是滚动发布，漂移会让权重与上面这个
+  # tag 不配套 → 架构哈希不符 → 引擎校验失败）。确认新权重可用后再更新这里。
+  PIKA_NET_SHA256: 071aefc0730e124876a97609a4a75624d62fa5d3155858c9646a1a8272e9e458
 
 jobs:
   build:
@@ -62,7 +65,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: engine/.build
-          key: pikafish-${{ env.PIKA_TAG }}-${{ hashFiles('engine/build-ios.sh') }}
+          # 补丁脚本也算缓存键：改了补丁就必须重编，不能复用旧的目标文件
+          key: pikafish-${{ env.PIKA_TAG }}-${{ hashFiles('engine/build-ios.sh', 'engine/patch-engine.py') }}
           restore-keys: |
             pikafish-${{ env.PIKA_TAG }}-
 
@@ -72,6 +76,17 @@ jobs:
           chmod +x engine/build-ios.sh
           PIKA_TAG="$PIKA_TAG" bash engine/build-ios.sh
           ls -l ios/tweak/Engine/lib/libpikafish.a
+
+      # scripts/net.sh 拉的是滚动发布 master-net，而源码钉在 PIKA_TAG。
+      # 官方换网络后，新权重可能与本源码架构哈希不符 —— 原生反应是
+      # Network::verify 里 exit(EXIT_FAILURE)，真机表现「思考中 → 闪退」。
+      # 指纹一漂就红，别等真机才发现。
+      - name: 校验 NNUE 权重指纹
+        run: |
+          set -eux
+          python3 engine/check-net.py \
+            "engine/.build/src/src/pikafish.nnue" \
+            --expect "${{ env.PIKA_NET_SHA256 }}"
 
       - name: 版本号随构建递增
         run: |

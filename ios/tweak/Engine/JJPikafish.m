@@ -79,6 +79,8 @@ static void JJFatalSignalHandler(int sig) {
 @property (nonatomic, assign) NSInteger searchingMovetime;
 @property (nonatomic, copy) JJPikaResultBlock searchingCb;
 @property (nonatomic, strong) NSDictionary *lastInfo;
+/* 2.1.68：最近一条 `info string`（引擎自述 / NNUE 加载失败原因），HUD 与日志共用 */
+@property (nonatomic, copy) NSString *lastEngineNotice;
 @property (nonatomic, strong) dispatch_block_t watchdog;
 
 /* 排队的下一个请求（新局面来了先 stop 旧的） */
@@ -388,6 +390,17 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
         [self flushPendingOnQueue];
         return;
     }
+    /* 2.1.68：`info string` 必须排在 `info ` 之前，而且必须打日志。
+       引擎的一切自述都走这个前缀 —— `info string NNUE evaluation using ...`、
+       `info string Network replica 1: ...`，以及 2.1.68 补丁新加的
+       `info string JJ-NNUE FAIL reason=... fileHash=0x... engineHash=0x...`。
+       2.1.60~67 把 `info ` 判断放在前面先 return，这些行一条都没进过日志，
+       「引擎到底有没有加载上权重」因此一直看不见，白白多绕了几轮。 */
+    if ([line hasPrefix:@"info string"]) {
+        NSLog(@"%@ 引擎自述: %@", kPikaLog, line);
+        self.lastEngineNotice = line;
+        return;
+    }
     if ([line hasPrefix:@"info "]) {
         self.lastInfo = [self parseInfoLine:line];
         return;
@@ -400,11 +413,12 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
         NSLog(@"%@ 引擎自报: %@", kPikaLog, line);
         return;
     }
-    /* 权重加载失败之类会走这里：原样打出来，别静默 */
-    if ([line hasPrefix:@"info string"] || [line rangeOfString:@"error"].location != NSNotFound ||
+    /* 其它可能带错误的行：原样打出来，别静默 */
+    if ([line rangeOfString:@"error"].location != NSNotFound ||
         [line rangeOfString:@"Error"].location != NSNotFound ||
         [line rangeOfString:@"NNUE"].location != NSNotFound) {
         NSLog(@"%@ 引擎输出: %@", kPikaLog, line);
+        self.lastEngineNotice = line;
     }
 }
 

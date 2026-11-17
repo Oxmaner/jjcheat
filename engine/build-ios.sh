@@ -81,6 +81,15 @@ NET_SIZE="$(wc -c < pikafish.nnue | tr -d ' ')"
 [ "$NET_SIZE" -gt 20000000 ] || die "pikafish.nnue 只有 $NET_SIZE 字节，下载不完整"
 log "权重   : $NET_SIZE 字节"
 
+# ---------- 源码补丁（2.1.68 起） ----------
+# Network::verify 在「网络没加载成功」时会 exit(EXIT_FAILURE)，而 Engine::go
+# 第一句就是 verify_network()。我们是进程内引擎，那个 exit 会把宿主 App 一起
+# 杀掉（真机 .ips thread 91 就停在那）。补丁把它改成返回 bool，并把失败原因
+# 带 decompressed/fileHash/engineHash 报出来。详见 engine/patch-engine.py。
+command -v python3 >/dev/null || die "找不到 python3（应用源码补丁需要）"
+log "应用引擎补丁"
+python3 "$ROOT/engine/patch-engine.py" "$SRC/src" || die "引擎补丁没打上（源码结构与预期不符，拒绝产出坏包）"
+
 # ---------- 编译静态库 ----------
 # 关键 flag：
 #  -fno-exceptions   Pikafish 全库按无异常编译（官方 Makefile 同款）
@@ -106,6 +115,8 @@ needs_build() {
     [ "$LIB_OUT" -nt "$SHIM_SRC" ] || return 0
     # 库存在但桥接符号缺失（上次编到一半）→ 重编
     nm -g "$LIB_OUT" 2>/dev/null | grep -q " T _jjpika_start$" || return 0
+    # 库是「没打补丁」的旧产物（缺 jj_last_network_load_error）→ 重编
+    nm -g "$LIB_OUT" 2>/dev/null | grep -q " T _jj_last_network_load_error$" || return 0
     # 只有单架构（旧产物）也要重编
     lipo -info "$LIB_OUT" 2>/dev/null | grep -q "arm64e" || return 0
     return 1
@@ -187,6 +198,15 @@ if [ "$MISSING" -ne 0 ]; then
     die "桥接层符号不全（缺 $MISSING 个）"
 fi
 log "符号齐全: jjpika_start/stop/send/recv/running（arm64 + arm64e）"
+
+# 补丁符号必须在：没有就说明 patch-engine.py 没生效，包里的引擎仍会在
+# 网络校验失败时 exit，一搜索就把 App 带走。
+for arch in $ARCH_LIST; do
+    if ! nm -g -arch "$arch" "$LIB_OUT" 2>/dev/null | grep -q " T _jj_last_network_load_error$"; then
+        die "[$arch] 缺 _jj_last_network_load_error —— 引擎补丁没生效"
+    fi
+done
+log "引擎补丁已生效: 网络校验失败不再 exit（jj_last_network_load_error 在）"
 
 # ---------- 落盘 ----------
 mkdir -p "$DEST_DIR"

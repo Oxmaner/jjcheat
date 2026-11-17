@@ -10,16 +10,6 @@
    2.1.0 换成独立进程 Pikafish 后默认 800ms：48MB 的 NNUE 大网络，
    旧 JS 时代的 200ms 连置换表都填不满，纯属白瞎这颗引擎。
    下限 100ms（再短不如直接看棋谱），上限 3000ms（手机发烫的临界）。 */
-/* ============================================================
- *  【诊断开关】2026-11-17 崩溃二分用
- *  1 = 完全不 hook CAMetalLayer -nextDrawable（不登记 surface、不读 IOSurface）
- *  崩溃日志显示 faultingThread=0（主线程 TuanjieFramework 渲染循环）空指针，
- *  而这个 hook 正好挂在 Unity 主线程渲染路径上，先把它整段摘掉验证。
- * ============================================================ */
-#ifndef JJ_DISABLE_METAL_HOOK
-#define JJ_DISABLE_METAL_HOOK 1
-#endif
-
 #define JJ_THINK_MS_DEFAULT     800
 #define JJ_THINK_MS_MIN         100
 #define JJ_THINK_MS_MAX         3000

@@ -48,6 +48,14 @@ typedef void (^JJPikaResultBlock)(NSDictionary * _Nullable result);
 /** 实际在用的 NNUE 权重路径（诊断面板用；为空表示还没解析出来） */
 - (NSString *)netPathInUse;
 
+/** 最近一条引擎自述（`info string ...`）。
+    2.1.68 起引擎在网络校验失败时会发
+    `info string JJ-NNUE FAIL reason=... | decompressed=... | fileHash=0x... engineHash=0x...`，
+    这里原样留存，HUD 的「皮卡鱼引擎」详情面板直接显示 —— 不用抓 syslog
+    就能分清「权重没读到」和「权重与引擎不配套」。成功时这里是
+    `NNUE evaluation using ...`。 */
+@property (nonatomic, readonly, copy, nullable) NSString *lastEngineNotice;
+
 /** 引擎主循环是否在跑 */
 - (BOOL)engineThreadAlive;
 

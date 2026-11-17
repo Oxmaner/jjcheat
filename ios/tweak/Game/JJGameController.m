@@ -316,6 +316,18 @@ typedef NS_ENUM(NSInteger, JJGameState) {
         na ? @"已就位" : @"缺失", na ? @([na fileSize]) : @"-"];
     if (net.length) [msg appendFormat:@"路径：%@\n", net];
 
+    /* 2.1.68：把引擎自己说的话摆在这里。
+       成功是 `NNUE evaluation using ...`；失败是
+       `JJ-NNUE FAIL reason=... decompressed=... fileHash=0x… engineHash=0x…`。
+       这一行能直接区分「文件没读到」和「权重与引擎不配套」，不用去翻 syslog。 */
+    NSString *notice = [pika lastEngineNotice];
+    if (notice.length) {
+        [msg appendFormat:@"\n引擎自述：\n%@\n", notice];
+    }
+    if ([pika state] == JJPikaStateDead || [notice hasPrefix:@"JJ-NNUE FAIL"]) {
+        [msg appendString:@"\n网络校验没通过 → 引擎会跳过搜索（不会再闪退）。"];
+    }
+
     [msg appendFormat:@"线程 1 · 哈希 %d MB · 每步 %ld ms", JJ_PIKA_HASH_MB, (long)self.thinkMs];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"皮卡鱼引擎"
                                                                message:msg
