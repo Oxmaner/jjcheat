@@ -33,26 +33,31 @@ typedef NS_ENUM(NSInteger, JJSheetRowKind) {
 /** 选中态（打勾 + 青绿） */
 @property (nonatomic, assign) BOOL on;
 @property (nonatomic, assign) BOOL enabled;
-/** action / danger 点击回调 */
-@property (nonatomic, copy, nullable) void (^handler)(void);
-/** stepper 步进回调：+1 / -1（调用方自己换算成实际步长并更新 detail） */
-@property (nonatomic, copy, nullable) void (^stepper)(NSInteger delta);
+/* 回调必须把 row 自己传进来。
+   2.1.81 初版是 void(^)(void)，想让回调改自己这一行就只能反向捕获 row；
+   而「刚创建、还没有强持有者」的对象赋给 __weak 局部变量，ARC 下可能立刻变 nil，
+   随后 [rows addObject:row] 就抛 NSInvalidArgumentException（真机 07:49:42 崩在这）。
+   带参数后无需捕获自己，从根上消除这一类 bug。 */
+/** action / danger 点击回调，row 是当前行 */
+@property (nonatomic, copy, nullable) void (^handler)(JJSheetRow *row);
+/** stepper 步进回调：delta = +1 / -1，row 是当前行 */
+@property (nonatomic, copy, nullable) void (^stepper)(NSInteger delta, JJSheetRow *row);
 
 + (instancetype)info:(NSString *)text;
 
 + (instancetype)action:(NSString *)title
                 symbol:(nullable NSString *)symbol
                 detail:(nullable NSString *)detail
-               handler:(void (^)(void))handler;
+               handler:(void (^)(JJSheetRow *row))handler;
 
 + (instancetype)stepper:(NSString *)title
                  symbol:(nullable NSString *)symbol
                   value:(NSString *)value
-               onChange:(void (^)(NSInteger delta))onChange;
+               onChange:(void (^)(NSInteger delta, JJSheetRow *row))onChange;
 
 + (instancetype)danger:(NSString *)title
                 symbol:(nullable NSString *)symbol
-               handler:(void (^)(void))handler;
+               handler:(void (^)(JJSheetRow *row))handler;
 
 @end
 

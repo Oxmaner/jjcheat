@@ -26,7 +26,7 @@ static const CGFloat kJJStepValueW  = 52.0;
 + (instancetype)action:(NSString *)title
                 symbol:(NSString *)symbol
                 detail:(NSString *)detail
-               handler:(void (^)(void))handler {
+               handler:(void (^)(JJSheetRow *row))handler {
     JJSheetRow *r = [[JJSheetRow alloc] init];
     r.kind = JJSheetRowKindAction;
     r.title = title ?: @"";
@@ -40,7 +40,7 @@ static const CGFloat kJJStepValueW  = 52.0;
 + (instancetype)stepper:(NSString *)title
                  symbol:(NSString *)symbol
                   value:(NSString *)value
-               onChange:(void (^)(NSInteger))onChange {
+               onChange:(void (^)(NSInteger delta, JJSheetRow *row))onChange {
     JJSheetRow *r = [[JJSheetRow alloc] init];
     r.kind = JJSheetRowKindStepper;
     r.title = title ?: @"";
@@ -53,7 +53,7 @@ static const CGFloat kJJStepValueW  = 52.0;
 
 + (instancetype)danger:(NSString *)title
                 symbol:(NSString *)symbol
-               handler:(void (^)(void))handler {
+               handler:(void (^)(JJSheetRow *row))handler {
     JJSheetRow *r = [[JJSheetRow alloc] init];
     r.kind = JJSheetRowKindDanger;
     r.title = title ?: @"";
@@ -331,7 +331,7 @@ static const CGFloat kJJStepValueW  = 52.0;
     NSUInteger i = (NSUInteger)(isPlus ? (b.tag - 400) : (b.tag - 300));
     if (i >= self.rows.count) return;
     JJSheetRow *row = self.rows[i];
-    if (row.stepper) row.stepper(isPlus ? 1 : -1);
+    if (row.stepper) row.stepper(isPlus ? 1 : -1, row);
 }
 
 
@@ -352,7 +352,7 @@ static const CGFloat kJJStepValueW  = 52.0;
         [UIView animateWithDuration:0.12 animations:^{
             b.backgroundColor = JJMenuCellColor(row.on);
         }];
-        if (row.handler) row.handler();
+        if (row.handler) row.handler(row);
     });
 }
 

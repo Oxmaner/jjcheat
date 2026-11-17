@@ -420,33 +420,34 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
                                      JJ_OPT_THINK_MS_MIN, JJ_OPT_THINK_MS_MAX]]];
 
     /* 步进器：每档 50ms。为什么用步进而不是键盘 —— 键盘会盖住棋盘，
-       而且这个值调一次就长期不动，微调比重新输入更顺手。 */
-    __block __weak JJSheetRow *step = nil;
-    step = [JJSheetRow stepper:@"时长"
+       而且这个值调一次就长期不动，微调比重新输入更顺手。
+       回调里的 row 就是本行（2.1.81 起由面板传入），不要再反向捕获自己：
+       「刚创建、还没强持有者」的对象赋给 __weak 会立刻变 nil，
+       随后 addObject 抛 NSInvalidArgumentException（真机 07:49:42 崩在这）。 */
+    JJSheetRow *step = [JJSheetRow stepper:@"时长"
                                     symbol:@"timer"
                                      value:[NSString stringWithFormat:@"%ld ms", (long)o.thinkMs]
-                                  onChange:^(NSInteger delta) {
+                                  onChange:^(NSInteger delta, JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         NSInteger v = [JJEngineOptions shared].thinkMs + delta * 50;
         if (v < JJ_OPT_THINK_MS_MIN) v = JJ_OPT_THINK_MS_MIN;
         if (v > JJ_OPT_THINK_MS_MAX) v = JJ_OPT_THINK_MS_MAX;
         [s2 applyThinkMs:v announce:NO];
-        step.detail = [NSString stringWithFormat:@"%ld ms", (long)v];
+        row.detail = [NSString stringWithFormat:@"%ld ms", (long)v];
         [s2 refreshActiveSheet];
     }];
     [rows addObject:step];
 
-    /* 预设：包含「当前值」并打勾，一键选回默认 650 */
+    /* 预设：包含「当前值」并打勾，一键选回默认 */
     NSMutableArray<NSNumber *> *presets =
         [NSMutableArray arrayWithArray:@[@(350), @(650), @(1000), @(2000)]];
     if (![presets containsObject:@(o.thinkMs)]) [presets insertObject:@(o.thinkMs) atIndex:0];
     for (NSNumber *n in presets) {
-        __block __weak JJSheetRow *r = nil;
-    r = [JJSheetRow action:[NSString stringWithFormat:@"%@ ms", n]
+        JJSheetRow *r = [JJSheetRow action:[NSString stringWithFormat:@"%@ ms", n]
                                         symbol:@"bolt.horizontal"
                                         detail:nil
-                                       handler:^{
+                                       handler:^(JJSheetRow *row) {
             __strong typeof(ws) s2 = ws;
             if (!s2) return;
             [s2 applyThinkMs:n.integerValue announce:YES];
@@ -456,14 +457,14 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
             for (JJSheetRow *rr in rows) {
                 if (rr.kind == JJSheetRowKindAction) rr.on = NO;
             }
-            r.on = YES;
+            row.on = YES;
             [s2 refreshActiveSheet];
         }];
         r.on = (n.integerValue == o.thinkMs);
         [rows addObject:r];
     }
 
-    [rows addObject:[JJSheetRow action:JJCopySheetDone symbol:nil detail:nil handler:^{
+    [rows addObject:[JJSheetRow action:JJCopySheetDone symbol:nil detail:nil handler:^(JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         [s2.ballWindow dismissSheet];
@@ -477,9 +478,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     NSLog(@"[JJCheat] 打开思考时间面板");
 }
 
-#pragma mark - 引擎参数（二级面板）
-
-/** 二级面板：引擎参数。每一项都直接对应 JJEngineOptions 的配置键。 */
 - (void)showEngineOptionsSheet {
     if (!self.enabled) {
         [self.ballWindow toast:JJCopyNeedPluginOn];
@@ -492,21 +490,22 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [rows addObject:[JJSheetRow info:@"改完立即下发；标「需重启」的项会重载权重"]];
 
     /* ---- 思考方式：时间 / 深度二选一 ---- */
-    JJSheetRow *byTime = [JJSheetRow action:@"按时间思考" symbol:@"clock" detail:nil handler:^{
+    JJSheetRow *byTime = [JJSheetRow action:@"按时间思考" symbol:@"clock" detail:nil
+                                     handler:^(JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         [o setThinkDepth:0];
         [s2 afterEngineOptionsChanged:NO];
-        [s2 showEngineOptionsSheet];        // 重开面板刷新勾选态
+        [s2 showEngineOptionsSheet];        // 重开面板刷新勾选态与可用状态
+        (void)row;
     }];
     byTime.on = (o.thinkDepth == 0);
     [rows addObject:byTime];
 
-    __block __weak JJSheetRow *timeStep = nil;
-    timeStep = [JJSheetRow stepper:@"时长"
+    JJSheetRow *timeStep = [JJSheetRow stepper:@"时长"
                                         symbol:@"timer"
                                          value:[NSString stringWithFormat:@"%ld ms", (long)o.thinkMs]
-                                      onChange:^(NSInteger delta) {
+                                      onChange:^(NSInteger delta, JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         NSInteger v = [JJEngineOptions shared].thinkMs + delta * 50;
@@ -514,36 +513,37 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
         o.thinkDepth = 0;                   // 调时间即视为「按时间思考」
         [o setThinkMs:v];
         s2.thinkMs = v;
-        timeStep.detail = [NSString stringWithFormat:@"%ld ms", (long)v];
+        row.detail = [NSString stringWithFormat:@"%ld ms", (long)v];
         [s2 afterEngineOptionsChanged:NO];
         [s2 refreshActiveSheet];
     }];
     timeStep.enabled = (o.thinkDepth == 0);
     [rows addObject:timeStep];
 
-    JJSheetRow *byDepth = [JJSheetRow action:@"按深度思考" symbol:@"chart.bar" detail:nil handler:^{
+    JJSheetRow *byDepth = [JJSheetRow action:@"按深度思考" symbol:@"chart.bar" detail:nil
+                                      handler:^(JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         if ([o thinkDepth] <= 0) [o setThinkDepth:10];   // 打开深度模式给个常用值
         [s2 afterEngineOptionsChanged:NO];
         [s2 showEngineOptionsSheet];
+        (void)row;
     }];
     byDepth.on = (o.thinkDepth > 0);
     [rows addObject:byDepth];
 
-    __block __weak JJSheetRow *depthStep = nil;
-    depthStep = [JJSheetRow stepper:@"深度"
+    JJSheetRow *depthStep = [JJSheetRow stepper:@"深度"
                                          symbol:@"arrow.down.to.line"
                                           value:(o.thinkDepth > 0
                                                  ? [NSString stringWithFormat:@"%ld 层", (long)o.thinkDepth]
                                                  : @"关闭")
-                                       onChange:^(NSInteger delta) {
+                                       onChange:^(NSInteger delta, JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         NSInteger v = [JJEngineOptions shared].thinkDepth;
         v = MAX(JJ_OPT_THINK_DEPTH_MIN, MIN(JJ_OPT_THINK_DEPTH_MAX, v + delta));
         [o setThinkDepth:v];
-        depthStep.detail = v > 0 ? [NSString stringWithFormat:@"%ld 层", (long)v] : @"关闭";
+        row.detail = v > 0 ? [NSString stringWithFormat:@"%ld 层", (long)v] : @"关闭";
         NSLog(@"[JJCheat] 引擎参数 ThinkDepth=%ld（0=按时间）", (long)v);
         [s2 afterEngineOptionsChanged:NO];
         [s2 refreshActiveSheet];
@@ -552,34 +552,32 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [rows addObject:depthStep];
 
     /* ---- 资源 ---- */
-    __block __weak JJSheetRow *hash = nil;
-    hash = [JJSheetRow stepper:@"哈希表"
+    JJSheetRow *hash = [JJSheetRow stepper:@"哈希表"
                                     symbol:@"memorychip"
                                      value:[NSString stringWithFormat:@"%ld MB", (long)o.hashMb]
-                                  onChange:^(NSInteger delta) {
+                                  onChange:^(NSInteger delta, JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         NSInteger v = [JJEngineOptions shared].hashMb + delta * 8;
         v = MAX(JJ_OPT_HASH_MB_MIN, MIN(JJ_OPT_HASH_MB_MAX, v));
         [o setHashMb:v];
-        hash.detail = [NSString stringWithFormat:@"%ld MB", (long)v];
+        row.detail = [NSString stringWithFormat:@"%ld MB", (long)v];
         NSLog(@"[JJCheat] 引擎参数 Hash=%ldMB → applyOptionsHot", (long)v);
         [s2 afterEngineOptionsChanged:NO];
         [s2 refreshActiveSheet];
     }];
     [rows addObject:hash];
 
-    __block __weak JJSheetRow *mpv = nil;
-    mpv = [JJSheetRow stepper:@"多线路"
+    JJSheetRow *mpv = [JJSheetRow stepper:@"多线路"
                                    symbol:@"list.number"
                                     value:[NSString stringWithFormat:@"%ld", (long)o.multiPV]
-                                 onChange:^(NSInteger delta) {
+                                 onChange:^(NSInteger delta, JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         NSInteger v = [JJEngineOptions shared].multiPV + delta;
         v = MAX(JJ_OPT_MULTIPV_MIN, MIN(JJ_OPT_MULTIPV_MAX, v));
         [o setMultiPV:v];
-        mpv.detail = [NSString stringWithFormat:@"%ld", (long)v];
+        row.detail = [NSString stringWithFormat:@"%ld", (long)v];
         NSLog(@"[JJCheat] 引擎参数 MultiPV=%ld → applyOptionsHot", (long)v);
         [s2 afterEngineOptionsChanged:NO];
         [s2 refreshActiveSheet];
@@ -587,34 +585,32 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [rows addObject:mpv];
 
     /* ---- 其它（2.1.80 补齐：此前有配置键但无 UI 入口）---- */
-    __block __weak JJSheetRow *overhead = nil;
-    overhead = [JJSheetRow stepper:@"落子余量"
+    JJSheetRow *overhead = [JJSheetRow stepper:@"落子余量"
                                         symbol:@"hourglass"
                                          value:[NSString stringWithFormat:@"%ld ms", (long)o.moveOverhead]
-                                      onChange:^(NSInteger delta) {
+                                      onChange:^(NSInteger delta, JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         NSInteger v = [JJEngineOptions shared].moveOverhead + delta * 10;
         v = MAX(JJ_OPT_MOVE_OVERHEAD_MIN, MIN(JJ_OPT_MOVE_OVERHEAD_MAX, v));
         [o setMoveOverhead:v];
-        overhead.detail = [NSString stringWithFormat:@"%ld ms", (long)v];
+        row.detail = [NSString stringWithFormat:@"%ld ms", (long)v];
         NSLog(@"[JJCheat] 引擎参数 MoveOverhead=%ldms → applyOptionsHot", (long)v);
         [s2 afterEngineOptionsChanged:NO];
         [s2 refreshActiveSheet];
     }];
     [rows addObject:overhead];
 
-    __block __weak JJSheetRow *wdl = nil;
-    wdl = [JJSheetRow action:@"显示胜率"
+    JJSheetRow *wdl = [JJSheetRow action:@"显示胜率"
                                   symbol:@"percent"
                                   detail:(o.showWDL ? @"开" : @"关")
-                                 handler:^{
+                                 handler:^(JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         JJEngineOptions *oo = [JJEngineOptions shared];
         [oo setShowWDL:!oo.showWDL];
-        wdl.on = oo.showWDL;
-        wdl.detail = oo.showWDL ? @"开" : @"关";
+        row.on = oo.showWDL;
+        row.detail = oo.showWDL ? @"开" : @"关";
         NSLog(@"[JJCheat] 引擎参数 ShowWDL=%d → applyOptionsHot", (int)oo.showWDL);
         [s2 afterEngineOptionsChanged:NO];
         [s2 refreshActiveSheet];
@@ -626,30 +622,25 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     JJSheetRow *threads = [JJSheetRow danger:[NSString stringWithFormat:@"线程数（当前 %ld）",
                                               (long)o.threads]
                                       symbol:@"cpu"
-                                     handler:^{
+                                     handler:^(JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         [s2 showThreadsConfirmSheet];
+        (void)row;
     }];
     [rows addObject:threads];
 
-    [rows addObject:[JJSheetRow action:JJCopySheetDone symbol:nil detail:nil handler:^{
+    [rows addObject:[JJSheetRow action:JJCopySheetDone symbol:nil detail:nil handler:^(JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         [s2.ballWindow dismissSheet];
+        (void)row;
     }]];
 
     [self presentSheetTitled:JJCopySheetEngineTitle subtitle:[o summary] rows:rows];
     NSLog(@"[JJCheat] 打开引擎参数面板");
 }
 
-/** 二级面板：线程数二次确认。
- *
- *  【为什么必须确认】2.1.60~62 真机实测：setoption Threads 会走 resize_threads()
- *  → threads.clear() 再 pthread_create。iOS 上重建不干净时 worker 悬空，
- *  go 时 main_thread()->worker->limits 在 0x0 解引用 → SIGSEGV。
- *  这个开关打开的代价是闪退而不是变慢，必须让用户明确知情。
- */
 - (void)showThreadsConfirmSheet {
     JJEngineOptions *o = [JJEngineOptions shared];
     __weak typeof(self) ws = self;
@@ -660,38 +651,39 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
         @"真机出现过重建后搜索闪退。改完会立即重启引擎（重载 50MB 权重 1~3 秒）。"
         @"若闪退，重进 App 把线程数改回 1 即可恢复。", (long)o.threads]]];
 
-    __block __weak JJSheetRow *step = nil;
-    step = [JJSheetRow stepper:@"线程数"
+    JJSheetRow *step = [JJSheetRow stepper:@"线程数"
                                     symbol:@"cpu"
                                      value:[NSString stringWithFormat:@"%ld", (long)o.threads]
-                                  onChange:^(NSInteger delta) {
+                                  onChange:^(NSInteger delta, JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         NSInteger v = [JJEngineOptions shared].threads + delta;
         v = MAX(JJ_OPT_THREADS_MIN, MIN(JJ_OPT_THREADS_MAX, v));
         [o setThreads:v];
-        step.detail = [NSString stringWithFormat:@"%ld", (long)v];
+        row.detail = [NSString stringWithFormat:@"%ld", (long)v];
         [s2 refreshActiveSheet];
     }];
     [rows addObject:step];
 
-    [rows addObject:[JJSheetRow danger:@"应用并重启引擎" symbol:@"arrow.clockwise" handler:^{
+    [rows addObject:[JJSheetRow danger:@"应用并重启引擎" symbol:@"arrow.clockwise"
+                               handler:^(JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         [s2.ballWindow dismissSheet];
         [s2 afterEngineOptionsChanged:YES];
+        (void)row;
     }]];
 
-    [rows addObject:[JJSheetRow action:JJCopySheetCancel symbol:nil detail:nil handler:^{
+    [rows addObject:[JJSheetRow action:JJCopySheetCancel symbol:nil detail:nil handler:^(JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         [s2.ballWindow dismissSheet];
+        (void)row;
     }]];
 
     [self presentSheetTitled:JJCopySheetThreadsTitle subtitle:nil rows:rows];
 }
 
-/** 统一的二级面板呈现：算高度 → 交给 ballWindow 定位 → 记录以便刷新 */
 - (void)presentSheetTitled:(NSString *)title
                   subtitle:(NSString *)subtitle
                       rows:(NSArray<JJSheetRow *> *)rows {
@@ -711,7 +703,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [self.activeSheet refreshSubtitle:[[JJEngineOptions shared] summary]];
 }
 
-/** 参数改完：热更新 or 重启引擎，并给明确反馈 */
 - (void)afterEngineOptionsChanged:(BOOL)needsRestart {
     JJEngineOptions *o = [JJEngineOptions shared];
     if (needsRestart) {
