@@ -99,6 +99,79 @@ for f in $FILES; do
 done
 
 echo "----"
+
+# ---------------------------------------------------------------------------
+# 菜单一致性检查（2.1.80）
+#
+# 【守的是什么】菜单项的 action 标识与 onMenuItem 的 switch 分支必须一一对应。
+# 2.1.78 把「重置开局」插到「HUD」前面时，菜单顺序变了、switch 没跟着改，
+# 结果点「HUD」实际执行了「重置开局」——HUD 开关因此完全失灵，而且从代码上看
+# 每一行都对，很难靠肉眼发现。
+# 现在两边都用 JJMenuAction 枚举，这里做集合比对；另外禁止出现数字下标分支
+# （出现就说明又回到了「按下标分派」的老路）。
+# ---------------------------------------------------------------------------
+CTRL="$TWEAK/Game/JJGameController.m"
+menu_fail=0
+if [ -f "$CTRL" ]; then
+    # 菜单里实际挂上的 action（形如 e3.action = JJMenuActionHUD;）
+    assigned="$(sed -n '/- (void)showMenu /,/showMenuWithEntries/p' "$CTRL" \
+        | grep -oE '\.action = JJMenuAction[A-Za-z]+' | sed 's/.*= //' | sort -u)"
+    # switch 里实际处理的分支
+    handled="$(grep -oE 'case JJMenuAction[A-Za-z]+' "$CTRL" | sed 's/case //' | sort -u)"
+
+    if [ -z "$assigned" ]; then
+        echo "FAIL  菜单一致性：showMenu 里没有找到任何 action 赋值"
+        menu_fail=1
+    elif [ "$assigned" != "$handled" ]; then
+        echo "FAIL  菜单一致性：菜单项与 switch 分支不匹配"
+        echo "      仅菜单有: $(comm -23 <(printf '%s\n' "$assigned") <(printf '%s\n' "$handled") | tr '\n' ' ')"
+        echo "      仅 switch 有: $(comm -13 <(printf '%s\n' "$assigned") <(printf '%s\n' "$handled") | tr '\n' ' ')"
+        menu_fail=1
+    else
+        cnt="$(printf '%s\n' "$assigned" | wc -l | tr -d ' ')"
+        echo "ok    菜单一致性：$cnt 项 action 与 switch 全对应"
+    fi
+
+    # ★ 每条 case 实际调用的方法必须是预期那个。
+    #
+    # 为什么还需要这一条：只比对「action 集合」抓不到「case 标签对、动作体被换」
+    # 这类错位 —— 而那正是 2.1.78 的真实形态（点 HUD 走了 resetToStartPosition，
+    # 标签还是 HUD）。所以这里把「动作 → 方法」的对应关系写死，逐条核对。
+    check_case() {
+        action="$1"; expect="$2"
+        # 取该 case 之后 3 行，看有没有调用预期方法
+        if grep -A3 "case $action:" "$CTRL" | grep -q "$expect"; then
+            return 0
+        fi
+        echo "FAIL  菜单分派：$action 应调用 $expect"
+        grep -A3 "case $action:" "$CTRL" | sed 's/^/      /'
+        menu_fail=1
+        return 1
+    }
+    check_case JJMenuActionPlugin          setPluginEnabled
+    check_case JJMenuActionAutoCalibrate   autoCalibrate
+    check_case JJMenuActionManualCalibrate manualCalibrate
+    check_case JJMenuActionHUD             toggleHUD
+    check_case JJMenuActionResetBoard      resetToStartPosition
+    check_case JJMenuActionThink           showThinkSheet
+    check_case JJMenuActionEngineOptions   showEngineOptionsSheet
+    check_case JJMenuActionEngineStatus    showEngineStatus
+
+    # 禁止按下标分派（case 0..9 这种）
+    if grep -qE 'case [0-9]+:' "$CTRL"; then
+        echo "FAIL  菜单一致性：onMenuItem 又出现数字下标分支（应使用 JJMenuAction）"
+        grep -nE 'case [0-9]+:' "$CTRL" | sed 's/^/      /'
+        menu_fail=1
+    fi
+
+    [ "$menu_fail" -eq 0 ] && echo "ok    菜单分派：8 条 action → 方法全部核对通过"
+else
+    echo "FAIL  菜单一致性：找不到 $CTRL"
+    menu_fail=1
+fi
+
+echo "----"
 echo "通过 $ok 个，失败 $fail 个"
 [ "$fail" -eq 0 ] || exit 1
+[ "$menu_fail" -eq 0 ] || exit 1
 echo "注意：Tweak.x 走 Logos 预处理，本脚本不覆盖，由 CI 的 theos 构建保证。"

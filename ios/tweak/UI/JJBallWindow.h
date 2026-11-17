@@ -27,6 +27,15 @@ NS_ASSUME_NONNULL_BEGIN
 /** YES = 危险/异常状态（如引擎不可用），图标用警示色 */
 @property (nonatomic, assign) BOOL warn;
 
+/** 2.1.80：动作标识（由调用方定义，如 JJMenuActionHUD）。
+ *
+ *  【为什么必须有】以前回调传的是「数组下标」，菜单顺序一改就错位：
+ *  2.1.78 把「重置开局」插到「HUD」前面后，点 HUD 实际执行了重置开局、
+ *  点重置开局反而切 HUD —— 这正是「HUD 开关不起作用」的根因。
+ *  现在每项自带 action，顺序怎么排都不会错。
+ *  未设置（0）时回退为位置下标，兼容旧调用。 */
+@property (nonatomic, assign) NSInteger action;
+
 + (instancetype)title:(NSString *)title symbol:(nullable NSString *)symbol;
 @end
 
@@ -54,6 +63,14 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)showMenuWithEntries:(NSArray<JJMenuEntry *> *)entries;
 - (void)showMenuWithTitles:(NSArray<NSString *> *)titles;
 - (void)hideMenu;
+
+/* ---- 2.1.80：二级面板（与一级菜单同一套 JJMenuStyle 视觉规范） ---- */
+
+/** 显示二级面板（会先收起一级菜单）。面板贴在球同侧，空间不够则翻到另一侧。 */
+- (void)showSheet:(UIView *)sheet;
+/** 收起二级面板 */
+- (void)dismissSheet;
+@property (nonatomic, readonly) BOOL sheetVisible;
 
 @end
 

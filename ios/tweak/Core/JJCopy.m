@@ -24,6 +24,12 @@ NSString *const JJCopyCalibDone            = @"标定完成 · 请进入一局�
 NSString *const JJCopyCalibInvalidRestored = @"四角无效 · 已恢复上次标定";
 NSString *const JJCopyResetDone            = @"已重置 · 请停在开局棋盘画面";
 
+NSString *const JJCopySheetThinkTitle   = @"思考时间";
+NSString *const JJCopySheetEngineTitle  = @"引擎参数";
+NSString *const JJCopySheetThreadsTitle = @"改线程数？";
+NSString *const JJCopySheetDone         = @"完成";
+NSString *const JJCopySheetCancel       = @"取消";
+
 NSString *JJCopyWithValue(NSString *title, NSString *value) {
     if (!title) return value ?: @"";
     if (!value.length) return title;

@@ -20,7 +20,7 @@
 NS_ASSUME_NONNULL_BEGIN
 
 /** 文案版本。改了任何一条对外文案就 +1，日志里会打出来，便于确认装的是哪版。 */
-#define JJ_COPY_VERSION  @"2.1.79-c1"
+#define JJ_COPY_VERSION  @"2.1.80-c1"
 
 /* ---- 通用状态词 ---- */
 extern NSString *const JJCopyOn;                    // 开
@@ -45,6 +45,13 @@ extern NSString *const JJCopyCalibTapFourCorners;   // 点棋盘四个角：左�
 extern NSString *const JJCopyCalibDone;             // 标定完成 · 请进入一局新棋
 extern NSString *const JJCopyCalibInvalidRestored;  // 四角无效 · 已恢复上次标定
 extern NSString *const JJCopyResetDone;             // 已重置 · 请停在开局棋盘画面
+
+/* ---- 二级菜单（2.1.80） ---- */
+extern NSString *const JJCopySheetThinkTitle;       // 思考时间
+extern NSString *const JJCopySheetEngineTitle;      // 引擎参数
+extern NSString *const JJCopySheetThreadsTitle;     // 改线程数？
+extern NSString *const JJCopySheetDone;             // 完成
+extern NSString *const JJCopySheetCancel;           // 取消
 
 /** 拼「某状态 · 值」这种最常见的组合（如「思考 650ms」）。 */
 NSString *JJCopyWithValue(NSString *title, NSString *value);

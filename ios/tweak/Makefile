@@ -33,6 +33,8 @@ JJCheat_FILES = Tweak.x \
                 Game/JJCalibrator.m \
                 UI/JJHUDWindow.m \
                 UI/JJBallWindow.m \
+                UI/JJMenuSheet.m \
+                UI/JJMenuStyle.m \
                 Vision/JJVisionBridge.m \
                 Vision/JJEngineScript.c \
                 Capture/JJMetalGrabber.m \

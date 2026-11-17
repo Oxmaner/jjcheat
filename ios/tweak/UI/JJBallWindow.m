@@ -5,6 +5,7 @@
 
 #import "JJBallWindow.h"
 #import "JJConfig.h"
+#import "JJMenuStyle.h"
 
 #ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
 #import <roothide.h>
@@ -14,25 +15,18 @@ static const CGFloat kJJBallSize      = 52.0;
 /** 引擎状态点直径（2.1.0 新增：球右上角小圆点） */
 static const CGFloat kJJEngineDotSize = 12.0;
 
-/* ---- 2.1.78 菜单网格尺寸 ----
+/* ---- 一级菜单网格尺寸 ----
    为什么从「竖排文字长条」改成「2 列图标网格」：
    旧的 232×264 文字列表贴在球内侧，几乎必然压住棋盘右半边，而且每行一句长文案
    要读半天。现在 174×226、纯图标 + 2~4 字标签，横向只占屏幕边缘一条，
-   配合毛玻璃让底下的棋子仍然可辨 —— 这才是「不遮挡视线」的实质。 */
+   配合毛玻璃让底下的棋子仍然可辨 —— 这才是「不遮挡视线」的实质。
+
+   2.1.80：颜色与圆角不再在这里定义，统一取 JJMenuStyle（与二级面板共用）。 */
 static const CGFloat kJJMenuCellW  = 76.0;
 static const CGFloat kJJMenuCellH  = 66.0;
 static const CGFloat kJJMenuGap    = 6.0;
 static const CGFloat kJJMenuPad    = 8.0;
 static const NSInteger kJJMenuCols = 2;
-
-/* 主色：激活 / 正常，青绿 */
-#define JJ_COLOR_ON      [UIColor colorWithRed:0.25 green:0.85 blue:0.63 alpha:1.0]
-/* 警示：引擎异常 */
-#define JJ_COLOR_WARN    [UIColor colorWithRed:1.00 green:0.42 blue:0.34 alpha:1.0]
-/* 常规 */
-#define JJ_COLOR_IDLE    [UIColor colorWithWhite:0.90 alpha:1.0]
-#define JJ_COLOR_TITLE   [UIColor colorWithWhite:0.92 alpha:1.0]
-#define JJ_COLOR_BORDER  [UIColor colorWithWhite:1 alpha:0.14]
 
 /** 插件图标：优先读随 deb 落到 jbroot 的 logo.png，读不到就回退文字「象棋」。 */
 static UIImage *JJLoadLogoImage(void) {
@@ -70,6 +64,7 @@ static UIImage *JJLoadLogoImage(void) {
     JJMenuEntry *e = [[JJMenuEntry alloc] init];
     e.title = title ?: @"";
     e.symbol = symbol;
+    e.action = 0;        // 0 = 未指定，按位置下标回调（兼容）
     return e;
 }
 
@@ -83,9 +78,14 @@ static UIImage *JJLoadLogoImage(void) {
 @property (nonatomic, strong) UIView *backdrop;
 @property (nonatomic, strong) UIView *menuView;
 @property (nonatomic, strong) UIVisualEffectView *menuBlur;
+/* 2.1.80：二级面板容器（与一级菜单共用同一套 JJMenuStyle 外观） */
+@property (nonatomic, strong) UIView *sheetContainer;
+@property (nonatomic, assign, readwrite) BOOL sheetVisible;
 @property (nonatomic, assign) BOOL usesLogo;
 @property (nonatomic, assign, readwrite) BOOL menuVisible;
 @property (nonatomic, assign) NSInteger entryCount;
+/* 2.1.80：与 entries 一一对应的 action 标识（0 = 用位置下标） */
+@property (nonatomic, strong) NSMutableArray<NSNumber *> *entryActions;
 @property (nonatomic, strong) UILabel *toastLabel;
 @end
 
@@ -114,23 +114,12 @@ static UIImage *JJLoadLogoImage(void) {
 
         /* 菜单面板：毛玻璃 + 细边框。
            毛玻璃是「不遮挡视线」的关键 —— 底下的棋盘与棋子仍然透得出来。 */
+        /* 2.1.80：外观统一由 JJMenuStyle 的 JJMenuApplyPanelStyle 提供
+           （深色 UltraThin 毛玻璃 + 18pt 圆角 + 0.5pt 白 14% 描边 + 底层深色 30%），
+           二级面板走同一个函数，两级观感才能一致。 */
         _menuView = [[UIView alloc] initWithFrame:CGRectZero];
-        _menuView.layer.cornerRadius = 18.0;
-        _menuView.layer.borderWidth = 0.5;
-        _menuView.layer.borderColor = JJ_COLOR_BORDER.CGColor;
-        _menuView.clipsToBounds = YES;
+        JJMenuApplyPanelStyle(_menuView);
         _menuView.hidden = YES;
-        /* 底层只留一点深色保证文字对比度；真正的观感交给下面的 UltraThin 毛玻璃。
-           用 UltraThin（不是 Thin/Regular）是因为棋盘是暖色木纹，材质越薄越透，
-           底下的棋子才看得出来 —— 这是「不遮挡视线」的核心。 */
-        _menuView.backgroundColor = [UIColor colorWithRed:0.05 green:0.06 blue:0.09 alpha:0.30];
-
-        UIBlurEffect *eff = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
-        if (eff) {
-            _menuBlur = [[UIVisualEffectView alloc] initWithEffect:eff];
-            _menuBlur.userInteractionEnabled = NO;
-            [_menuView addSubview:_menuBlur];
-        }
         [self.rootViewController.view addSubview:_menuView];
 
         CGFloat d = kJJBallSize;
@@ -214,7 +203,12 @@ static UIImage *JJLoadLogoImage(void) {
 
 - (void)tapBall { if (self.onTap) self.onTap(); }
 
-- (void)closeMenuTap { [self hideMenu]; }
+- (void)closeMenuTap {
+    /* 有二级面板时先收二级（返回上一层），这是「层级不变」的关键：
+       点空白 = 退一层，不是一次全关。 */
+    if (self.sheetVisible) { [self dismissSheet]; return; }
+    [self hideMenu];
+}
 
 #pragma mark - 菜单
 
@@ -253,8 +247,11 @@ static UIImage *JJLoadLogoImage(void) {
     else y = MAX(topLimit, MIN(belowY, bottomLimit - h));
 
     self.menuView.frame = CGRectMake(x, y, w, h);
-    self.menuBlur.frame = self.menuView.bounds;
+    if (self.menuBlur) self.menuBlur.frame = self.menuView.bounds;
     self.entryCount = (NSInteger)entries.count;
+
+    self.entryActions = [NSMutableArray arrayWithCapacity:entries.count];
+    for (JJMenuEntry *e in entries) [self.entryActions addObject:@(e.action)];
 
     for (NSUInteger i = 0; i < entries.count; i++) {
         JJMenuEntry *e = entries[i];
@@ -276,25 +273,17 @@ static UIImage *JJLoadLogoImage(void) {
     self.menuVisible = YES;
 
     /* 轻微放大淡入，提示「从这里展开了」 */
-    self.menuView.alpha = 0.0;
-    self.menuView.transform = CGAffineTransformMakeScale(0.94, 0.94);
-    [UIView animateWithDuration:0.16 animations:^{
-        self.menuView.alpha = 1.0;
-        self.menuView.transform = CGAffineTransformIdentity;
-    }];
+    JJMenuAnimateIn(self.menuView);
 }
 
 /** 一个网格单元：SF Symbol 图标在上，短标签在下，状态用颜色和右侧小字表达。 */
 - (UIButton *)makeCellForEntry:(JJMenuEntry *)e rect:(CGRect)rect {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     b.frame = rect;
-    b.backgroundColor = [UIColor colorWithWhite:1 alpha:e.on ? 0.10 : 0.04];
-    b.layer.cornerRadius = 12.0;
-    b.layer.borderWidth = 0.5;
-    b.layer.borderColor = (e.on ? [JJ_COLOR_ON colorWithAlphaComponent:0.55]
-                               : [UIColor colorWithWhite:1 alpha:0.08]).CGColor;
+    JJMenuApplyCellStyle(b, e.on, e.warn);
 
-    UIColor *tint = e.warn ? JJ_COLOR_WARN : (e.on ? JJ_COLOR_ON : JJ_COLOR_IDLE);
+    UIColor *tint = e.warn ? JJMenuWarnColor()
+                           : (e.on ? JJMenuAccentColor() : JJMenuTextColor());
 
     /* 图标：SF Symbols（iOS 13+）。取不到就只显示文字，不留白块。 */
     UIImage *icon = nil;
@@ -323,14 +312,66 @@ static UIImage *JJLoadLogoImage(void) {
     UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(2, rect.size.height - 26,
                                                           rect.size.width - 4, 18)];
     lb.text = label;
-    lb.textColor = e.on ? tint : JJ_COLOR_TITLE;
-    lb.font = [UIFont systemFontOfSize:11.5 weight:(e.on ? UIFontWeightSemibold : UIFontWeightRegular)];
+    lb.textColor = e.on ? tint : JJMenuTextColor();
+    lb.font = JJMenuCellLabelFont(e.on);
     lb.textAlignment = NSTextAlignmentCenter;
     lb.adjustsFontSizeToFitWidth = YES;
     lb.minimumScaleFactor = 0.75;
     lb.userInteractionEnabled = NO;
     [b addSubview:lb];
     return b;
+}
+
+#pragma mark - 二级面板（2.1.80）
+
+- (void)showSheet:(UIView *)sheet {
+    if (!sheet) return;
+    [self hideMenu];                       // 一级收起，避免两层叠在一起
+    [self dismissSheet];
+
+    /* 宽度：与一级菜单同侧，最多 JJMenuSheetMaxW，屏幕窄时留 16pt 边距 */
+    CGRect scr = [UIScreen mainScreen].bounds;
+    UIEdgeInsets safe = UIEdgeInsetsZero;
+    if (@available(iOS 11.0, *)) safe = self.safeAreaInsets;
+    CGFloat w = MIN(JJMenuSheetMaxW, scr.size.width - 32.0);
+    /* 高度由调用方用它自己的 rows 算好（JJMenuSheet +heightForWidth:rows:hasSubtitle:），
+       这里只读不算 —— 免得两处各算一遍又不一致。 */
+    CGFloat h = sheet.frame.size.height;
+    if (h <= 0) h = 240.0;
+
+    BOOL rightSide = CGRectGetMidX(self.ball.frame) > scr.size.width / 2.0;
+    CGFloat x = rightSide ? (scr.size.width - w - 8.0 - safe.right) : (8.0 + safe.left);
+
+    CGFloat belowY = CGRectGetMaxY(self.ball.frame) + 10.0;
+    CGFloat aboveY = CGRectGetMinY(self.ball.frame) - 10.0 - h;
+    CGFloat topLimit = safe.top + 10.0;
+    CGFloat bottomLimit = scr.size.height - safe.bottom - 10.0;
+    CGFloat y;
+    if (belowY + h <= bottomLimit) y = belowY;
+    else if (aboveY >= topLimit) y = aboveY;
+    else y = MAX(topLimit, MIN(belowY, bottomLimit - h));
+
+    sheet.frame = CGRectMake(x, y, w, h);
+    /* 面板自己再套一次样式也无害（幂等），但容器不再另加背景，
+       保证二级与一级用的是同一份 JJMenuStyle。 */
+    [self.rootViewController.view addSubview:sheet];
+    self.sheetContainer = sheet;
+    self.sheetVisible = YES;
+    self.backdrop.hidden = NO;
+    JJMenuAnimateIn(sheet);
+}
+
+- (void)dismissSheet {
+    if (!self.sheetContainer) {
+        self.sheetVisible = NO;
+        return;
+    }
+    UIView *v = self.sheetContainer;
+    self.sheetContainer = nil;
+    self.sheetVisible = NO;
+    [UIView animateWithDuration:0.12 animations:^{ v.alpha = 0.0; }
+                     completion:^(BOOL finished) { [v removeFromSuperview]; }];
+    if (!self.menuVisible) self.backdrop.hidden = YES;
 }
 
 - (void)hideMenu {
@@ -350,6 +391,16 @@ static UIImage *JJLoadLogoImage(void) {
     NSInteger idx = b.tag - 100;
     if (idx < 0 || idx >= self.entryCount) return;
 
+    /* 2.1.80：优先用菜单项自带的 action 标识，而不是位置下标。
+       位置下标会在「菜单顺序调整」时错位 —— 2.1.78 就是这样让
+       点「HUD」执行了「重置开局」，成了「HUD 开关不起作用」的根因。
+       action 为 0（未设置）时回退到下标，保证旧调用方仍可用。 */
+    NSInteger action = idx;
+    if (idx < (NSInteger)self.entryActions.count) {
+        NSInteger tagged = [self.entryActions[(NSUInteger)idx] integerValue];
+        if (tagged != 0) action = tagged;
+    }
+
     /* 先给一次明确的视觉反馈再收起。
        旧版点完立刻 hideMenu，加上很多动作的反馈只落在 HUD 上（HUD 关掉时就完全没反馈），
        用户会觉得「点了没反应」。现在按钮自己先亮一下。 */
@@ -361,7 +412,7 @@ static UIImage *JJLoadLogoImage(void) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         [s2 hideMenu];
-        if (s2.onMenuItem) s2.onMenuItem(idx);
+        if (s2.onMenuItem) s2.onMenuItem(action);
     });
 }
 
@@ -464,9 +515,11 @@ static UIImage *JJLoadLogoImage(void) {
     if (!v) return nil;
     /* ① 球（含状态点）始终可交互 */
     if (v == self.ball || [v isDescendantOfView:self.ball]) return v;
-    /* ② 菜单打开时，遮罩与菜单项可交互 */
+    /* ② 菜单 / 二级面板打开时，遮罩与其中的控件可交互 */
     if (self.menuVisible &&
         (v == self.backdrop || [v isDescendantOfView:self.menuView])) return v;
+    if (self.sheetVisible && self.sheetContainer &&
+        (v == self.backdrop || [v isDescendantOfView:self.sheetContainer])) return v;
     /* ③ 有模态弹窗在场 → 全窗放行，否则弹窗点不动（见上面的说明） */
     if (self.rootViewController.presentedViewController) return v;
     /* ④ 其余透传给下层 window（游戏画面） */
