@@ -144,9 +144,10 @@ function main() {
 
   /* F 段要直接调识别器的 alignGridToOpening：bundle 模板里有
      __JJ_TEST_HOOK__ 钩子，engine.js 装载时把 REC/TRK 模块递出来 */
-  global.__JJ_TEST_HOOK__ = function (RECm, TRKm) {
+  global.__JJ_TEST_HOOK__ = function (RECm, TRKm, utilm) {
     global.__REC = RECm;
     global.__TRK = TRKm;
+    global.__UTIL = utilm;
   };
 
   console.log('========== A. 执红：红先手 + 走子轮次 + 噪声门槛 + 派出去重 ==========');
@@ -437,6 +438,64 @@ function main() {
     console.log('F1 偏移修复: 命中=%d/32 平移=%d,%d | F2 空盘拒绝: 命中=%d | F3 already: 命中=%d',
       r1.occHit, r1.shiftX, r1.shiftY, r2.occHit, r3.occHit);
     console.log('G 浅木皮肤: 判有子=%d/32 | 自举后与标准开局差=%d 格', occG, diffG);
+  }
+
+  /* ================================================================
+   * H. 2.1.76 引擎安全闸 + 走法规则校验
+   *
+   * 守两件事：
+   *   ① 缺王 / 王可被吃的盘面绝不能喂给 Pikafish —— 引擎会拒绝
+   *      （"Incorrect number of kings" / "King can be captured"），
+   *      而 2.1.75 及之前 UCIEngine::position 失败会 std::exit(1)，
+   *      把整个 App 一起杀掉（真机 .ips thread 73，HANDOFF §14）。
+   *   ② 锚盘推进时必须验证走法形状 —— 1.1.44 起 isLegal/genLegalMoves
+   *      一次都没被调用过，马别腿/炮没炮架/仕出宫都能当"真走法"推进锚盘，
+   *      这是「瞎指挥」的长尾来源。
+   * ================================================================ */
+  console.log('');
+  console.log('========== H. 引擎安全闸（王=1 / 王不可被吃）+ 走法规则校验 ==========');
+  {
+    const U = global.__UTIL;
+    if (!U || !U.codesEngineSafe) throw new Error('测试钩子未注入 codesEngineSafe');
+    const TRKM = global.__TRK;
+    const opn = TRKM.startPieceMap();
+
+    /* H1 标准开局 → 必须放行 */
+    if (!U.codesEngineSafe(opn, 'red')) throw new Error('H1 标准开局应放行（red）');
+    if (!U.codesEngineSafe(opn, 'black')) throw new Error('H1 标准开局应放行（black）');
+
+    /* H2 缺红帅 → 必须拒绝（引擎 "Incorrect number of kings"） */
+    const noRK = opn.slice(); noRK[9 * 9 + 4] = 0;
+    if (U.codesEngineSafe(noRK, 'red')) throw new Error('H2 缺红帅必须拒绝');
+
+    /* H3 多一个黑将 → 必须拒绝 */
+    const twoBK = opn.slice(); twoBK[0 * 9 + 3] = 8;
+    if (U.codesEngineSafe(twoBK, 'red')) throw new Error('H3 双黑将必须拒绝');
+
+    /* H4 红车正将黑将（同列无阻挡）→ 必须拒绝（引擎 "King can be captured"） */
+    const pin = new Array(90).fill(0);
+    pin[0 * 9 + 4] = 8;    // 黑将 row0,col4
+    pin[8 * 9 + 4] = 5;    // 红车 row8,col4（同一列，中间全空）
+    pin[9 * 9 + 4] = 1;    // 红帅 row9,col4
+    if (U.codesEngineSafe(pin, 'red')) throw new Error('H4 红车正将黑将必须拒绝');
+
+    /* H5 马二进三（(9,1)→(7,2)）→ 规则合法 */
+    if (!U.stepIsRuleLegal(opn, 9 * 9 + 1, 7 * 9 + 2)) {
+      throw new Error('H5 马二进三应判为合法');
+    }
+
+    /* H6 马横着走（(9,1)→(9,4)）→ 形状不合法，必须拒绝 */
+    if (U.stepIsRuleLegal(opn, 9 * 9 + 1, 9 * 9 + 4)) {
+      throw new Error('H6 马横走必须拒绝（马腿/形状校验失效）');
+    }
+
+    /* H7 车穿过自己的兵 → 必须拒绝 */
+    if (U.stepIsRuleLegal(opn, 9 * 9 + 0, 6 * 9 + 0)) {
+      throw new Error('H7 车穿过己方兵必须拒绝');
+    }
+
+    console.log('H1 开局放行 | H2 缺帅拒绝 | H3 双将拒绝 | H4 王可被吃拒绝');
+    console.log('H5 马二进三合法 | H6 马横走拒绝 | H7 车穿子拒绝');
   }
 
   console.log('');

@@ -547,26 +547,33 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
     [self writeLine:[NSString stringWithFormat:@"go movetime %ld",
                      (long)self.searchingMovetime]];
 
-    /* 看门狗：movetime + 宽限期仍无 bestmove → 停止引擎，丢一次结果。
-       进程内引擎卡死不能 kill，只能 quit 后由下一轮重新拉起。 */
+    /* 看门狗：movetime + 宽限期仍无 bestmove → 让引擎停下，丢一次结果。
+       2.1.76 卡顿修复：旧逻辑在这里 jjpika_stop() + state=Dead，
+       下一轮 analyzeFen 走 launchOnQueue() → 重新 mmap 50MB 权重 + 重新 UCI 握手，
+       真机上就是 2~4 秒卡死，而且 NNUE 校验慢的话会反复触发、越卡越频繁。
+       现在只发 UCI `stop`：引擎线程、权重、置换表全部保活，状态回 Ready。
+       只有引擎线程真的退出了（jjpika_running()==0）才标记 Dead 等重新拉起。
+       发 stop 后引擎会回 bestmove，handleBestmoveOnQueue 末尾会自动 flush 下一个请求。 */
     __weak typeof(self) weakSelf = self;
     NSInteger mt = self.searchingMovetime;
     self.watchdog = dispatch_block_create(0, ^{
         __strong typeof(weakSelf) self2 = weakSelf;
         if (!self2 || self2.state != JJPikaStateSearching) return;
-        NSLog(@"%@ 看门狗超时（movetime=%ldms 无 bestmove），重启引擎", kPikaLog, (long)mt);
         JJPikaResultBlock cb = self2.searchingCb;
-        JJPikaResultBlock pcb = self2.pendingCb;
         self2.searchingCb = nil;
-        self2.pendingCb = nil;
         self2.searchingFen = nil;
-        self2.pendingFen = nil;
-        jjpika_stop();
-        self2.engineThreadRunning = NO;
-        self2.readerRunning = NO;
-        self2.state = JJPikaStateDead;
+        self2.state = JJPikaStateReady;      // 保活：不要回到 Starting/Dead
+        [self2 writeLine:@"stop"];
+        NSLog(@"%@ 看门狗超时（movetime=%ldms 无 bestmove）→ 发 stop 保活引擎（不重载权重）",
+              kPikaLog, (long)mt);
+        if (!jjpika_running()) {
+            NSLog(@"%@ 引擎线程确实已退出 → Dead，等下一轮重新拉起", kPikaLog);
+            self2.state = JJPikaStateDead;
+            self2.engineThreadRunning = NO;
+            self2.readerRunning = NO;
+        }
         if (cb) dispatch_async(dispatch_get_main_queue(), ^{ cb(nil); });
-        if (pcb) dispatch_async(dispatch_get_main_queue(), ^{ pcb(nil); });
+        /* pending 不清：stop 之后 bestmove 到达时 handleBestmoveOnQueue 会 flush 它 */
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                      (int64_t)((mt + KIKA_BESTMOVE_GRACE_MS) * 1000000ull)),

@@ -401,9 +401,11 @@ static NSString *JJFormatNodes(NSInteger nodes) {
         self.lineMain.text = @"引擎思考中…";
         self.lineScore.text = @"";
     } else if (blocked.length) {
-        /* 引擎自己拒绝了本次搜索（网络没加载上 / 引擎异常）。
-           这时说「视角未对齐」是误导 —— 识别可能是好的，只是没有建议可画。 */
-        self.lineMain.text = [NSString stringWithFormat:@"引擎%@ · 点球看⑥详情", blocked];
+        /* 引擎自己拒绝了本次搜索（网络没加载上 / 引擎异常），或识别侧主动拦下
+           （王将不唯一）。这时说「视角未对齐」是误导 —— 原因很具体，直接说。 */
+        self.lineMain.text = [blocked hasPrefix:@"引擎"]
+            ? [NSString stringWithFormat:@"%@ · 点球看⑥详情", blocked]
+            : blocked;
         self.lineScore.text = @"";
     } else {
         self.lineMain.text = @"视角未对齐 · 请回开局画面";

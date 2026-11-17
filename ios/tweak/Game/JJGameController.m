@@ -932,9 +932,14 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
        那句话把人往识别方向引，而实际问题在引擎。这里明确区分开。 */
     NSString *notice = [JJPikafish shared].lastEngineNotice;
     if ([notice hasPrefix:@"JJ-NNUE FAIL"]) {
-        disp[@"engineBlocked"] = @"网络未就绪";
+        disp[@"engineBlocked"] = @"引擎网络未就绪";
     } else if ([[JJPikafish shared] state] == JJPikaStateDead) {
         disp[@"engineBlocked"] = @"引擎不可用";
+    } else if ([rec[@"skipReason"] isEqualToString:@"king"]) {
+        /* 2.1.76：识别侧主动拦下了这一帧（王/将不唯一，或走子方能吃对方王）。
+           这种盘面 Pikafish 会拒绝，以前会让它 exit 拆掉 App。
+           现在只是这一帧不发搜索 —— 明确告诉用户是识别在等，不是视角问题。 */
+        disp[@"engineBlocked"] = @"识别待确认 · 王将不唯一";
     }
     disp[@"sideToMove"] = rec[@"sideToMove"] ?: (waiting ? @"black" : @"red");
     [[JJHUDWindow shared] showResult:disp

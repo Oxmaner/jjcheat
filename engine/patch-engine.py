@@ -353,6 +353,139 @@ ENGINE_CPP_VERIFY_CALL_NEW = """        if (onVerifyNetwork)
 }"""
 
 
+# ---------------------------------------------------------------
+# 4) uci.cpp —— 第二个 exit 路径（2.1.76）
+#
+# 2.1.75 真机 .ips thread 73 的证据链：
+#   exit ← __cxa_finalize_ranges ← operator delete ← UCIEngine::loop
+#   ← UCIEngine::position ← UCIEngine::terminate_on_critical_error
+# 即「识别出的 FEN 非法 → position 解析失败 → terminate_on_critical_error
+# 里 std::exit(1) → 把宿主 App 一起拆掉」。这和 2.1.68 修的 Network::verify
+# 是同一类问题：Pikafish 假设自己是独立进程，任何致命错误都可以 exit。
+#
+# 改法：不 exit，改成「打一行 JJ-FATAL + 置标志」，由 loop 的 go 分支拦住
+# 后续搜索，回一个占位 bestmove 让上层正常收尾。
+# 为什么必须拦住 go：Engine::set_position 第一行就丢弃旧局面
+#   states = StateListPtr(new std::deque<StateInfo>(1));
+# 解析失败时局面已经是残缺的，继续 start_thinking 会搜一个非法局面。
+# ---------------------------------------------------------------
+UCI_CPP_FLAG_OLD = """namespace Stockfish {
+
+using Time = std::chrono::steady_clock;
+using ms   = std::chrono::milliseconds;"""
+UCI_CPP_FLAG_NEW = """namespace Stockfish {
+
+using Time = std::chrono::steady_clock;
+using ms   = std::chrono::milliseconds;
+
+// JJCheat: position 解析失败后局面是残缺的（Engine::set_position 第一行就丢弃
+// 旧局面）。置位后由 loop 的 go 分支拦住搜索，避免对着非法局面 start_thinking。
+// 常量初始化：无动态初始化、无析构，跨静态初始化阶段也安全。
+static bool jjPositionBroken = false;"""
+
+UCI_CPP_GO_OLD = """        else if (token == "go")
+        {
+            // send info strings after the go command is sent for old GUIs and python-chess
+            print_info_string(engine.numa_config_information_as_string());
+            print_info_string(engine.thread_allocation_information_as_string());
+            go(is);
+        }"""
+UCI_CPP_GO_NEW = """        else if (token == "go")
+        {
+            // JJCheat: 上一次 position 解析失败 → 局面残缺，绝不能搜索。
+            // 回一个占位 bestmove，让上层（JJPikafish）正常收尾：
+            // 它会清掉看门狗并把状态恢复成 Ready，于是不会重启引擎、
+            // 不会重新 mmap 50MB 权重（那是「思考卡顿」的主因）。
+            if (jjPositionBroken)
+            {
+                jjPositionBroken = false;
+                sync_cout << "info string JJ-SKIP: previous `position` failed, search skipped"
+                          << sync_endl;
+                sync_cout << "bestmove (none)" << sync_endl;
+                continue;
+            }
+            // send info strings after the go command is sent for old GUIs and python-chess
+            print_info_string(engine.numa_config_information_as_string());
+            print_info_string(engine.thread_allocation_information_as_string());
+            go(is);
+        }"""
+
+UCI_CPP_TERM_OLD = """void UCIEngine::terminate_on_critical_error(const std::string& message) {
+    sync_cout << "info string CRITICAL ERROR: Command `" << currentCmd
+              << "` failed. Reason: " << message << '\\n'
+              << sync_endl;
+    std::exit(1);
+}"""
+UCI_CPP_TERM_NEW = """void UCIEngine::terminate_on_critical_error(const std::string& message) {
+    // JJCheat: 原本这里还有 std::exit(1)。我们是进程内引擎，
+    // 那个 exit 会把宿主 App 一起杀掉（2.1.75 真机 .ips thread 73 就停在这）。
+    // 现在只报告 + 置标志，由 loop 的 go 分支拒绝搜索。
+    sync_cout << "info string JJ-FATAL: Command `" << currentCmd
+              << "` failed. Reason: " << message << '\\n'
+              << sync_endl;
+    jjPositionBroken = true;
+}"""
+
+# ---------------------------------------------------------------
+# 5) tt.cpp —— 置换表分配失败不能 exit（2.1.76）
+#
+# iOS 上 64MB 连续大页分配不是必成。Pikafish 原生失败就 exit(EXIT_FAILURE)，
+# 进程内引擎等于直接杀 App。改成逐级减半重试，最小 8MB；
+# 全部失败就留空表继续跑（只是慢，不会崩、也不会给错着法）。
+# ---------------------------------------------------------------
+TT_CPP_OLD = """void TranspositionTable::resize(usize mbSize, ThreadPool& threads) {
+    aligned_large_pages_free(table);
+
+    clusterCount  = mbSize * 1024 * 1024 / sizeof(Cluster);
+    usize ttBytes = clusterCount * sizeof(Cluster);
+
+    // Request 1GB pages if we'd get at least eight per NUMA node, to avoid
+    // memory oversubscription
+    bool hugePageHint = ttBytes >= threads.numa_nodes() * HugePageSize * 8;
+
+    table = static_cast<Cluster*>(aligned_large_pages_alloc_with_hint(ttBytes, hugePageHint));
+
+    if (!table)
+    {
+        std::cerr << "Failed to allocate " << mbSize << "MB for transposition table." << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    clear(threads);
+}"""
+
+TT_CPP_NEW = """void TranspositionTable::resize(usize mbSize, ThreadPool& threads) {
+    aligned_large_pages_free(table);
+    table = nullptr;
+
+    // JJCheat: 原本分配失败就 exit(EXIT_FAILURE)，进程内引擎等于直接杀 App。
+    // iOS 上连续大块分配不保证成功，所以逐级减半重试；都失败就留空表继续跑。
+    usize tryMb = mbSize;
+    while (tryMb >= 8)
+    {
+        clusterCount             = tryMb * 1024 * 1024 / sizeof(Cluster);
+        const usize   ttBytes    = clusterCount * sizeof(Cluster);
+        const bool    hugePageHint = ttBytes >= threads.numa_nodes() * HugePageSize * 8;
+        table = static_cast<Cluster*>(aligned_large_pages_alloc_with_hint(ttBytes, hugePageHint));
+        if (table)
+        {
+            if (tryMb != mbSize)
+                sync_cout << "info string JJ-TT: hash downgraded "
+                          << mbSize << "MB -> " << tryMb << "MB (allocation failed)"
+                          << sync_endl;
+            clear(threads);
+            return;
+        }
+        tryMb /= 2;
+    }
+
+    // 连 8MB 都拿不到：留空表。搜索仍然正确，只是没有置换表剪枝（更慢）。
+    clusterCount = 0;
+    sync_cout << "info string JJ-TT: no transposition table (allocation failed), "
+              << "search continues without TT" << sync_endl;
+}"""
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: patch-engine.py <pikafish src 目录>", file=sys.stderr)
@@ -402,6 +535,27 @@ def main():
     for n in need:
         if n not in text:
             errors.append(f"network.cpp: read_parameters 改造不完整，缺 {n!r}")
+
+    patch(src / "uci.cpp", "uci.cpp", [
+        (UCI_CPP_FLAG_OLD, UCI_CPP_FLAG_NEW),
+        (UCI_CPP_GO_OLD, UCI_CPP_GO_NEW),
+        (UCI_CPP_TERM_OLD, UCI_CPP_TERM_NEW),
+        # position 成功 → 局面已重建，清掉历史错误标志
+        ("""    auto err = engine.set_position(fen, moves);
+    if (err.has_value())
+        terminate_on_critical_error(err->what());
+}""",
+         """    auto err = engine.set_position(fen, moves);
+    if (err.has_value())
+        terminate_on_critical_error(err->what());
+    else
+        jjPositionBroken = false;   // JJCheat: 局面已重建，清掉历史错误
+}"""),
+    ])
+
+    patch(src / "tt.cpp", "tt.cpp", [
+        (TT_CPP_OLD, TT_CPP_NEW),
+    ])
 
     patch(src / "engine.h", "engine.h", [
         (ENGINE_H_OLD, ENGINE_H_NEW),

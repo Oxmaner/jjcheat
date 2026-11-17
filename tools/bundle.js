@@ -285,6 +285,74 @@ function codesPositionPlausible(codes) {
   return true;
 }
 
+/**
+ * 引擎安全校验（2.1.76）——「这一帧能不能喂给 Pikafish」，与「能不能显示」分开
+ *
+ * 为什么不直接并进 codesLegal：历史上加过「王必须各 1 个」，结果红帅被高亮圈
+ * 遮住一帧就整盘作废、浮窗直接冻住不动（见 validateCodes 的注释）。显示层
+ * 必须宽松，否则偶发漏读会让程序看起来死掉了。
+ *
+ * 但这一层绝对不能宽松 —— Pikafish 的 Position::set() 会拒绝两类盘面：
+ *   王数量不为 1        → "Unsupported position. Incorrect number of kings."
+ *   走子方正在将军对方  → "Unsupported position. King can be captured."
+ * 而 UCIEngine::position() 失败后会走 terminate_on_critical_error：
+ * 2.1.75 及之前那里是 std::exit(1)，直接把宿主 App 一起拆掉
+ * （真机 .ips thread 73 的证据链，见 HANDOFF §14）；
+ * 2.1.76 起补丁改成「打 JJ-FATAL + 拒绝搜索」，虽然不再崩，
+ * 但这次搜索必然作废 —— 等于白白浪费一次思考，还让 HUD 抖一下。
+ * 所以：宁可这一帧不给建议，也绝不把非法 FEN 发给引擎。
+ *
+ * @param {Array|Int8Array} codes 引擎坐标（红在下）
+ * @param {string} sideToMove 'red' | 'black'
+ */
+function codesEngineSafe(codes, sideToMove) {
+  var rk = 0, bk = 0;
+  for (var i = 0; i < 90; i++) {
+    if (codes[i] === 1) rk++;
+    else if (codes[i] === 8) bk++;
+  }
+  if (rk !== 1 || bk !== 1) return false;
+  try {
+    var fen = codesToBoardFen(codes) + ' ' + (sideToMove === 'black' ? 'b' : 'w') + ' - - 0 1';
+    var pos = new POS.Position(fen);
+    // inCheck(对方) 为真 = 我方正将着对方 = 这盘面不许出现（对方上一手不该走成被将）
+    if (pos.inCheck(pos.side ^ 1)) return false;
+  } catch (e) {
+    return false;    // 连 Position 都建不起来，更不能喂引擎
+  }
+  return true;
+}
+
+/**
+ * 这一步棋在规则上真的走得通吗（2.1.76）
+ *
+ * analyzeStepDiff 只验「代数结构」：from 格变空、to 格出现同一个子、不吃己方。
+ * 它**不验走法形状** —— 马别腿、炮没炮架、仕走出九宫、车穿过别的子，全都能过。
+ * 整份 bundle.js 里 isLegal / genLegalMoves 从 1.1.44 起一次都没被调用过，
+ * 所以网格噪声凑出来的「伪走法」会被当成真走法推进锚盘，之后越错越远，
+ * 引擎就对着这张越来越离谱的盘面算 —— 这就是「瞎指挥」的长尾来源。
+ *
+ * 这里用 Position.genLegalMoves() 严格比对（内部先按形状生成候选，
+ * 再用 isLegal 过滤「走完自己被将军」）。命中才算真走法。
+ *
+ * @param {Array} codes 走子前的盘面（引擎坐标，红在下）
+ */
+function stepIsRuleLegal(codes, from, to) {
+  try {
+    var piece = codes[from] || 0;
+    if (!piece) return false;
+    // 红在下坐标系里：红子(1..7) 走 w，黑子(8..14) 走 b
+    var side = piece <= 7 ? 'w' : 'b';
+    var pos = new POS.Position(codesToBoardFen(codes) + ' ' + side + ' - - 0 1');
+    var want = from | (to << 7);
+    var legal = pos.genLegalMoves();
+    for (var i = 0; i < legal.length; i++) {
+      if (legal[i] === want) return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
 /** 棋盘 FEN → 90 格 codes（开局锚定用） */
 function boardFenToCodes(fen) {
   var out = new Array(90).fill(0);
@@ -478,7 +546,7 @@ var JJEngine = {
   /* 2.1.58：开局匹配滤波对齐（alignGridToOpening）。标记必须变：
      容器里那份 engine.js 只认「缺当前标记 → 覆盖升级」，标记不变 = 2.1.57
      的旧脚本一直被用下去，新对齐逻辑根本跑不到。 */
-  featureMark: 'pikafishNative2168',
+  featureMark: 'pikafishNative2176',
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
@@ -1504,10 +1572,13 @@ var JJEngine = {
       if (!reseat) {
         var nextAnchor = anchor.slice();
         if (stepInfo.move) {
+          // 2.1.76：先用规则验证这一步真走得通（马腿/炮架/仕出宫/车穿子），
+          // 只靠 codesLegal + codesPositionPlausible 拦不住这些。
+          var ruleOk = stepIsRuleLegal(anchor, stepInfo.move.from, stepInfo.move.to);
           nextAnchor[stepInfo.move.from] = 0;
           nextAnchor[stepInfo.move.to] = stepInfo.move.piece;
           // 一步棋不该把相/兵/将推到规则外，否则宁可当作噪声丢弃
-          if (codesLegal(nextAnchor) && codesPositionPlausible(nextAnchor)) {
+          if (ruleOk && codesLegal(nextAnchor) && codesPositionPlausible(nextAnchor)) {
             session.prevAnchorFen = session.anchorFen;   // 走子前盘面，供中文记谱
             anchor = nextAnchor;
             session.anchorCodes = nextAnchor;
@@ -1782,6 +1853,23 @@ var JJEngine = {
     var analyzeFen = directFen ||
         ((session.lastBoardFen || session.tracker.fen.split(' ')[0]) + ' ' +
          turnChar + ' - - 0 1');
+
+    /* 2.1.76：喂引擎前的最后一道闸。
+       王必须各恰好 1 个，且走子方不能已经能吃对方王 —— 这两类盘面 Pikafish
+       会直接拒绝（"Incorrect number of kings" / "King can be captured"），
+       而 2.1.75 及之前 UCIEngine::position 失败会 std::exit(1)，把整个 App
+       带走（真机 .ips thread 73，HANDOFF §14）。
+       2.1.76 起引擎侧补丁已改为「不 exit、拒绝搜索」，但那次思考就白费了，
+       所以识别侧也要自己拦住：这一帧干脆不发搜索，下一帧再来。
+       注意这里只拦「喂引擎」，不影响浮窗继续显示上一帧合法盘面。 */
+    var engCheck = session.anchorCodes || null;
+    if (engCheck && !codesEngineSafe(engCheck, turnChar === 'b' ? 'black' : 'red')) {
+      out.skipReason = 'king';
+      out.needSearch = 0;
+      out.searchFen = '';
+      return out;
+    }
+
     out.searchFen = analyzeFen;
     out.needSearch = (analyzeFen !== session.lastDispatchedFen) ? 1 : 0;
     if (out.needSearch) session.lastDispatchedFen = analyzeFen;
@@ -1818,7 +1906,11 @@ var JJEngine = {
 
 global.JJEngine = JJEngine;
 /* 仅离线回归用：宿主注入钩子时暴露识别器与开局表（生产环境不设置，零开销） */
-if (typeof global.__JJ_TEST_HOOK__ === 'function') global.__JJ_TEST_HOOK__(REC, TRK);
+if (typeof global.__JJ_TEST_HOOK__ === 'function')
+  global.__JJ_TEST_HOOK__(REC, TRK, {
+    codesEngineSafe: codesEngineSafe,
+    stepIsRuleLegal: stepIsRuleLegal
+  });
 if (typeof module !== 'undefined' && module.exports) module.exports = JJEngine;
 
 })(typeof globalThis !== 'undefined' ? globalThis : this);

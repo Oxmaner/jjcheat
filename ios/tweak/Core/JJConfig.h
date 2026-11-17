@@ -10,7 +10,9 @@
    2.1.0 换成独立进程 Pikafish 后默认 800ms：48MB 的 NNUE 大网络，
    旧 JS 时代的 200ms 连置换表都填不满，纯属白瞎这颗引擎。
    下限 100ms（再短不如直接看棋谱），上限 3000ms（手机发烫的临界）。 */
-#define JJ_THINK_MS_DEFAULT     800
+/* 2.1.76：800 → 650。800ms 满载搜索与游戏渲染抢核，落子后有明显掉帧；
+   650ms 在象棋上强度几乎无感差异，但单步占用 CPU 少两成。 */
+#define JJ_THINK_MS_DEFAULT     650
 #define JJ_THINK_MS_MIN         100
 #define JJ_THINK_MS_MAX         3000
 
@@ -33,8 +35,12 @@
 #define JJ_FRAME_DIFF_THRESHOLD 260
 
 /* process 调用节流（秒）。2.0 起帧序号 + 指纹已经保证不重复喂同一帧，
-   这里只留一道很小的保险，防止回调刚落地又立刻发下一轮。 */
-#define JJ_PROCESS_MIN_GAP      0.2
+   这里只留一道很小的保险，防止回调刚落地又立刻发下一轮。
+   2.1.76 卡顿优化：0.2 → 0.35。每轮 process 要 memcpy 14MB 进 JS 再跑全盘
+   模板匹配，5 次/秒在 iOS 上和游戏抢 CPU；3 次/秒肉眼无差别。
+   注意：真实走子靠帧指纹识别，降频不影响「对方走完给提示」的及时性
+   （指纹变了就立刻处理，不看这个间隔）。 */
+#define JJ_PROCESS_MIN_GAP      0.35
 /* 盘面彻底不可信（JS 明确 skipAnalyze）时才退避，正常噪声帧不再退避：
    噪声帧由 JS 侧锚盘覆盖并命中结论缓存，退避只会拖慢真实走子的响应。 */
 #define JJ_PROCESS_ILLEGAL_GAP  2.5
@@ -95,8 +101,11 @@
 /* NNUE 权重文件名。必须与 Pikafish 的 EvalFileDefaultName 一致：
    引擎会在 argv[0] 所在目录按这个名字找。 */
 #define JJ_PIKA_NET_NAME        @"pikafish.nnue"
-/* 哈希表 MB。手机别给太大：64MB 进程内内存，与游戏共用地址空间但独立分配 */
-#define JJ_PIKA_HASH_MB         64
+/* 哈希表 MB。手机别给太大：进程内内存，与游戏共用地址空间但独立分配。
+   2.1.76：64 → 48。iOS 上 64MB 连续大块分配不保证成功，失败时 Pikafish 原生
+   会 exit（已用补丁改成降级），但降级后哈希变小、搜索变弱。
+   48MB 对齐象棋每步 800ms 的搜索量已经绰绰有余，分配成功率明显更高。 */
+#define JJ_PIKA_HASH_MB         48
 /* 引擎状态小圆点刷新间隔（秒） */
 #define JJ_ENGINE_DOT_GAP       2.0
 
