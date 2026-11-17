@@ -26,26 +26,10 @@ int JJSqFromICCS(NSString *iccs, int idx) {
     return JJSqFromTwo([iccs characterAtIndex:o], [iccs characterAtIndex:o + 1]);
 }
 
-NSString *JJICCASToInternalUcci(NSString *iccs) {
-    if (iccs.length < 4) return nil;
-    int from = JJSqFromICCS(iccs, 0);
-    int to = JJSqFromICCS(iccs, 1);
-    if (from < 0 || to < 0) return nil;
-    return [NSString stringWithFormat:@"%c%d%c%d",
-            (char)('a' + from % 9), from / 9,
-            (char)('a' + to % 9), to / 9];
-}
-
-NSString *JJInternalUcciToICCS(NSString *ucci) {
-    if (ucci.length < 4) return nil;
-    int fCol = (int)[ucci characterAtIndex:0] - 'a';
-    int fRow = (int)[ucci characterAtIndex:1] - '0';
-    int tCol = (int)[ucci characterAtIndex:2] - 'a';
-    int tRow = (int)[ucci characterAtIndex:3] - '0';
-    if (fCol < 0 || fCol > 8 || fRow < 0 || fRow > 9) return nil;
-    if (tCol < 0 || tCol > 8 || tRow < 0 || tRow > 9) return nil;
-    return [NSString stringWithFormat:@"%c%d%c%d",
-            (char)('a' + fCol), 9 - fRow, (char)('a' + tCol), 9 - tRow];
+int JJSqRotate180(int sq) {
+    if (sq < 0 || sq >= 90) return -1;
+    int r = sq / 9, c = sq % 9;
+    return (9 - r) * 9 + (8 - c);
 }
 
 /* ============================================================

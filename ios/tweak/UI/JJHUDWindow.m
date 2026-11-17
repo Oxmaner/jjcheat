@@ -9,6 +9,7 @@
 
 #import "JJHUDWindow.h"
 #import "JJConfig.h"
+#import "JJCopy.h"
 #import <math.h>
 
 /* ============================================================

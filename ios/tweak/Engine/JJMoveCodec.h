@@ -26,11 +26,28 @@ NS_ASSUME_NONNULL_BEGIN
     idx: 0 = 起点, 1 = 终点。 */
 int JJSqFromICCS(NSString *iccs, int idx);
 
-/** 标准 ICCS "h2e2" → 内部 ucci "h7e7"（rank 逐位翻转）。非法返回 nil。 */
-NSString *JJICCASToInternalUcci(NSString *iccs);
-
-/** 内部 ucci "h7e7" → 标准 ICCS "h2e2"。非法返回 nil。 */
-NSString *JJInternalUcciToICCS(NSString *ucci);
+/** 内部 sq → 屏幕 sq（旋转 180°）：sq' = (9 - row) * 9 + (8 - col)。
+ *
+ *  【为什么必须有这个函数】这是「我方执黑时箭头指向对角」的唯一修法。
+ *
+ *  引擎坐标（本文件的内部 sq / ICCS 换算结果）永远是「红在下」；
+ *  而屏幕坐标（JJCalibrator.gridPts）的 row 0 是用户点按的顶边。
+ *  我方执黑时用户在屏幕上看的是翻转后的盘面：
+ *
+ *      recognizer 读到的屏幕 90 格
+ *          → flipCodes() 旋转 180° 　→ 引擎坐标（组 FEN 用）
+ *          → 引擎算出 bestmove（ICCS）
+ *          → JJSqFromICCS() 得到**引擎坐标**的 from/to
+ *
+ *  但画箭头时用的是 gridPts（**屏幕坐标**），中间少了反方向的旋转，
+ *  于是行和列同时反向 → 箭头指向棋盘对角。
+ *  注意必须是 180° 旋转（行列都反），不是上下翻转：
+ *  九宫左右对称，只翻行的话合法性检查发现不了，但整盘列全错。
+ *
+ *  用法：`if (flipped) sq = JJSqRotate180(sq);` 再取 gridPts[sq]。
+ *  同一个函数正反都能用（旋转 180° 两次等于不变），不要另写逆变换，
+ *  否则两处实现迟早分叉 —— 这正是这次 bug 的成因。 */
+int JJSqRotate180(int sq);
 
 /** 中文记谱（「炮二平五」）。
     boardFen = 棋盘部分或完整 FEN（10 行斜杠分隔，第 1 行 = 屏幕最上）。

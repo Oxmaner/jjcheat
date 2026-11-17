@@ -68,12 +68,19 @@ function makeFixture(src, blackBottom) {
   let engCodes = S0.slice();
 
   /** 把引擎坐标 codes 包成 recognizer.classify 的返回结构 */
+  let lowConfCells = 0;      /* 2.1.79：测试注入的「低置信度有子格」数量 */
   function classifyResult(codes) {
     const grid = new Int8Array(90);
     const conf = new Float32Array(90);
+    let marked = 0;
     for (let i = 0; i < 90; i++) {
       grid[i] = codes[i] ? (codes[i] <= 7 ? 1 : 2) : 0;
       conf[i] = codes[i] ? 1.5 : 0.02;
+      /* 把前 N 个有子格的模板分数压到 LOWCONF(0.55) 以下，模拟被高亮圈/落子放大遮住 */
+      if (codes[i] && marked < lowConfCells) {
+        conf[i] = 0.15;
+        marked++;
+      }
     }
     return { grid, conf, codes: Int8Array.from(codes) };
   }
@@ -136,7 +143,9 @@ function makeFixture(src, blackBottom) {
   }
 
   return { JJ, S, C, START, S0, frame, learn, learnOpening,
-           setCodes: c => { engCodes = c.slice(); } };
+           setCodes: c => { engCodes = c.slice(); },
+           /* 2.1.79：注入 N 个低置信度有子格 */
+           setLowConf: n => { lowConfCells = n | 0; } };
 }
 
 function main() {
@@ -540,6 +549,148 @@ function main() {
       if (r.reseat) throw new Error('I3 重锚后不该继续 reseat');
       if (r.needSearch) throw new Error('I3 同一局面不该重复派发搜索');
     });
+  }
+
+  /* ================================================================
+   * J. 2.1.79 低置信度闸门：待确认格子太多就不硬猜
+   *
+   * 背景：live 模式原先 `if (liveMode) { mergedCodes[sm] = raw; continue; }`
+   * 完全跳过置信度判断，于是任何结构合法的帧都直接组 FEN 喂引擎 ——
+   * 哪怕里面有六七个格子是低分蒙出来的兵种。引擎非常认真地对着错盘面算，
+   * 建议自然离谱，用户还看不出是识别错了。这就是「瞎指挥」的一个真源。
+   * ================================================================ */
+  console.log('');
+  console.log('========== J. 低置信度闸门（不硬猜） ==========');
+  {
+    const J = makeFixture(src, false);
+    J.learnOpening(true);
+
+    /* J1 全部高置信度 → 正常派发 */
+    J.setLowConf(0);
+    J.frame('J1 全部高置信', J.S0.slice(), r => {
+      if (r.skipAnalyze) throw new Error('J1 高置信帧不该 skipAnalyze');
+      if (!r.needSearch) throw new Error('J1 应派发搜索');
+      if (r.unsureCount !== 0) throw new Error('J1 unsureCount 应为 0，实际 ' + r.unsureCount);
+    });
+
+    /* J2 3 个待确认（低于阈值 6）→ 仍应派发，不能因为一点抖动就罢工 */
+    J.setLowConf(3);
+    J.frame('J2 3 格待确认', J.S0.slice(), r => {
+      if (r.skipAnalyze) throw new Error('J2 3 格不该跳过（阈值是 6）');
+      if (r.unsureCount !== 3) throw new Error('J2 unsureCount 应为 3，实际 ' + r.unsureCount);
+    });
+
+    /* J3 8 个待确认（超阈值）→ 必须 skipAnalyze + lowconf，且不发搜索 */
+    J.setLowConf(8);
+    J.frame('J3 8 格待确认', J.S0.slice(), r => {
+      if (!r.skipAnalyze) throw new Error('J3 超阈值必须 skipAnalyze（不许硬猜）');
+      if (r.skipReason !== 'lowconf') throw new Error('J3 skipReason 应为 lowconf，实际 ' + r.skipReason);
+      if (r.needSearch) throw new Error('J3 超阈值不该派发搜索');
+      if (r.unsureCount !== 8) throw new Error('J3 unsureCount 应为 8，实际 ' + r.unsureCount);
+    });
+
+    /* J4 恢复高置信 → 立刻恢复工作（不退避，不能像旧 illegalStreak 那样歇几秒）
+       注意：必须换一个局面才能验证「派发」，因为同一 FEN 会被
+       lastDispatchedFen 去重（needSearch=0 是正确行为，不是失败）。 */
+    J.setLowConf(0);
+    /* 红先黑后：先我方走一步（ply=1，轮到对方），再对方走一步（ply=2，轮到我）
+       —— 单走黑方一步会让 ply=1 被判成「还是对方走」，等不到我方派发。 */
+    const stepJ = J.S0.slice();
+    stepJ[54] = 0; stepJ[45] = 7;           // 红兵进一
+    J.frame('J4a 恢复高置信·我方走子', stepJ, r => {
+      if (r.skipAnalyze) throw new Error('J4a 恢复后不该仍 skipAnalyze（说明加了退避）');
+      if (r.unsureCount !== 0) throw new Error('J4a unsureCount 应归零');
+    });
+    const stepJ2 = stepJ.slice();
+    stepJ2[27] = 0; stepJ2[36] = 14;        // 黑卒进一
+    J.frame('J4b 对方走子·应立刻派发', stepJ2, r => {
+      if (r.skipAnalyze) throw new Error('J4b 不该 skipAnalyze');
+      if (r.ply !== 2) throw new Error('J4b ply 应为 2，实际 ' + r.ply);
+      if (!r.needSearch) throw new Error('J4b 轮到我方应立刻派发搜索（说明加了退避）');
+    });
+
+    console.log('J1 高置信派发 | J2 3格容忍 | J3 8格拒绝 | J4 恢复即派发');
+  }
+
+  /* ================================================================
+   * P. 坐标公式一致性：JS flipCodes 与 ObjC JJSqRotate180 必须同式
+   *
+   * 「我方执黑箭头指向对角」的根因就是两侧各算各的：JS 用 180° 旋转把
+   * 屏幕格转成引擎坐标，OC 画箭头时却没转回来。修法是在 OC 加
+   * JJSqRotate180(sq) = (9-r)*9+(8-c)，与 JS flipCodes 完全同式。
+   *
+   * 回归跑不了 ObjC，所以这里锁住 JS 这一半的公式：
+   * 一旦有人把 flipCodes 改成「只翻行」或别的形式，P 段立刻失败，
+   * 提醒必须同步改 JJMoveCodec.m 的 JJSqRotate180，否则镜像 bug 会复发。
+   * ================================================================ */
+  console.log('');
+  console.log('========== P. 坐标旋转公式一致性（防两侧分叉） ==========');
+  {
+    const C = global.__C;
+    if (typeof global.__flip !== 'function') throw new Error('测试钩子未注入 flipCodes');
+    const flip = global.__flip;
+
+    /* P1 公式对拍：逐格验证 flipCodes 等于 (9-r)*9+(8-c) */
+    const src90 = new Int8Array(90);
+    for (let i = 0; i < 90; i++) src90[i] = (i % 7) + 1;   // 填满，保证每格都被搬动
+    const got = flip(src90);
+    for (let sq = 0; sq < 90; sq++) {
+      const r = (sq / 9) | 0, c = sq % 9;
+      const want = (9 - r) * 9 + (8 - c);
+      if (got[want] !== src90[sq]) {
+        throw new Error('P1 flipCodes 与 (9-r)*9+(8-c) 不一致 @sq=' + sq +
+          '（JJMoveCodec.m 的 JJSqRotate180 必须同步修改，否则执黑箭头会镜像）');
+      }
+    }
+
+    /* P2 必须是 180° 旋转而不是单纯上下翻转：
+       单独翻行会让九宫左右对称、合法性检查发现不了，但整盘列全错。
+       用「不对称」的一格验证：row0,col0 应落到 row9,col8 */
+    const t = new Int8Array(90);
+    t[0] = 5;
+    const ft = flip(t);
+    if (ft[89] !== 5) throw new Error('P2 flipCodes 必须是 180° 旋转（sq0 → sq89），不是上下翻转');
+    if (ft[81] !== 0) throw new Error('P2 只翻了行没翻列（sq0 → sq81），这正是历史 bug');
+
+    /* P3 自逆：旋转两次必须回到原样（正反同式，不需要单独写逆变换） */
+    const twice = flip(flip(src90));
+    for (let i = 0; i < 90; i++) {
+      if (twice[i] !== src90[i]) throw new Error('P3 旋转两次未复原 @' + i);
+    }
+    void C;
+    console.log('P1 公式同式 | P2 180°旋转而非上下翻 | P3 自逆');
+  }
+
+  /* ================================================================
+   * Q. 模块拆分完整性（2.1.79）
+   *
+   * 棋盘纯函数已从 tools/bundle.js 迁到 src/app/board.js。
+   * 这条断言守两件事：
+   *   1) 打包产物里这些函数确实生效（不是只剩个空别名）
+   *   2) 关键分支行为不变 —— 用可直接观察的等价关系验证，
+   *      而不是复述实现（复述实现的断言改代码时会一起改，等于没守）
+   * ================================================================ */
+  console.log('');
+  console.log('========== Q. 模块拆分完整性（board.js 生效） ==========');
+  {
+    const U = global.__UTIL;
+    if (!U || !U.codesEngineSafe || !U.stepIsRuleLegal) {
+      throw new Error('Q 测试钩子缺 codesEngineSafe/stepIsRuleLegal —— 模块别名没生效');
+    }
+    const TRKM = global.__TRK;
+    const opn = TRKM.startPieceMap();
+
+    /* Q1 拆出去的函数仍能被主流程正常调用（开局合法、缺帅非法） */
+    if (!U.codesEngineSafe(opn, 'red')) throw new Error('Q1 开局应放行');
+    const bad = opn.slice(); bad[9 * 9 + 4] = 0;
+    if (U.codesEngineSafe(bad, 'red')) throw new Error('Q1 缺帅应拒绝（说明 board.js 没接上）');
+
+    /* Q2 走法形状校验仍在（马横走必须拒绝） */
+    if (U.stepIsRuleLegal(opn, 9 * 9 + 1, 9 * 9 + 4)) {
+      throw new Error('Q2 马横走应被拒绝');
+    }
+
+    console.log('Q1 引擎安全闸仍生效 | Q2 走法形状校验仍生效');
   }
 
   console.log('');

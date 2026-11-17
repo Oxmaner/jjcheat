@@ -35,6 +35,13 @@ typedef NS_ENUM(NSInteger, JJPikaState) {
     score/mate/depth/nodes/nps/winrate、ponder。 */
 typedef void (^JJPikaResultBlock)(NSDictionary * _Nullable result);
 
+/** 搜索进度回调（主线程，节流后调用）。
+ *  2.1.79 新增：搜索过程中把 depth / nodes / score 渐进推给 HUD。
+ *  以前只在 bestmove 时刷新一次，用户点完球之后 650ms 里界面毫无变化，
+ *  主观上就是「卡住了」。现在数字一边涨一边刷，感知延迟大幅下降。
+ *  节流在引擎队列侧做（150ms 一次），不会因为 info 行密集而压垮主线程。 */
+typedef void (^JJPikaProgressBlock)(NSDictionary *info);
+
 @interface JJPikafish : NSObject
 
 + (instancetype)shared;
@@ -78,6 +85,14 @@ typedef void (^JJPikaResultBlock)(NSDictionary * _Nullable result);
 
 /** 是否就绪（分析请求就绪或已在后台拉起）。未就绪时 analyze 会先排队。 */
 - (BOOL)isReadyOrStarting;
+
+/** 2.1.79：热更新引擎选项（菜单改完参数后调用）。
+ *  只下发不触发线程重建的项；Threads 变更会被跳过并记日志，
+ *  必须由调用方 shutdown + start 才能真正生效（见 JJEngineOptions）。 */
+- (void)applyOptionsHot;
+
+/** 搜索进度回调（可选）。赋 nil 即关闭。 */
+@property (nonatomic, copy, nullable) JJPikaProgressBlock onSearchProgress;
 
 @end
 

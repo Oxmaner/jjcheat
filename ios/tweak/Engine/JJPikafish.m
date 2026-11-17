@@ -11,9 +11,11 @@
 #import "JJPikafish.h"
 #import "JJPikafishInstaller.h"
 #import "JJMoveCodec.h"
+#import "JJEngineOptions.h"
 #import "JJConfig.h"
 #import "jjpika_shim.h"
 
+#import <QuartzCore/QuartzCore.h>   /* CACurrentMediaTime（进度节流用） */
 #import <dispatch/dispatch.h>
 #import <os/lock.h>
 #import <math.h>
@@ -69,6 +71,8 @@ static void JJFatalSignalHandler(int sig) {
 @property (nonatomic, assign) BOOL readerRunning;
 
 /* 握手 */
+/* 当前已下发到引擎的 Threads。用于判断「用户改了 Threads」这种必须重启的情况 */
+@property (nonatomic, assign) NSInteger appliedThreads;
 @property (nonatomic, assign) BOOL sawUciok;
 @property (nonatomic, assign) BOOL sawReadyok;
 @property (nonatomic, assign) NSInteger waitTries;
@@ -79,6 +83,8 @@ static void JJFatalSignalHandler(int sig) {
 @property (nonatomic, assign) NSInteger searchingMovetime;
 @property (nonatomic, copy) JJPikaResultBlock searchingCb;
 @property (nonatomic, strong) NSDictionary *lastInfo;
+/* 2.1.79：进度回调节流时间戳（只在 pikaQueue 上读写） */
+@property (nonatomic, assign) CFTimeInterval lastProgressTs;
 /* 2.1.68：最近一条 `info string`（引擎自述 / NNUE 加载失败原因），HUD 与日志共用 */
 @property (nonatomic, copy) NSString *lastEngineNotice;
 @property (nonatomic, strong) dispatch_block_t watchdog;
@@ -356,24 +362,87 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
     }
 }
 
+#pragma mark - 选项下发
+
+/** 把 JJEngineOptions 的引擎侧参数下发一遍。
+ *  握手完成时调一次；菜单改参数后调一次（热更新）。
+ *  Threads 放在最前：它会 resize_threads()，Hash 需要在新的线程池上分配，
+ *  否则刚分配的表会被 resize 清掉一次，白做一遍几十 MB 的清零。 */
+- (void)applyOptionsOnQueue {
+    JJEngineOptions *o = [JJEngineOptions shared];
+    NSArray<NSString *> *lines = [o setoptionLines];
+    for (NSString *line in lines) [self writeLine:line];
+    NSLog(@"%@ 选项已下发: %@", kPikaLog, [o summary]);
+}
+
+/** 运行中热更新：只改不触发线程重建的项。
+ *  Threads 变更必须重启引擎（调用方负责确认与 shutdown/start），
+ *  这里遇到 Threads 变化会拒绝下发并记一条日志，避免静默崩溃。 */
+- (void)applyOptionsHot {
+    dispatch_async(_pikaQueue, ^{
+        if (self.state != JJPikaStateReady && self.state != JJPikaStateSearching) return;
+        JJEngineOptions *o = [JJEngineOptions shared];
+        NSInteger liveThreads = self.appliedThreads;
+        if (liveThreads != o.threads) {
+            NSLog(@"%@ Threads %ld→%ld 需要重启引擎，热更新已跳过（等用户确认后重启）",
+                  kPikaLog, (long)liveThreads, (long)o.threads);
+        }
+        for (NSString *line in [o setoptionLines]) {
+            /* Threads 行单独跳过：热改它会重建线程池，正是历史上闪退的成因 */
+            if ([line hasPrefix:@"setoption name Threads"]) continue;
+            [self writeLine:line];
+        }
+        self.appliedThreads = o.threads;
+        [self writeLine:@"isready"];
+        NSLog(@"%@ 选项热更新完成: %@", kPikaLog, [o summary]);
+    });
+}
+
+/* 2.1.79：搜索进度节流推送。
+ *
+ * 为什么节流：Pikafish 每层都会吐一批 info，多线路时更密（MultiPV=3 时
+ * 一次 go 能有上百行）。每行都刷 HUD 会让主线程一直忙着排版，
+ * 反而更卡。150ms 是「肉眼看着在动」与「不浪费主线程」的折中。
+ *
+ * 为什么放在引擎队列判断而不是主线程：当前时间戳的比较很便宜，
+ * 放在产生方判断可以避免把 90% 的行都 dispatch 到主线程再丢掉。 */
+- (void)emitProgressIfDue {
+    if (!self.onSearchProgress) return;
+    if (self.state != JJPikaStateSearching) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - self.lastProgressTs < 0.15) return;
+    self.lastProgressTs = now;
+
+    NSDictionary *info = self.lastInfo;
+    if (!info) return;
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    out[@"depth"] = info[@"depth"] ?: @0;
+    out[@"nodes"] = info[@"nodes"] ?: @0;
+    out[@"score"] = info[@"score"] ?: @0;
+    out[@"mate"] = info[@"mate"] ?: @0;
+    out[@"nps"] = info[@"nps"] ?: @0;
+    out[@"wdlW"] = info[@"wdlW"] ?: @0;
+    out[@"wdlD"] = info[@"wdlD"] ?: @0;
+    if (info[@"pv"]) out[@"pv"] = info[@"pv"];
+    out[@"searchFen"] = self.searchingFen ?: @"";
+
+    JJPikaProgressBlock cb = self.onSearchProgress;
+    dispatch_async(dispatch_get_main_queue(), ^{ cb([out copy]); });
+}
+
 #pragma mark - UCI 行处理
 
 - (void)handleLineOnQueue:(NSString *)line {
     if ([line hasPrefix:@"uciok"]) {
         self.sawUciok = YES;
-        /* 2.1.63：只设「无副作用」的 UCI 选项。
-           2.1.60~62 在这里发过 setoption Threads=1 和 setoption EvalFile，
-           两者都会触发引擎内部重建：Threads.set() 会 threads.clear() 再
-           pthread_create 8MB 栈的搜索线程；EvalFile 会重新加载 50MB NNUE。
-           Pikafish 默认 Threads 就是 1、构造时已按 argv[0] 目录加载 NNUE，
-           重设只是把已经就绪的线程池/权重推倒重建。iOS 上 pthread 重建不干净
-           → worker 悬空 → go movetime 时 main_thread()->worker->limits 在 0x0
-           解引用 SIGSEGV（§25.3 真机证实、§25.5 静态分析）。
-           去掉这两条，用构造时的默认线程池与权重；其余选项不重建线程。 */
-        [self writeLine:[NSString stringWithFormat:@"setoption name Hash value %d",
-                         JJ_PIKA_HASH_MB]];
-        [self writeLine:@"setoption name Move Overhead value 0"];
-        [self writeLine:@"setoption name UCI_ShowWDL value true"];
+        /* 2.1.79：选项下发统一走 JJEngineOptions，不再在这里写死字符串。
+           历史教训（2.1.60~62）：曾经在这里无条件下发 setoption Threads / EvalFile，
+           两者都会触发引擎内部重建 —— Threads.set() 让 threads.clear() 再
+           pthread_create；EvalFile 重载 50MB NNUE。iOS 上 pthread 重建不干净
+           → worker 悬空 → go 时在 0x0 解引用 SIGSEGV（§25.3 真机证实）。
+           现在：Threads 默认 1，只有用户主动改过才下发（见 JJEngineOptions 默认值）；
+           EvalFile 一律不发（构造函数已按 argv[0] 目录加载好权重）。 */
+        [self applyOptionsOnQueue];
         [self writeLine:@"isready"];
         return;
     }
@@ -403,6 +472,7 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
     }
     if ([line hasPrefix:@"info "]) {
         self.lastInfo = [self parseInfoLine:line];
+        [self emitProgressIfDue];
         return;
     }
     if ([line hasPrefix:@"bestmove"]) {
@@ -544,8 +614,16 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
     self.searchingCb = completion;
     self.lastInfo = nil;
     [self writeLine:[NSString stringWithFormat:@"position fen %@", fen]];
-    [self writeLine:[NSString stringWithFormat:@"go movetime %ld",
-                     (long)self.searchingMovetime]];
+    /* 2.1.79：深度模式优先。thinkDepth > 0 时用 go depth，否则 go movetime。
+       深度模式的看门狗仍按 movetime 估算时长（depth 的耗时不可预测，
+       只能给一个宽松上限，超时就当卡死处理）。 */
+    NSInteger wantDepth = [JJEngineOptions shared].thinkDepth;
+    if (wantDepth > 0) {
+        [self writeLine:[NSString stringWithFormat:@"go depth %ld", (long)wantDepth]];
+    } else {
+        [self writeLine:[NSString stringWithFormat:@"go movetime %ld",
+                         (long)self.searchingMovetime]];
+    }
 
     /* 看门狗：movetime + 宽限期仍无 bestmove → 让引擎停下，丢一次结果。
        2.1.76 卡顿修复：旧逻辑在这里 jjpika_stop() + state=Dead，

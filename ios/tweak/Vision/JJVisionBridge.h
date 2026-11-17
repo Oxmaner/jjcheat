@@ -51,12 +51,6 @@ typedef void (^JJVisionResultBlock)(NSDictionary * _Nullable result, NSError * _
                height:(int)h
              callback:(JJVisionResultBlock)callback;
 
-/** 90 个交叉点的屏幕像素坐标 */
-- (NSArray<NSArray<NSNumber *> *> *)gridPoints;
-
-/** 当前局面 FEN（屏幕坐标） */
-- (NSString *)currentFen;
-
 @end
 
 NS_ASSUME_NONNULL_END

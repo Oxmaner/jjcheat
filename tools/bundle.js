@@ -23,7 +23,8 @@ const ENTRY_FILES = [
   'cst/notation',
   'vision/templates',
   'vision/recognizer',
-  'vision/tracker'
+  'vision/tracker',
+  'app/board'
 ];
 
 // 模块 id -> 源码
@@ -115,393 +116,32 @@ var TRK = __require('vision/tracker');
  * ============================================================ */
 
 /* ============================================================
- *  棋盘朝向处理
- *  用户执红时红子在下（标准朝向），执黑时 JJ象棋 会翻转棋盘、黑子在下。
- *  引擎内部统一用「红在下」的标准坐标，所以画面翻转时要翻回来。
+ *  棋盘纯函数层
+ *  2.1.79：实现已迁到 src/app/board.js（纯输入→输出，不碰 session/引擎）。
+ *  这里只做别名，保持主流程里的裸名调用不变，迁移零行为变化。
  * ============================================================ */
 
-/** 上下翻转一张棋子编码表 */
-function flipPieceMap(map) {
-  var out = new Array(90).fill(0);
-  for (var sq = 0; sq < 90; sq++) {
-    var v = map[sq];
-    if (!v) continue;
-    var r = (sq / 9) | 0, c = sq % 9;
-    out[(9 - r) * 9 + c] = v;
-  }
-  return out;
-}
+var B = __require('app/board');
+var PC2FEN_TABLE = B.PC2FEN_TABLE;
+var flipGrid = B.flipGrid;
+var flipCodes = B.flipCodes;
+var codesToBoardFen = B.codesToBoardFen;
+var boardFenToCodes = B.boardFenToCodes;
+var validateCodes = B.validateCodes;
+var codesUsable = B.codesUsable;
+var codesLegal = B.codesLegal;
+var codesPositionPlausible = B.codesPositionPlausible;
+var codesEngineSafe = B.codesEngineSafe;
+var stepIsRuleLegal = B.stepIsRuleLegal;
+var analyzeStepDiff = B.analyzeStepDiff;
+var countCodesDiff = B.countCodesDiff;
+var countOccupancyDiff = B.countOccupancyDiff;
+var repairCodesQuota = B.repairCodesQuota;
 
-/** 上下翻转一张三分类网格（返回新数组，不改原数组） */
-function flipGrid(grid) {
-  var out = new Int8Array(90);
-  for (var sq = 0; sq < 90; sq++) {
-    var r = (sq / 9) | 0, c = sq % 9;
-    // ★ 必须是「旋转 180 度」，不是「上下翻转」
-    //
-    //   你执黑时，看盘的视角是从对面看过来 —— 相当于把棋盘在桌面里转了 180 度，
-    //   行和列同时反向。原来只翻了行、列没翻，得到的是一张「左右镜像」的假局面：
-    //   帅/将恰好还在九宫里（九宫左右对称），所以合法性检查也发现不了，
-    //   但整盘棋子全在错的列上，引擎算出来的着法自然全废。
-    out[(9 - r) * 9 + (8 - c)] = grid[sq];
-  }
-  return out;
-}
+/* 2.1.79：单帧允许的「待确认格子」上限（低置信度的有子格）。
+   超过就不发搜索，HUD 显示「识别待确认 · N 格」。 */
+var JJ_MAX_UNSURE_CELLS = 6;
 
-/** 屏幕坐标 ↔ 引擎坐标（红在下）：旋转 180 度 */
-function flipCodes(codes) {
-  var out = new Int8Array(90);
-  for (var sq = 0; sq < 90; sq++) {
-    var r = (sq / 9) | 0, c = sq % 9;
-    out[(9 - r) * 9 + (8 - c)] = codes[sq];
-  }
-  return out;
-}
-
-/* ============================================================
- *  直接把识别出的兵种编码组回 FEN
- *
- *  这才是象棋软件该有的架构：识别整盘棋子 → 组局面 → 引擎算。
- *  不依赖「从开局一步步跟踪」，所以随时中途进去也能用。
- * ============================================================ */
-
-var PC2FEN_TABLE = ['', 'K', 'A', 'B', 'N', 'R', 'C', 'P', 'k', 'a', 'b', 'n', 'r', 'c', 'p'];
-
-/** 只拼棋盘部分（不带走子方） */
-function codesToBoardFen(codes) {
-  var rows = [];
-  for (var r = 0; r < 10; r++) {
-    var s = '', empty = 0;
-    for (var c = 0; c < 9; c++) {
-      var v = codes[r * 9 + c];
-      if (!v) { empty++; continue; }
-      if (empty) { s += empty; empty = 0; }
-      s += PC2FEN_TABLE[v] || '1';
-    }
-    if (empty) s += empty;
-    rows.push(s);
-  }
-  return rows.join('/');
-}
-
-/**
- * 局面合法性校验
- *
- * 只拦「明显不合理」的情况，不做严格将帅计数校验。
- * 之前要求 redK===1 && blkK===1，结果红帅被高亮圈/绿点遮住一帧就整盘作废，
- * 浮窗直接冻住不动。宁可容忍个别格识别错，也不要让程序彻底停止工作。
- */
-function validateCodes(codes) {
-  var redN = 0, blkN = 0;
-  for (var i = 0; i < 90; i++) {
-    var v = codes[i];
-    if (!v) continue;
-    if (v >= 1 && v <= 7) redN++;
-    else if (v >= 8 && v <= 14) blkN++;
-  }
-  // 棋子数不可能超过初始布局
-  if (redN > 16 || blkN > 16) return false;
-  // 全是空 / 只剩两三个子，说明识别彻底失败
-  if (redN + blkN < 6) return false;
-  return true;
-}
-
-/** 宽松版：只要不是全空就接受，用于「让程序继续工作」 */
-/**
- * 有没有认出东西来。
- *
- * 只要认出至少 1 个棋子就算有结果 —— 象棋可以有只剩两个王的盘面，
- * 任何「至少 N 个子」的门槛都是瞎猜，会误杀合法残局（实测 6 子、4 子残局都栽在这上面）。
- * 真正意义上「什么都没认出来」是 0 个棋子，那种情况才不该覆盖上一局面。
- */
-function codesUsable(codes) {
-  for (var i = 0; i < 90; i++) if (codes[i]) return true;
-  return false;
-}
-
-/**
- * 严格合法性校验：这一帧识别出来的盘面「有没有可能是一盘真棋」。
- *
- * 为什么要这道闸：真机抓屏和离线截图不完全一致，偶尔会出几帧垃圾识别。
- * 垃圾盘面一旦被显示出去，用户看到的就是「满盘车」「红帅变黑将」这种乱象，
- * 而真正该做的是：宁可继续显示上一帧合法盘面，也不要把垃圾推给用户。
- *
- * 判据（象棋规则里不可能出现的组合）：
- *   每方最多 1 个将帅、2 仕、2 相、2 马、2 车、2 炮、5 兵
- *   双方棋子总数都不能超过 16，且不能少到 5 个以下（那是识别崩了）
- *   必须有一方有将帅（至少红黑各 1 个里的一个，允许另一侧被遮挡漏读）
- */
-function codesLegal(codes) {
-  var LIM = [0, 1, 2, 2, 2, 2, 2, 5];   // 将 仕 相 马 车 炮 兵
-  var cnt = [new Array(8).fill(0), new Array(8).fill(0)];
-  var redN = 0, blkN = 0;
-  for (var i = 0; i < 90; i++) {
-    var v = codes[i];
-    if (!v) continue;
-    if (v >= 1 && v <= 7) { redN++; cnt[0][v]++; }
-    else if (v >= 8 && v <= 14) { blkN++; cnt[1][v - 7]++; }
-  }
-  // 只拦「规则上不可能」的情况，一律是上限：
-  //   每方最多 16 子（象棋不能升变，子只会少不会多）
-  //   每类子不超过初始数量（将1 仕2 相2 马2 车2 炮2 兵5）
-  // 【没有任何下限】
-  //   只剩两个王、只剩一个车，都是合法局面；任何「至少 N 个子」的门槛
-  //   都会误杀残局（实测 6 子和 4 子的残局全被误杀过）。
-  if (redN > 16 || blkN > 16) return false;
-  for (var s = 0; s < 2; s++) {
-    for (var t = 1; t <= 7; t++) {
-      if (cnt[s][t] > LIM[t]) return false;
-    }
-  }
-  return true;
-}
-
-/**
- * 位置合理性校验（1.1.44）
- *
- * codesLegal 只管「数量不超限」，拦不住「黑卒出现在自己底线」「红相过了河」
- * 这类规则上不可能的盘面。15:10 真机 FEN 一路漂成 pnbaknb2 / 3k1rbp1 /
- * 1RRaknbp1，全部数量合法但位置荒谬，引擎拿着这种盘面给的着法自然是乱的。
- * 这里只写象棋硬规则（将帅仕士不出九宫、相象不过河、兵卒不后退），
- * 不会误杀任何合法残局。
- *
- * @param {Array|Int8Array} codes 引擎坐标（红在下，row0=黑底线，row9=红底线）
- */
-function codesPositionPlausible(codes) {
-  for (var i = 0; i < 90; i++) {
-    var v = codes[i];
-    if (!v) continue;
-    var r = (i / 9) | 0, c = i % 9;
-    var palace = (c >= 3 && c <= 5);
-    if (v === 1 && !(r >= 7 && palace)) return false;   // 红帅
-    if (v === 8 && !(r <= 2 && palace)) return false;   // 黑将
-    if (v === 2 && !(r >= 7 && palace)) return false;   // 红仕
-    if (v === 9 && !(r <= 2 && palace)) return false;   // 黑士
-    if (v === 3 && r < 5) return false;                 // 红相不过河
-    if (v === 10 && r > 4) return false;                // 黑象不过河
-    if (v === 7 && r > 6) return false;                 // 红兵不后退
-    if (v === 14 && r < 3) return false;                // 黑卒不后退
-  }
-  return true;
-}
-
-/**
- * 引擎安全校验（2.1.76）——「这一帧能不能喂给 Pikafish」，与「能不能显示」分开
- *
- * 为什么不直接并进 codesLegal：历史上加过「王必须各 1 个」，结果红帅被高亮圈
- * 遮住一帧就整盘作废、浮窗直接冻住不动（见 validateCodes 的注释）。显示层
- * 必须宽松，否则偶发漏读会让程序看起来死掉了。
- *
- * 但这一层绝对不能宽松 —— Pikafish 的 Position::set() 会拒绝两类盘面：
- *   王数量不为 1        → "Unsupported position. Incorrect number of kings."
- *   走子方正在将军对方  → "Unsupported position. King can be captured."
- * 而 UCIEngine::position() 失败后会走 terminate_on_critical_error：
- * 2.1.75 及之前那里是 std::exit(1)，直接把宿主 App 一起拆掉
- * （真机 .ips thread 73 的证据链，见 HANDOFF §14）；
- * 2.1.76 起补丁改成「打 JJ-FATAL + 拒绝搜索」，虽然不再崩，
- * 但这次搜索必然作废 —— 等于白白浪费一次思考，还让 HUD 抖一下。
- * 所以：宁可这一帧不给建议，也绝不把非法 FEN 发给引擎。
- *
- * @param {Array|Int8Array} codes 引擎坐标（红在下）
- * @param {string} sideToMove 'red' | 'black'
- */
-function codesEngineSafe(codes, sideToMove) {
-  var rk = 0, bk = 0;
-  for (var i = 0; i < 90; i++) {
-    if (codes[i] === 1) rk++;
-    else if (codes[i] === 8) bk++;
-  }
-  if (rk !== 1 || bk !== 1) return false;
-  try {
-    var fen = codesToBoardFen(codes) + ' ' + (sideToMove === 'black' ? 'b' : 'w') + ' - - 0 1';
-    var pos = new POS.Position(fen);
-    // inCheck(对方) 为真 = 我方正将着对方 = 这盘面不许出现（对方上一手不该走成被将）
-    if (pos.inCheck(pos.side ^ 1)) return false;
-  } catch (e) {
-    return false;    // 连 Position 都建不起来，更不能喂引擎
-  }
-  return true;
-}
-
-/**
- * 这一步棋在规则上真的走得通吗（2.1.76）
- *
- * analyzeStepDiff 只验「代数结构」：from 格变空、to 格出现同一个子、不吃己方。
- * 它**不验走法形状** —— 马别腿、炮没炮架、仕走出九宫、车穿过别的子，全都能过。
- * 整份 bundle.js 里 isLegal / genLegalMoves 从 1.1.44 起一次都没被调用过，
- * 所以网格噪声凑出来的「伪走法」会被当成真走法推进锚盘，之后越错越远，
- * 引擎就对着这张越来越离谱的盘面算 —— 这就是「瞎指挥」的长尾来源。
- *
- * 这里用 Position.genLegalMoves() 严格比对（内部先按形状生成候选，
- * 再用 isLegal 过滤「走完自己被将军」）。命中才算真走法。
- *
- * @param {Array} codes 走子前的盘面（引擎坐标，红在下）
- */
-function stepIsRuleLegal(codes, from, to) {
-  try {
-    var piece = codes[from] || 0;
-    if (!piece) return false;
-    // 红在下坐标系里：红子(1..7) 走 w，黑子(8..14) 走 b
-    var side = piece <= 7 ? 'w' : 'b';
-    var pos = new POS.Position(codesToBoardFen(codes) + ' ' + side + ' - - 0 1');
-    var want = from | (to << 7);
-    var legal = pos.genLegalMoves();
-    for (var i = 0; i < legal.length; i++) {
-      if (legal[i] === want) return true;
-    }
-  } catch (e) {}
-  return false;
-}
-
-/** 棋盘 FEN → 90 格 codes（开局锚定用） */
-function boardFenToCodes(fen) {
-  var out = new Array(90).fill(0);
-  var rows = String(fen || '').split(' ')[0].split('/');
-  if (rows.length !== 10) return out;
-  for (var r = 0; r < 10; r++) {
-    var col = 0, line = rows[r];
-    for (var k = 0; k < line.length && col < 9; k++) {
-      var ch = line[k];
-      if (ch >= '1' && ch <= '9') { col += parseInt(ch, 10); continue; }
-      var v = PC2FEN_TABLE.indexOf(ch);
-      out[r * 9 + col] = v > 0 ? v : 0;
-      col++;
-    }
-  }
-  return out;
-}
-
-/**
- * 一步棋差分分析（1.1.44 核心）
- *
- * 象棋每步只动一枚棋子。把本帧识别结果与「上一稳定盘面」比较：
- *   - 找「有子→空」的起点 from 和「cur[to] === prev[from]」的终点 to；
- *   - 额外变化格一律视为识别噪声，用锚盘值覆盖；
- *   - 变化格数过多（>6）或找不到一步棋结构 → 整帧丢弃。
- * 这样每帧落地的 codes 都严格由「锚盘 + 一步棋」生成，模板抖动再也带不偏盘面。
- *
- * @returns {{changed:number, move:object|null, noise:Array}}
- */
-function analyzeStepDiff(prev, cur) {
-  var changed = [];
-  for (var i = 0; i < 90; i++) {
-    if ((prev[i] || 0) !== (cur[i] || 0)) changed.push(i);
-  }
-  if (changed.length === 0) return { changed: 0, move: null, noise: [] };
-  var none = { changed: changed.length, move: null, noise: changed };
-  if (changed.length > 6) return none;
-
-  var best = null;
-  for (var a = 0; a < changed.length; a++) {
-    var from = changed[a];
-    var piece = prev[from] || 0;
-    if (!piece || (cur[from] || 0) !== 0) continue;
-    for (var b = 0; b < changed.length; b++) {
-      if (b === a) continue;
-      var to = changed[b];
-      if ((cur[to] || 0) !== piece) continue;
-      var captured = prev[to] || 0;
-      if (captured === piece) continue;
-      // 不能吃己方棋子
-      if (captured && ((captured <= 7) === (piece <= 7))) continue;
-      var noise = changed.filter(function (x) { return x !== from && x !== to; });
-      var cand = { from: from, to: to, piece: piece, captured: captured, noise: noise };
-      if (!best || noise.length < best.noise.length) best = cand;
-    }
-  }
-  if (!best) return none;
-  return { changed: changed.length, move: best, noise: best.noise };
-}
-
-/**
- * 两帧 codes 的差异格数（换局重锚用）。
- * 真机模板每帧抖 3~8 格，逐格签名「完全相同」几乎不可能凑齐连续 3 帧；
- * 改用差异格数阈值，既能让稳定局面收敛，又不会把单帧垃圾当新局。
- * @param {Array|Int8Array} a 上一帧
- * @param {Array|Int8Array} b 本帧
- * @returns {number} 不同格数
- */
-function countCodesDiff(a, b) {
-  var n = 0;
-  for (var i = 0; i < 90; i++) if ((a[i] || 0) !== (b[i] || 0)) n++;
-  return n;
-}
-
-/**
- * 占位差异：只比「有子 / 无子」，忽略兵种认错。
- * 2.0.0 新局判据用它区分两种情况：
- *   - 回到的确是标准开局：32 枚棋子都在正确位置，模板最多把兵种认错 → 占位差 0；
- *   - 开局刚走了两步：起点两格变空、终点两格多子 → 占位差 4。
- * 只用 countCodesDiff 会把后者（差 4 格）误判成新局，离线回归 A4 实测踩到。
- * @param {Array|Int8Array} a
- * @param {Array|Int8Array} b
- * @returns {number} 占位不同的格数
- */
-function countOccupancyDiff(a, b) {
-  var n = 0;
-  for (var i = 0; i < 90; i++) {
-    if (((a[i] || 0) !== 0) !== ((b[i] || 0) !== 0)) n++;
-  }
-  return n;
-}
-
-/**
- * 兵种配额裁剪（1.1.43 → 1.1.44）
- *
- * 1.1.43 把超额兵种直接清成空格，15:10 日志每帧 repaired=1~4，棋子被一帧帧
- * 凭空删掉，盘面越来越残缺。1.1.44 改为「优先用模板候选替换成同阵营缺额兵种，
- * 实在没有候选才清空格」，且绝不删将帅、单帧最多清 6 格。
- *
- * @param {Array|Int8Array} codes 90 格兵种编码
- * @param {Array} conf 每格模板置信度（低的先动）
- * @param {Array} ranked 每格候选兵种（recognizer.lastRanked）
- * @returns {{codes: Int8Array, repaired: number, replaced: number, dropped: number}}
- */
-function repairCodesQuota(codes, conf, ranked) {
-  var LIM = [0, 1, 2, 2, 2, 2, 2, 5];   // 将 仕 相 马 车 炮 兵
-  var MAX_DROP = 6;
-  var out = new Int8Array(90);
-  for (var i = 0; i < 90; i++) out[i] = codes[i] || 0;
-  var repaired = 0, replaced = 0, dropped = 0;
-  for (var side = 0; side < 2; side++) {
-    var base = side === 0 ? 1 : 8;
-    for (var t = 1; t <= 7; t++) {
-      var v = base + t - 1, list = [];
-      for (var sq = 0; sq < 90; sq++) {
-        if (out[sq] === v) list.push({ sq: sq, conf: conf ? (conf[sq] || 0) : 1 });
-      }
-      var excess = list.length - LIM[t];
-      if (excess <= 0) continue;
-      list.sort(function (x, y) { return x.conf - y.conf; });
-      for (var k = 0; k < excess; k++) {
-        var cell = list[k];
-        if (v === 1 || v === 8) continue;              // 将帅绝不删
-        var alt = 0;
-        var cand = ranked && ranked[cell.sq];
-        if (cand) {
-          for (var ri = 0; ri < cand.length; ri++) {
-            var a2 = cand[ri];
-            if (!a2 || a2 === v) continue;
-            if ((a2 <= 7) !== (side === 0)) continue; // 阵营必须一致
-            var at = a2 <= 7 ? a2 : a2 - 7;
-            var n2 = 0;
-            for (var z = 0; z < 90; z++) if (out[z] === a2) n2++;
-            if (n2 < LIM[at]) { alt = a2; break; }
-          }
-        }
-        if (!alt && dropped >= MAX_DROP) continue;
-        out[cell.sq] = alt;
-        if (alt) replaced++; else dropped++;
-        repaired++;
-      }
-    }
-  }
-  return { codes: out, repaired: repaired, replaced: replaced, dropped: dropped };
-}
-
-/* 2.0.0 换局重锚门槛：与锚盘差异小于这个数、又不成一步棋结构，
-   一律判为模板噪声直接丢弃。16:00 日志里首帧 diff=4 就触发 reseat，
-   把学习刚锚定的标准开局换成错误盘面，是「新对局识别不了」的帮凶。 */
 var JJ_RESEAT_MIN_DIFF = 8;
 /* 连续被丢弃多少帧后，允许一次「大变化 + 双合法」盘面强制重锚，
    防止中途进对局时 3 帧稳定条件永远凑不齐而卡死。 */
@@ -547,7 +187,7 @@ var JJEngine = {
   /* 2.1.58：开局匹配滤波对齐（alignGridToOpening）。标记必须变：
      容器里那份 engine.js 只认「缺当前标记 → 覆盖升级」，标记不变 = 2.1.57
      的旧脚本一直被用下去，新对齐逻辑根本跑不到。 */
-  featureMark: 'pikafishNative2178',
+  featureMark: 'pikafishNative2179',
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
@@ -1053,177 +693,6 @@ var JJEngine = {
     return alignFields(out);
   },
 
-  /** 清空学习结果，退回默认阈值模式（画面不是开局时的兜底） */
-  skipLearning: function () {
-    if (session.recognizer) {
-      session.recognizer.bgModel = null;
-      // 模板不能清空 —— 内置模板是离线从已知正确盘面生成的，
-      // 清空后就只剩「纯颜色判断」，识别率会掉一大截。
-      // 这里只是「重新装回内置模板」，等价于丢弃任何运行时学出来的模板。
-      try {
-        session.recognizer.templates = session.recognizer._buildBuiltinTemplates();
-      } catch (e) { /* 保持原样 */ }
-    }
-    return { skipped: true };
-  },
-
-  /**
-   * 自动检测棋盘四角
-   * 棋盘是严格等间距的 9 竖 10 横网格，用边缘投影 + 等距约束就能定位，
-   * 完全不需要用户手点。
-   * @returns {Array<[number,number]>|null} [[左上],[右上],[右下],[左下]]，检测失败返回 null
-   */
-  autoDetectBoard: function (pixels, w, h) {
-    try {
-      var r = REC.autoDetectBoard(pixels, w, h);
-      if (!r) return null;
-      return [
-        [r[0][0], r[0][1]],
-        [r[1][0], r[1][1]],
-        [r[2][0], r[2][1]],
-        [r[3][0], r[3][1]]
-      ];
-    } catch (e) {
-      return null;
-    }
-  },
-
-  /**
-   * 自动检测 + 用棋子实测校验，校验不过就明确报不通过。
-   *
-   * 为什么要校验：边缘投影找到的线间距可能偏小 10~20%（实测格高 59.9 vs 实际 73.3），
-   * 这种误差逐行累积，到第 7 行采样点已经偏了整整一格，炮就被采到上面空格去了。
-   * 检测本身没法自己发现自己错了，只能用「棋子应该落在交叉点上」来验证。
-   *
-   * 校验方法：网格算出来后，采 90 个格子，统计「暖色盘面」的格子数
-   * 和它们到最近交叉点的偏移。棋子数太少或偏移太大 → 判定网格不可信。
-   */
-  /**
-   * 自动检测的调试信息：初始边缘投影四角 / 棋子反推结果 / 最终走了哪条路
-   */
-  autoDetectDebug: function (pixels, w, h) {
-    var r = null;
-    try { r = JJEngine.autoDetectBoard(pixels, w, h); } catch (e) { return { error: String(e && e.message || e) }; }
-    return { corners: r, debug: REC.autoDetectBoard.lastDebug || null };
-  },
-
-  autoDetectBoardChecked: function (pixels, w, h) {
-    var corners = JJEngine.autoDetectBoard(pixels, w, h);
-    if (!corners) return { ok: false, reason: 'no_grid' };
-
-    // 用这组角采样，看有多少格是「有棋子盘面」
-    JJEngine.setCorners(corners);
-    if (!session.recognizer) return { ok: false, reason: 'no_recognizer' };
-    var stats;
-    try { stats = session.recognizer.sampleAll(pixels, w, h, false); } catch (e) { return { ok: false, reason: 'sample_fail' }; }
-
-    var pieceCells = 0;
-    var warmSum = 0;
-    for (var i = 0; i < 90; i++) {
-      var s = stats[i];
-      if (!s) continue;
-      var warmR = s.warmR || 0;
-      if (warmR >= 0.30) { pieceCells++; warmSum += warmR; }
-    }
-    return {
-      ok: true,
-      corners: corners,
-      pieceCells: pieceCells,
-      avgWarm: pieceCells ? (warmSum / pieceCells) : 0,
-      // 中局一般 20~32 个子，低于 8 个基本就是网格歪了
-      plausible: pieceCells >= 8
-    };
-  },
-
-  /** 自动检测并直接应用（一步到位） */
-  autoCalibrate: function (pixels, w, h) {
-    var r = JJEngine.autoDetectBoard(pixels, w, h);
-    if (!r) return { ok: false };
-    /* ★ 2.1.58 自动检测四角必须先过「开局匹配滤波」确认再落地。
-       refineByPieces 的暖亮圆盘掩码在木色皮肤上整块棋盘都命中
-       （R-B=87、L=189 全过），等于对噪声对齐 —— 以前直接 set + 持久化，
-       一组被木纹带歪的网格点会一直用到下次手动标定。
-       现在用已知开局 32 个位置复核：对不齐（或画面根本不是开局棋盘）
-       就拒绝，宁可让用户重试，也不落一组错点。 */
-    if (REC.alignGridToOpening) {
-      var spmAc = TRK.startPieceMap();
-      var opAc = [], emAc = [];
-      for (var ai = 0; ai < 90; ai++) (spmAc[ai] ? opAc : emAc).push(ai);
-      var alignAc = null;
-      try { alignAc = REC.alignGridToOpening(pixels, w, h, r, opAc, emAc); } catch (eAc) {}
-      if (alignAc) {
-        if (alignAc.accepted && alignAc.corners) {
-          JJEngine.setCorners(alignAc.corners);
-          return { ok: true, corners: alignAc.corners, align: alignAc };
-        }
-        if (alignAc.already) {
-          JJEngine.setCorners(r);
-          return { ok: true, corners: r, align: alignAc };
-        }
-        return { ok: false, reason: 'no_pieces', align: alignAc, corners: r };
-      }
-    }
-    JJEngine.setCorners(r);
-    return { ok: true, corners: r };
-  },
-
-  /** 调试：直接输出单帧的兵种识别结果（不走稳定性门槛、不写 session） */
-  classifyBoard: function (pixels, w, h) {
-    if (!session.recognizer) return null;
-    var stats = session.recognizer.sampleAll(pixels, w, h, true);
-    var cls = null;
-    try { cls = session.recognizer.classify(stats); } catch (e) { return { error: String(e && e.message || e) }; }
-    if (!cls || !cls.codes) return { error: 'no_codes' };
-    var codes = Array.prototype.slice.call(cls.codes);
-    var redN = 0, blkN = 0, details = [];
-    for (var i = 0; i < 90; i++) {
-      var v = codes[i];
-      if (!v) continue;
-      if (v >= 1 && v <= 7) redN++; else blkN++;
-      details.push([i, v]);
-    }
-    return {
-      codes: codes,
-      fen: codesToBoardFen(codes),
-      redN: redN,
-      blkN: blkN,
-      valid: validateCodes(codes),
-      usable: codesUsable(codes),
-      occupied: details.length,
-      details: details,
-      conf: session.recognizer.lastConf ? Array.prototype.slice.call(session.recognizer.lastConf) : null,
-      ranked: session.recognizer.lastRanked || null
-    };
-  },
-
-  /**
-   * 调试：对单格做半径/偏移扫描，看「换个采样窗口这一格会变成什么」
-   * @param {number} sq 格子序号 0..89
-   * @param {number} scale 半径倍率（相对默认 radius）
-   * @param {number} dxF cell 单位的水平偏移
-   * @param {number} dyF cell 单位的垂直偏移
-   */
-  debugCell: function (pixels, w, h, sq, scale, dxF, dyF) {
-    var rec = session.recognizer;
-    if (!rec) return null;
-    var pts = rec.gridPoints();
-    var cell = rec.cellSize(pts);
-    var radius = Math.max(3, Math.round(cell * rec.cellRadiusRatio * (scale || 1)));
-    var gain = rec.estimateGain(pixels, w, h, pts);
-    var cx = pts[sq * 2] + (dxF || 0) * cell;
-    var cy = pts[sq * 2 + 1] + (dyF || 0) * cell;
-    var s = rec.sampleCell(pixels, w, h, cx, cy, radius, true, gain);
-    var m = rec.matchCell(s);
-    return {
-      key: m.key, score: m.score, warmRatio: m.warmRatio,
-      alts: (m.alts || []).map(function (a) { return [a.key, Math.round(a.score * 1000) / 1000]; }),
-      inkR: Math.round((s.inkR || 0) * 1000) / 1000,
-      warmR: Math.round((s.warmR || 0) * 1000) / 1000,
-      skipped: s.skipped || 0,
-      cell: cell, radius: radius
-    };
-  },
-
   /**
    * 把一步 UCCI 着法翻译成中文着法 + 起止格
    * （2.1.0：检测到的走法用它出中文记谱；引擎建议的中文记谱由
@@ -1242,35 +711,6 @@ var JJEngine = {
     } catch (e) {
       return { chinese: '', from: -1, to: -1 };
     }
-  },
-
-  /** 调试：切换兵种打分方式 'dot' | 'f1' | 'mass' | 'mass:0.5'（后者同时设惩罚系数） */
-  setScoreMode: function (mode) {
-    if (!session.recognizer) return false;
-    var parts = String(mode).split(':');
-    session.recognizer.scoreMode = parts[0];
-    if (parts.length > 1) session.recognizer.massK = parseFloat(parts[1]);
-    return session.recognizer.scoreMode === parts[0];
-  },
-
-  /** 调试：输出 90 个格子的原始特征，用来定位「哪一格为什么判错」 */
-  debugSample: function (pixels, w, h) {
-    if (!session.recognizer) return null;
-    var stats = session.recognizer.sampleAll(pixels, w, h, true);
-    var out = [];
-    for (var i = 0; i < 90; i++) {
-      var s = stats[i] || {};
-      out.push([
-        i,
-        Math.round((s.inkR || 0) * 1000) / 1000,
-        Math.round((s.warmR || 0) * 1000) / 1000,
-        Math.round((s.redInkR || 0) * 1000) / 1000,
-        Math.round((s.darkInkR || 0) * 1000) / 1000,
-        Math.round((s.redR || 0) * 1000) / 1000,
-        s.skipped || 0
-      ]);
-    }
-    return out;
   },
 
   /**
@@ -1331,7 +771,16 @@ var JJEngine = {
       }
       var raw = cls.codes ? cls.codes[sm] : 0;
       var conf = cls.conf ? (cls.conf[sm] || 0) : 1;
-      if (liveMode) { mergedCodes[sm] = raw; continue; }
+      if (liveMode) {
+        mergedCodes[sm] = raw;
+        /* 2.1.79：实时模式仍然不保留旧值（保留会导致「对方走了浮窗里没变」
+           那个老 bug），但必须把「认出了子、可模板分数很低」的格子记下来。
+           以前 live 直接 continue，置信度机制在生产环境等于不存在 ——
+           高亮圈 / 落子放大只要遮住一帧，就按低分硬猜一个兵种，整盘喂给引擎。
+           空格不参与计数：判空比判兵种可靠得多，算进去会频繁误报。 */
+        if (raw && conf < LOWCONF) lowConfCount++;
+        continue;
+      }
       var st = stats[sm];
       var warm = st ? (st.warmR || 0) : 0;
       var okCell;
@@ -1843,6 +1292,7 @@ var JJEngine = {
     out.diffChanged = stepInfo.changed;
     out.anchorFen = session.anchorFen || '';
     out.flipped = session.flipped ? 1 : 0;
+    out.unsureCount = session.lowConfCount || 0;
     out.skipReason = 'none';
 
     // 2) 到了我方走 → 算棋
@@ -1856,6 +1306,28 @@ var JJEngine = {
     if (!legalNow || !cls.codes || !codesUsable(cls.codes)) {
       out.skipAnalyze = 1;
       out.skipReason = !legalNow ? 'illegal' : 'empty';
+      out.needSearch = 0;
+      out.searchFen = '';
+      return out;
+    }
+
+    /* 2.1.79 治理「乱指挥」：待确认格子太多就不硬猜
+     *
+     * 之前 live 模式完全跳过置信度判断，于是任何一帧只要结构上合法就直接
+     * 组 FEN 喂引擎 —— 哪怕里面有六七个格子是低分蒙出来的兵种。引擎会非常
+     * 认真地对着错盘面算，建议自然离谱，而用户完全看不出是识别错了。
+     *
+     * 现在：待确认格子超过阈值就整帧不发搜索，让 HUD 明确显示「识别待确认」。
+     * 阈值取 6 是有意的宽松值：
+     *   - 真机落子动画一般只影响 1~3 格（起点 / 终点 + 高亮圈）；
+     *   - 残局模板少、分数普遍偏低，阈值太紧会一直卡住不给建议；
+     *   - 6 格约占 32 枚棋子的 19%，超过这个比例说明整帧整体不可信。
+     * 不退避：下一帧正常就立刻恢复，不要像旧的 illegalStreak 那样歇几秒。 */
+    var unsureCount = session.lowConfCount || 0;
+    if (unsureCount > JJ_MAX_UNSURE_CELLS) {
+      out.skipAnalyze = 1;
+      out.skipReason = 'lowconf';
+      out.unsureCount = unsureCount;
       out.needSearch = 0;
       out.searchFen = '';
       return out;
@@ -1905,20 +1377,6 @@ var JJEngine = {
 
   /** 当前局面 */
   currentFen: function () { return session.tracker ? session.tracker.fen : C.START_FEN; },
-
-  /** 手动修正局面（识别错了的时候用） */
-  forceSetFen: function (fen) {
-    session.tracker = new TRK.MoveTracker(fen);
-    session.lastFen = fen;
-    session.lastResult = null;
-    return session.tracker.fen;
-  },
-
-  /** 调试：把一个 FEN 渲染成 90 格三分类（验证追踪逻辑） */
-  fenToGrid: function (fen) {
-    var pos = new POS.Position(fen);
-    return Array.prototype.slice.call(TRK.boardToGrid(pos.board));
-  },
 
   /** 棋盘 → 每个交叉点在该帧中的像素坐标，给 UI 画箭头用 */
   gridPoints: function () {

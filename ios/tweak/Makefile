@@ -39,7 +39,9 @@ JJCheat_FILES = Tweak.x \
                 Capture/JJScreenGrabber.m \
                 Engine/JJPikafish.m \
                 Engine/JJPikafishInstaller.m \
-                Engine/JJMoveCodec.m
+                Engine/JJMoveCodec.m \
+                Engine/JJEngineOptions.m \
+                Core/JJCopy.m
 
 JJ_CORE := $(THEOS_PROJECT_DIR)/Core
 JJ_CAPTURE := $(THEOS_PROJECT_DIR)/Capture

@@ -5,11 +5,13 @@
 
 #import "JJGameController.h"
 #import "JJConfig.h"
+#import "JJCopy.h"
 #import "JJCalibrator.h"
 #import "JJVisionBridge.h"
 #import "JJPikafish.h"
 #import "JJPikafishInstaller.h"
 #import "JJMoveCodec.h"
+#import "JJEngineOptions.h"
 #import "JJScreenGrabber.h"
 #import "JJMetalGrabber.h"
 #import "JJBallWindow.h"
@@ -72,6 +74,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
 - (void)toggleHUD;
 - (void)editThinkMs;
 - (void)showEngineStatus;
+- (void)editEngineOptions;
 - (void)applyThinkMs:(NSInteger)v;
 @end
 
@@ -91,17 +94,10 @@ typedef NS_ENUM(NSInteger, JJGameState) {
         _state = JJGameStateIdle;
         _enabled = [ud objectForKey:JJ_KEY_ENABLED] ? [ud boolForKey:JJ_KEY_ENABLED] : YES;
         _hudVisible = [ud objectForKey:JJ_KEY_HUD_VISIBLE] ? [ud boolForKey:JJ_KEY_HUD_VISIBLE] : YES;
-        NSInteger savedMs = [ud integerForKey:JJ_KEY_THINK_MS];
-        if (![ud boolForKey:JJ_KEY_THINK_MS_V2]) {
-            /* 一次性迁移：2.0.x 的 200ms 是给 JS 引擎调的值，
-               Pikafish 吃 48MB NNUE，这个时长等于没思考。 */
-            if (savedMs > 0 && savedMs <= 250) savedMs = 0;
-            [ud setBool:YES forKey:JJ_KEY_THINK_MS_V2];
-            [ud synchronize];
-        }
-        _thinkMs = savedMs > 0
-            ? MIN(JJ_THINK_MS_MAX, MAX(JJ_THINK_MS_MIN, savedMs))
-            : JJ_THINK_MS_DEFAULT;
+        /* 2.1.79：思考时长与其它引擎参数的读取/迁移/夹区间统一在
+           JJEngineOptions 里做，这里只取一次值，不再重复一遍迁移逻辑
+           （两处各写一份是「同逻辑多实现」的典型，迟早分叉）。 */
+        _thinkMs = [JJEngineOptions shared].thinkMs;
         _engineGen = 0;
         NSLog(@"[JJCheat] 配置: 插件=%@ HUD=%@ 思考=%ldms",
               _enabled ? @"开" : @"关", _hudVisible ? @"开" : @"关", (long)_thinkMs);
@@ -190,10 +186,40 @@ typedef NS_ENUM(NSInteger, JJGameState) {
             case 3: [self2 resetToStartPosition];             break;
             case 4: [self2 toggleHUD];                       break;
             case 5: [self2 editThinkMs];                     break;
-            case 6: [self2 showEngineStatus];                break;
+            case 6: [self2 editEngineOptions];               break;
+            case 7: [self2 showEngineStatus];                break;
             default: break;
         }
     };
+    /* 2.1.79：搜索进度 → HUD。
+       以前只在 bestmove 时刷新，用户点完球之后整段思考时间里界面毫无变化，
+       主观上就是「卡住了」。现在深度/节点/分值边算边刷（引擎侧已 150ms 节流），
+       而且着法一旦确定会先给中文提示，具体坐标等 bestmove 落地。
+       注意：这里只更新文本，不画箭头 —— 箭头要等 bestmove，避免中途乱指。 */
+    __weak typeof(self) ws = self;
+    [[JJPikafish shared] setOnSearchProgress:^(NSDictionary *info) {
+        __strong typeof(ws) s2 = ws;
+        if (!s2) return;
+        if (!s2.enginePending) return;          // 已经出结果了就不再刷
+        NSMutableDictionary *disp = [NSMutableDictionary dictionary];
+        NSDictionary *rec = s2.lastRecognition ?: @{};
+        [disp addEntriesFromDictionary:rec];
+        disp[@"from"] = @-1;                    // 搜索中不画箭头
+        disp[@"to"] = @-1;
+        disp[@"suggest"] = @"";
+        disp[@"suggestChinese"] = @"";
+        disp[@"depth"] = info[@"depth"] ?: @0;
+        disp[@"nodes"] = info[@"nodes"] ?: @0;
+        disp[@"score"] = info[@"score"] ?: @0;
+        disp[@"mate"] = info[@"mate"] ?: @0;
+        disp[@"enginePending"] = @1;
+        disp[@"engineState"] = @"思考中";
+        disp[@"sideToMove"] = rec[@"sideToMove"] ?: @"red";
+        [[JJHUDWindow shared] showResult:disp
+                              gridPoints:[JJCalibrator shared].gridPts
+                                     fen:rec[@"fen"] ?: @""];
+    }];
+
     [self.ballWindow attach];
 }
 
@@ -223,8 +249,18 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     [arr addObject:[JJMenuEntry title:@"重置开局" symbol:@"arrow.counterclockwise"]];
 
     JJMenuEntry *e4 = [JJMenuEntry title:@"思考" symbol:@"timer"];
-    e4.value = [NSString stringWithFormat:@"%ldms", (long)self.thinkMs];
+    {
+        JJEngineOptions *o = [JJEngineOptions shared];
+        e4.value = o.thinkDepth > 0
+            ? [NSString stringWithFormat:@"D%ld", (long)o.thinkDepth]
+            : [NSString stringWithFormat:@"%ldms", (long)o.thinkMs];
+    }
     [arr addObject:e4];
+
+    /* 2.1.79：引擎可调参数统一入口。
+       菜单项与 JJEngineOptions 的配置键一一对应，加新参数只改那一层 + 这里的弹窗，
+       不动搜索主流程。 */
+    [arr addObject:[JJMenuEntry title:@"引擎参数" symbol:@"slider.horizontal.3"]];
 
     /* 引擎状态：就绪=绿、启动中/搜索中=绿、异常=红。
        颜色直接反映健康度，不必点进去才知道。 */
@@ -283,13 +319,12 @@ typedef NS_ENUM(NSInteger, JJGameState) {
 }
 
 - (void)applyThinkMs:(NSInteger)v {
-    if (v <= 0) v = JJ_THINK_MS_DEFAULT;
-    v = MIN(JJ_THINK_MS_MAX, MAX(JJ_THINK_MS_MIN, v));
-    self.thinkMs = v;
-    [[NSUserDefaults standardUserDefaults] setInteger:v forKey:JJ_KEY_THINK_MS];
-    [[NSUserDefaults standardUserDefaults] synchronize];
+    /* 夹区间与持久化都在配置层，这里只同步内存值 + 反馈 */
+    [[JJEngineOptions shared] setThinkMs:v];
+    self.thinkMs = [JJEngineOptions shared].thinkMs;
+    v = self.thinkMs;
     [[JJHUDWindow shared] showStatus:[NSString stringWithFormat:@"思考时间已设为 %ld ms", (long)v]];
-    [self.ballWindow toast:[NSString stringWithFormat:@"思考时间 %ld ms", (long)v]];
+    [self.ballWindow toast:[NSString stringWithFormat:@"思考时间 %ld ms（下一步生效）", (long)v]];
     NSLog(@"[JJCheat] 思考时间=%ld ms", (long)v);
 }
 
@@ -337,7 +372,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     /* 已经有一个模态在展示时再 present 会失败（UIKit 只打警告，弹窗根本不出现）。
        连点两次菜单就会踩到，所以这里直接挡掉。 */
     if (self.ballWindow.rootViewController.presentedViewController) {
-        [self.ballWindow toast:@"请先关闭当前弹窗"];
+        [self.ballWindow toast:JJCopyCloseDialogFirst];
         return;
     }
     [self.ballWindow.rootViewController presentViewController:ac animated:YES completion:nil];
@@ -347,6 +382,213 @@ typedef NS_ENUM(NSInteger, JJGameState) {
 /** 引擎状态详情：一眼看出 Pikafish 到底在不在、跑没跑起来。
     2.1.52 起引擎在进程内跑（静态库链进 dylib），没有可执行文件可查，
     所以只报告「权重路径 / 权重大小 / 引擎线程是否活着」。 */
+#pragma mark - 引擎参数（2.1.79）
+
+/** 引擎可调参数面板。
+ *
+ *  设计原则：菜单项 ↔ JJEngineOptions 的配置键一一对应。
+ *  加新参数只需要在 JJEngineOptions 加键 + 在这里加一段选项，
+ *  搜索主流程（position/go/bestmove）一个字都不用动。
+ *
+ *  只有 Pikafish 真的支持的选项才出现在这里（见 engine.cpp 的 options.add）。
+ *  皮卡鱼没有开局库 / 残局库，所以不做假开关。
+ */
+- (void)editEngineOptions {
+    if (self.ballWindow.hidden) [self.ballWindow attach];
+    if (self.ballWindow.rootViewController.presentedViewController) {
+        [self.ballWindow toast:JJCopyCloseDialogFirst];
+        return;
+    }
+    JJEngineOptions *o = [JJEngineOptions shared];
+
+    UIAlertController *ac =
+        [UIAlertController alertControllerWithTitle:@"引擎参数"
+                                            message:[o summary]
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    /* ---- 思考方式：时间 / 深度，二选一 ---- */
+    [ac addAction:[UIAlertAction actionWithTitle:
+                   [NSString stringWithFormat:@"按时间思考（当前 %ld ms）", (long)o.thinkMs]
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *a) {
+        [self promptNumberWithTitle:@"思考时间（ms）"
+                               note:[NSString stringWithFormat:@"%d~%d，越大越强也越费电",
+                                     JJ_OPT_THINK_MS_MIN, JJ_OPT_THINK_MS_MAX]
+                                cur:o.thinkMs
+                                min:JJ_OPT_THINK_MS_MIN
+                                max:JJ_OPT_THINK_MS_MAX
+                              apply:^(NSInteger v) {
+            [o setThinkDepth:0];      // 选了时间就关掉深度模式
+            [o setThinkMs:v];
+            self.thinkMs = o.thinkMs;
+            [self afterEngineOptionsChanged:NO];
+        }];
+    }]];
+
+    [ac addAction:[UIAlertAction actionWithTitle:
+                   [NSString stringWithFormat:@"按深度思考（当前 %@）",
+                    o.thinkDepth > 0 ? [NSString stringWithFormat:@"%ld 层", (long)o.thinkDepth]
+                                     : @"关闭"]
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *a) {
+        [self promptNumberWithTitle:@"搜索深度（层）"
+                               note:[NSString stringWithFormat:@"%d~%d；填 0 关闭深度模式",
+                                     JJ_OPT_THINK_DEPTH_MIN, JJ_OPT_THINK_DEPTH_MAX]
+                                cur:o.thinkDepth
+                                min:JJ_OPT_THINK_DEPTH_MIN
+                                max:JJ_OPT_THINK_DEPTH_MAX
+                              apply:^(NSInteger v) {
+            [o setThinkDepth:v];
+            [self afterEngineOptionsChanged:NO];
+        }];
+    }]];
+
+    /* ---- Hash ---- */
+    [ac addAction:[UIAlertAction actionWithTitle:
+                   [NSString stringWithFormat:@"哈希表（当前 %ld MB）", (long)o.hashMb]
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *a) {
+        [self promptNumberWithTitle:@"哈希表（MB）"
+                               note:[NSString stringWithFormat:
+                                     @"%d~%d。越大算得越深，但占内存。改完下一步生效。",
+                                     JJ_OPT_HASH_MB_MIN, JJ_OPT_HASH_MB_MAX]
+                                cur:o.hashMb
+                                min:JJ_OPT_HASH_MB_MIN
+                                max:JJ_OPT_HASH_MB_MAX
+                              apply:^(NSInteger v) {
+            [o setHashMb:v];
+            [self afterEngineOptionsChanged:NO];
+        }];
+    }]];
+
+    /* ---- MultiPV：多线路 ---- */
+    [ac addAction:[UIAlertAction actionWithTitle:
+                   [NSString stringWithFormat:@"多线路 MultiPV（当前 %ld）", (long)o.multiPV]
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *a) {
+        [self promptNumberWithTitle:@"MultiPV（候选线路数）"
+                               note:[NSString stringWithFormat:
+                                     @"%d~%d。>1 时引擎会同时报告多条候选，"
+                                     @"但 HUD 目前只画第一条。",
+                                     JJ_OPT_MULTIPV_MIN, JJ_OPT_MULTIPV_MAX]
+                                cur:o.multiPV
+                                min:JJ_OPT_MULTIPV_MIN
+                                max:JJ_OPT_MULTIPV_MAX
+                              apply:^(NSInteger v) {
+            [o setMultiPV:v];
+            [self afterEngineOptionsChanged:NO];
+        }];
+    }]];
+
+    /* ---- 线程数：必须二次确认 ---- */
+    [ac addAction:[UIAlertAction actionWithTitle:
+                   [NSString stringWithFormat:@"线程数（当前 %ld）", (long)o.threads]
+                                          style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *a) {
+        [self confirmThreadsChange];
+    }]];
+
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消"
+                                          style:UIAlertActionStyleCancel
+                                        handler:nil]];
+
+    /* ActionSheet 在 iPad 上需要锚点；iPhone 上设了也无害 */
+    ac.popoverPresentationController.sourceView = self.ballWindow;
+    ac.popoverPresentationController.sourceRect =
+        CGRectMake(CGRectGetMidX(self.ballWindow.bounds),
+                   CGRectGetMaxY(self.ballWindow.bounds) - 8, 1, 1);
+    [self.ballWindow.rootViewController presentViewController:ac animated:YES completion:nil];
+}
+
+/** 数字输入对话框：统一夹区间 + 回调 */
+- (void)promptNumberWithTitle:(NSString *)title
+                         note:(NSString *)note
+                          cur:(NSInteger)cur
+                          min:(NSInteger)lo
+                          max:(NSInteger)hi
+                        apply:(void (^)(NSInteger))apply {
+    UIAlertController *ac =
+        [UIAlertController alertControllerWithTitle:title
+                                            message:note
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.text = [NSString stringWithFormat:@"%ld", (long)cur];
+    }];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *a) {
+        __strong typeof(ws) s2 = ws;
+        if (!s2) return;
+        NSInteger v = [ac.textFields.firstObject.text integerValue];
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        if (apply) apply(v);
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self.ballWindow.rootViewController presentViewController:ac animated:YES completion:nil];
+}
+
+/** 线程数二次确认。
+ *
+ *  【为什么必须确认】2.1.60~62 真机实测：setoption Threads 会走
+ *  resize_threads() → threads.clear() 再 pthread_create。iOS 上重建不干净时
+ *  worker 悬空，go 时 main_thread()->worker->limits 在 0x0 解引用 → SIGSEGV。
+ *  也就是说这个开关一旦打开，代价是闪退而不是变慢，必须让用户明确知情。
+ */
+- (void)confirmThreadsChange {
+    JJEngineOptions *o = [JJEngineOptions shared];
+    NSString *msg = [NSString stringWithFormat:
+                     @"当前 %ld 线程。\n\n"
+                     @"警告：改线程数会重建引擎的搜索线程池。历史上（2.1.60~62）"
+                     @"真机出现过重建后 worker 悬空、搜索时闪退的问题。\n\n"
+                     @"改完会立即重启引擎（重新加载 50MB 权重，约 1~3 秒），"
+                     @"期间不出建议。若闪退，重进 App 后把线程数改回 1 即可恢复。",
+                     (long)o.threads];
+    UIAlertController *ac =
+        [UIAlertController alertControllerWithTitle:@"确定要改线程数？"
+                                            message:msg
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"我明白，继续"
+                                          style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *a) {
+        __strong typeof(ws) s2 = ws;
+        if (!s2) return;
+        [s2 promptNumberWithTitle:@"线程数"
+                             note:[NSString stringWithFormat:@"%d~%d，默认 1",
+                                   JJ_OPT_THREADS_MIN, JJ_OPT_THREADS_MAX]
+                              cur:o.threads
+                              min:JJ_OPT_THREADS_MIN
+                              max:JJ_OPT_THREADS_MAX
+                            apply:^(NSInteger v) {
+            [o setThreads:v];
+            [s2 afterEngineOptionsChanged:YES];
+        }];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self.ballWindow.rootViewController presentViewController:ac animated:YES completion:nil];
+}
+
+/** 参数改完：热更新 or 重启引擎，并给明确反馈 */
+- (void)afterEngineOptionsChanged:(BOOL)needsRestart {
+    JJEngineOptions *o = [JJEngineOptions shared];
+    if (needsRestart) {
+        [self.ballWindow toast:@"正在重启引擎（重新加载权重）…"];
+        [[JJPikafish shared] shutdown];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [[JJPikafish shared] start];
+            [self.ballWindow toast:@"引擎已按新参数重启"];
+        });
+    } else {
+        /* 不重建线程：只下发 setoption，下一步搜索就生效 */
+        [[JJPikafish shared] applyOptionsHot];
+        [self.ballWindow toast:[NSString stringWithFormat:@"%@ · 下一步生效", [o summary]]];
+    }
+    NSLog(@"[JJCheat] 引擎参数变更: %@ (restart=%d)", [o summary], (int)needsRestart);
+}
+
 - (void)showEngineStatus {
     JJPikafish *pika = [JJPikafish shared];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -374,14 +616,14 @@ typedef NS_ENUM(NSInteger, JJGameState) {
         [msg appendString:@"\n网络校验没通过 → 引擎会跳过搜索（不会再闪退）。"];
     }
 
-    [msg appendFormat:@"线程 1 · 哈希 %d MB · 每步 %ld ms", JJ_PIKA_HASH_MB, (long)self.thinkMs];
+    [msg appendFormat:@"%@", [[JJEngineOptions shared] summary]];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"皮卡鱼引擎"
                                                                message:msg
                                                         preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
     if (self.ballWindow.hidden) [self.ballWindow attach];
     if (self.ballWindow.rootViewController.presentedViewController) {
-        [self.ballWindow toast:@"请先关闭当前弹窗"];
+        [self.ballWindow toast:JJCopyCloseDialogFirst];
         return;
     }
     [self.ballWindow.rootViewController presentViewController:ac animated:YES completion:nil];
@@ -411,8 +653,8 @@ typedef NS_ENUM(NSInteger, JJGameState) {
 
 - (void)autoCalibrate {
     if (!self.enabled) {
-        [[JJHUDWindow shared] showStatus:@"请先开启插件"];
-        [self.ballWindow toast:@"请先开启插件"];
+        [[JJHUDWindow shared] showStatus:JJCopyNeedPluginOn];
+        [self.ballWindow toast:JJCopyNeedPluginOn];
         return;
     }
     if (!self.activated) [self activate];
@@ -429,14 +671,14 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     self.state = JJGameStateWaitingBoard;
     [self startTimer];
     [[JJHUDWindow shared] showStatus:@"自动标定中…请停在【开局】棋盘画面"];
-    [self.ballWindow toast:@"自动标定中 · 请停在开局棋盘画面"];
+    [self.ballWindow toast:JJCopyCalibAutoRunning];
     NSLog(@"[JJCheat] 自动标定棋盘：备份旧标定，重新学习（不清空 JS 锚盘）");
 }
 
 - (void)manualCalibrate {
     if (!self.enabled) {
-        [[JJHUDWindow shared] showStatus:@"请先开启插件"];
-        [self.ballWindow toast:@"请先开启插件"];
+        [[JJHUDWindow shared] showStatus:JJCopyNeedPluginOn];
+        [self.ballWindow toast:JJCopyNeedPluginOn];
         return;
     }
     if (!self.activated) [self activate];
@@ -451,7 +693,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     self.learnedBoard = NO;
     self.state = JJGameStateCalibrating;
 
-    [self.ballWindow toast:@"点棋盘四个角：左上→右上→右下→左下"];
+    [self.ballWindow toast:JJCopyCalibTapFourCorners];
     __weak typeof(self) weakSelf = self;
     [[JJHUDWindow shared] beginCalibrationWithCompletion:^(NSArray<NSValue *> *corners) {
         __strong typeof(weakSelf) self2 = weakSelf;
@@ -469,8 +711,8 @@ typedef NS_ENUM(NSInteger, JJGameState) {
             self.state = JJGameStateRunning;
             self.calibrationPending = NO;
             [self startTimer];
-            [[JJHUDWindow shared] showStatus:@"四角无效 · 已恢复上次标定"];
-            [self.ballWindow toast:@"四角无效 · 已恢复上次标定"];
+            [[JJHUDWindow shared] showStatus:JJCopyCalibInvalidRestored];
+            [self.ballWindow toast:JJCopyCalibInvalidRestored];
         } else {
             self.state = JJGameStateWaitingBoard;
             [self startTimer];
@@ -489,7 +731,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     [self startTimer];
     [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
     [[JJHUDWindow shared] showStatus:@"标定完成 · 请进入一局新棋（开局布局）"];
-    [self.ballWindow toast:@"标定完成 · 请进入一局新棋"];
+    [self.ballWindow toast:JJCopyCalibDone];
 }
 
 - (void)resetToStartPosition {
@@ -511,7 +753,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     self.state = JJGameStateWaitingBoard;
     [self startTimer];
     [[JJHUDWindow shared] showStatus:@"已重置 · 等开局画面"];
-    [self.ballWindow toast:@"已重置 · 请停在开局棋盘画面"];
+    [self.ballWindow toast:JJCopyResetDone];
 }
 
 #pragma mark - 画面指纹（主线程极轻计算）
@@ -1024,16 +1266,59 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
        那句话把人往识别方向引，而实际问题在引擎。这里明确区分开。 */
     NSString *notice = [JJPikafish shared].lastEngineNotice;
     if ([notice hasPrefix:@"JJ-NNUE FAIL"]) {
-        disp[@"engineBlocked"] = @"引擎网络未就绪";
+        disp[@"engineBlocked"] = JJCopyEngineNetNotReady;
     } else if ([[JJPikafish shared] state] == JJPikaStateDead) {
-        disp[@"engineBlocked"] = @"引擎不可用";
+        disp[@"engineBlocked"] = JJCopyEngineUnavailable;
     } else if ([rec[@"skipReason"] isEqualToString:@"king"]) {
         /* 2.1.76：识别侧主动拦下了这一帧（王/将不唯一，或走子方能吃对方王）。
            这种盘面 Pikafish 会拒绝，以前会让它 exit 拆掉 App。
            现在只是这一帧不发搜索 —— 明确告诉用户是识别在等，不是视角问题。 */
-        disp[@"engineBlocked"] = @"识别待确认 · 王将不唯一";
+        disp[@"engineBlocked"] = JJCopyRecogPendingKing;
     }
     disp[@"sideToMove"] = rec[@"sideToMove"] ?: (waiting ? @"black" : @"red");
+
+    /* ★ 2.1.79 修「我方执黑时箭头指向对角」
+     *
+     * from/to 来自 JJSqFromICCS/JJPikafish，是**引擎坐标（红永远在下）**；
+     * 而 gridPoints 是**屏幕坐标**（row 0 = 用户点按的顶边）。
+     * 执黑时 JS 侧用 flipCodes() 把屏幕格旋转 180° 转成引擎坐标去组 FEN，
+     * 但画箭头时没有转回来 —— 行、列同时反向 → 箭头指向对角。
+     *
+     * 统一在这里做一次反变换，只在「喂给 HUD」这一个出口做：
+     * 不要在 JJPikafish 里改（那会污染搜索缓存与日志里的 FEN），
+     * 也不要在 HUD 里改（HUD 不该知道引擎坐标的存在）。
+     * 旋转 180° 正反同式，所以直接复用 JJSqRotate180。 */
+    if ([rec[@"flipped"] integerValue] != 0) {
+        NSInteger f = [disp[@"from"] integerValue];
+        NSInteger t = [disp[@"to"] integerValue];
+        if (f >= 0 && f < 90) disp[@"from"] = @(JJSqRotate180((int)f));
+        if (t >= 0 && t < 90) disp[@"to"] = @(JJSqRotate180((int)t));
+
+        /* pv 是 ICCS 串序列，将来画多层箭头时同样需要旋转。
+           ICCS 与内部 sq 的关系：col = sq%9, rank = 9 - sq/9（见 JJMoveCodec.m 顶部）。
+           这里从 ICCS 解出 sq → 旋转 → 再拼回 ICCS，顺序必须保持 from 在前。 */
+        if ([disp[@"pv"] isKindOfClass:[NSArray class]]) {
+            NSMutableArray *pv2 = [NSMutableArray array];
+            for (id m in (NSArray *)disp[@"pv"]) {
+                if (![m isKindOfClass:[NSString class]] || [(NSString *)m length] < 4) {
+                    [pv2 addObject:m];
+                    continue;
+                }
+                int a = JJSqFromICCS(m, 0), b = JJSqFromICCS(m, 1);
+                if (a < 0 || b < 0) {
+                    [pv2 addObject:m];
+                    continue;
+                }
+                int ra = JJSqRotate180(a), rb = JJSqRotate180(b);
+                /* sq → ICCS：列 = sq%9 的字母，rank = 9 - sq/9 */
+                [pv2 addObject:[NSString stringWithFormat:@"%c%d%c%d",
+                                (char)('a' + ra % 9), 9 - ra / 9,
+                                (char)('a' + rb % 9), 9 - rb / 9]];
+            }
+            disp[@"pv"] = pv2;
+        }
+    }
+
     [[JJHUDWindow shared] showResult:disp
                           gridPoints:[JJCalibrator shared].gridPts
                                  fen:rec[@"fen"] ?: @""];
