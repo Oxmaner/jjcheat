@@ -160,64 +160,52 @@ NETWORK_CPP_DESC_NEW = """        if (got != want)
         }
         remaining -= want;"""
 
-NETWORK_CPP_READPARAMS_OLD = """bool Network::read_parameters(std::istream& stream, std::string& netDescription) {
-    u32 hashValue;
-    if (!read_header(stream, &hashValue, &netDescription))
-        return false;
-    if (hashValue != Network::hash)
-        return false;
-    if (!Detail::read_parameters(stream, featureTransformer))
-        return false;
-    for (usize i = 0; i < LayerStacks; ++i)
-    {
-        if (!Detail::read_parameters(stream, network[i]))
-            return false;
-    }
-    return stream && stream.peek() == std::ios::traits_type::eof();
-}"""
+# read_parameters 用**小锚点**改，不整函数替换：
+# 不同 Pikafish 版本这个函数差异很大（master 多出 LayerStack 表校验），
+# 整段替换会在换 commit 时立刻失效。下面每个锚点在目标版本里必须唯一。
+READPARAMS_ANCHORS = [
+    # A. 函数入口：清空上一次的失败原因
+    ("    u32 hashValue;\n    if (!read_header(stream, &hashValue, &netDescription))\n        return false;",
+     "    u32 hashValue;\n    g_jjLoadError = \"\";\n"
+     "    if (!read_header(stream, &hashValue, &netDescription))\n"
+     "    {\n        if (*g_jjLoadError == '\\0')\n"
+     "            g_jjLoadError = \"header rejected\";\n        return false;\n    }"),
 
-NETWORK_CPP_READPARAMS_NEW = """bool Network::read_parameters(std::istream& stream, std::string& netDescription) {
-    u32 hashValue;
-    g_jjLoadError = "";
+    # B. 架构哈希比对：把两个值都记下来（这是定位"权重与源码不配套"的关键）
+    ("    if (hashValue != Network::hash)\n        return false;",
+     "    g_jjFileHash = unsigned(hashValue);\n"
+     "    g_jjWantHash = unsigned(Network::hash);\n"
+     "    if (hashValue != Network::hash)\n    {\n"
+     "        g_jjLoadError = \"architecture hash mismatch (net not built for this engine)\";\n"
+     "        return false;\n    }"),
 
-    if (!read_header(stream, &hashValue, &netDescription))
-    {
-        if (*g_jjLoadError == '\\0')
-            g_jjLoadError = "header rejected";
-        return false;
-    }
+    # C. feature transformer 参数
+    ("    if (!Detail::read_parameters(stream, featureTransformer))\n        return false;",
+     "    if (!Detail::read_parameters(stream, featureTransformer))\n    {\n"
+     "        g_jjLoadError = \"feature-transformer parameters unreadable\";\n"
+     "        return false;\n    }"),
 
-    // 文件里的架构哈希 vs 本引擎编出来的哈希：不一致就说明权重和源码不配套
-    // （scripts/net.sh 拉的是滚动发布 master-net，而源码钉在某个 tag 上，
-    //  这是本项目最可能踩的坑，所以把两个值都原样报出去）。
-    g_jjFileHash = unsigned(hashValue);
-    g_jjWantHash = unsigned(Network::hash);
-    if (hashValue != Network::hash)
-    {
-        g_jjLoadError = "architecture hash mismatch (net not built for this engine)";
-        return false;
-    }
+    # D. 各 layer stack 参数（两种写法都兼容）
+    ("    for (usize i = 0; i < storedLayerStacks; ++i)\n    {\n"
+     "        if (!Detail::read_parameters(stream, network[i]))\n            return false;\n    }",
+     "    for (usize i = 0; i < storedLayerStacks; ++i)\n    {\n"
+     "        if (!Detail::read_parameters(stream, network[i]))\n        {\n"
+     "            g_jjLoadError = \"layer-stack parameters unreadable\";\n"
+     "            return false;\n        }\n    }"),
 
-    if (!Detail::read_parameters(stream, featureTransformer))
-    {
-        g_jjLoadError = "feature-transformer parameters unreadable";
-        return false;
-    }
-    for (usize i = 0; i < LayerStacks; ++i)
-    {
-        if (!Detail::read_parameters(stream, network[i]))
-        {
-            g_jjLoadError = "layer-stack parameters unreadable";
-            return false;
-        }
-    }
-    if (!stream || stream.peek() != std::ios::traits_type::eof())
-    {
-        g_jjLoadError = "trailing bytes or bad stream state";
-        return false;
-    }
-    return true;
-}"""
+    ("    for (usize i = 0; i < LayerStacks; ++i)\n    {\n"
+     "        if (!Detail::read_parameters(stream, network[i]))\n            return false;\n    }",
+     "    for (usize i = 0; i < LayerStacks; ++i)\n    {\n"
+     "        if (!Detail::read_parameters(stream, network[i]))\n        {\n"
+     "            g_jjLoadError = \"layer-stack parameters unreadable\";\n"
+     "            return false;\n        }\n    }"),
+
+    # E. 收尾：多余字节 / 流状态
+    ("    return stream && stream.peek() == std::ios::traits_type::eof();",
+     "    if (!stream || stream.peek() != std::ios::traits_type::eof())\n    {\n"
+     "        g_jjLoadError = \"trailing bytes or bad stream state\";\n"
+     "        return false;\n    }\n    return true;"),
+]
 
 NETWORK_CPP_LOADEXT_OLD = """void Network::load_external(const fs::path& dir, const fs::path& evalfilePath, EvalFile& evalFile) {
     std::stringstream stream(read_compressed_nnue(dir / evalfilePath));
@@ -386,11 +374,34 @@ def main():
         (NETWORK_CPP_GLOBALS_OLD, NETWORK_CPP_GLOBALS_NEW),
         (NETWORK_CPP_HEADER_OLD, NETWORK_CPP_HEADER_NEW),
         (NETWORK_CPP_DESC_OLD, NETWORK_CPP_DESC_NEW),
-        (NETWORK_CPP_READPARAMS_OLD, NETWORK_CPP_READPARAMS_NEW),
         (NETWORK_CPP_LOADEXT_OLD, NETWORK_CPP_LOADEXT_NEW),
         (NETWORK_CPP_VERIFY_OLD, NETWORK_CPP_VERIFY_NEW),
         (NETWORK_CPP_VERIFY_TAIL_OLD, NETWORK_CPP_VERIFY_TAIL_NEW),
     ])
+
+    # read_parameters 的锚点逐条尝试：同一条锚点可能有多种写法（不同版本），
+    # 只要命中一种就算成功；全都命中不了才报错（源码又变了，必须人工看）。
+    rp = src / "nnue" / "network.cpp"
+    text = rp.read_text(encoding="utf-8")
+    for idx, (old, new) in enumerate(READPARAMS_ANCHORS, 1):
+        if new in text:
+            print(f"{MARK} read_parameters #{idx}: 已是目标状态，跳过")
+            continue
+        if text.count(old) != 1:
+            continue          # 这个写法没命中，试下一个（可能是别的版本的写法）
+        text = text.replace(old, new, 1)
+        print(f"{MARK} read_parameters #{idx}: 已替换")
+    rp.write_text(text, encoding="utf-8")
+    # 收尾校验：五个语义点必须都在
+    text = rp.read_text(encoding="utf-8")
+    need = ["g_jjLoadError = \"architecture hash mismatch",
+            "g_jjLoadError = \"feature-transformer parameters unreadable\"",
+            "g_jjLoadError = \"layer-stack parameters unreadable\"",
+            "g_jjLoadError = \"trailing bytes or bad stream state\"",
+            "g_jjFileHash = unsigned(hashValue)"]
+    for n in need:
+        if n not in text:
+            errors.append(f"network.cpp: read_parameters 改造不完整，缺 {n!r}")
 
     patch(src / "engine.h", "engine.h", [
         (ENGINE_H_OLD, ENGINE_H_NEW),

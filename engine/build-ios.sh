@@ -59,16 +59,11 @@ TARGET_FLAGS="-target arm64-apple-ios$MIN_IOS -isysroot $SDK -mios-version-min=$
 
 # ---------- 取源码 ----------
 mkdir -p "$WORK"
-if [ -d "$SRC/.git" ] && [ "$NFORCE" != "1" ]; then
-    CUR="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
-    if [ "$CUR" = "$TAG" ]; then
-        log "复用已有源码: $CUR"
-    else
-        log "已有源码 $CUR != $TAG，重新取"
-        rm -rf "$SRC"
-    fi
-fi
-if [ ! -d "$SRC" ]; then
+STAMP="$SRC/.jj-commit"
+if [ "${NFORCE}" != "1" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$TAG" ]; then
+    log "复用已有源码: $TAG"
+else
+    [ -d "$SRC" ] && log "源码不是 $TAG，重新取"
     log "取 Pikafish 源码 @ $TAG"
     rm -rf "$SRC" "$WORK/src.tgz"
     # 用 codeload 的 tarball：可以直接钉 commit（git clone --branch 只吃分支/tag）
@@ -77,9 +72,9 @@ if [ ! -d "$SRC" ]; then
         -o "$WORK/src.tgz" || die "源码下载失败（commit $TAG）"
     mkdir -p "$SRC"
     tar xzf "$WORK/src.tgz" -C "$SRC" --strip-components=1 || die "源码解包失败"
-    git -C "$SRC" init -q 2>/dev/null || true
-    # 记下实际版本，便于日志追溯
-    printf '%s\n' "$TAG" > "$SRC/.jj-commit"
+    # 记下实际版本：下次构建据此决定能不能复用（tarball 解出来不是 git 仓库，
+    # 不能靠 git rev-parse 判断）
+    printf '%s\n' "$TAG" > "$STAMP"
 fi
 
 cd "$SRC/src"
