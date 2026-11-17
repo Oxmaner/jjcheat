@@ -90,18 +90,24 @@ static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
  *  %orig 后记住本次 drawable 的 surface，交给第 N+1 帧。
  *  14MB 读回在专用 QOS_UTILITY 队列执行，渲染线程只做零拷贝登记。
  * ============================================================ */
-#if !JJ_DISABLE_METAL_HOOK
 %hook CAMetalLayer
 
+/* Logos 的 %init 会为这里声明的方法生成注册代码，所以方法体必须在；
+   否则 #if 摘掉整个方法时注册表仍引用它 → undefined-internal。
+   诊断版（JJ_DISABLE_METAL_HOOK=1）直接 return %orig：hook 照常注册，
+   但不登记 surface、不读 IOSurface、不碰任何 Metal 对象。 */
 - (id<CAMetalDrawable>)nextDrawable {
+#if JJ_DISABLE_METAL_HOOK
+    return %orig;
+#else
     JJMetalBeforeNextDrawable();
     id<CAMetalDrawable> drawable = %orig;
     JJMetalAfterNextDrawable(drawable);
     return drawable;
+#endif
 }
 
 %end
-#endif
 
 /* ============================================================
  *  入口
