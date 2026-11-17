@@ -448,3 +448,161 @@ uuid : 11f986fc-38c2-3d81-9c8d-218f15b0b588
 ```
 
 而且 thread 91 正在跑 `jjpika_start`。所以 **14:31 时注入是成功的、引擎线程是活的**。注入失效发生在 **14:31 之后**（时间上最接近的是 2.1.67 诊断包的重装），§2 的排查范围可以据此收窄。
+
+---
+
+## §12 2.1.68 实施：把 exit 改成降级（推翻 2.1.64~67）
+
+### 12.1 先说推翻的部分
+
+2.1.64~67 那五个 commit 建立在「崩溃在主线程渲染、与引擎无关」上（§3 的原结论），具体是：给 `CAMetalLayer -nextDrawable` 加 `JJ_DISABLE_METAL_HOOK=1` 开关、本地写 ReplayKit 抓帧器、以及随后的 BOM/Logos 编译修补。**这条线全部作废**（§11 已证明 thread 91 就是引擎，且栈里有 `exit`）。
+
+处理方式：本地源码整体重置回 `fe5c204e`（2.1.63）的树，接手方新增的
+`ios/tweak/JJMetalGrabber.m`、`JJReplayGrabber.h/.m` 三个多余文件删除，
+`JJConfig.h` / `Tweak.x` 的诊断开关回退。只保留一个纯技术修补：**`JJConfig.h` 去掉 BOM**（BOM 是我自己引入的，去掉无副作用）。
+
+> 提醒：`jjcheat-patch/` 不是 git 仓库，所以「回滚」是从 GitHub 上按 blob 拉回来覆盖的。以后接手时如果发现本地与云端 head 不一致，别假设本地是新的。
+
+### 12.2 引擎补丁（`engine/patch-engine.py`，构建时自动应用）
+
+单文件 14 处替换，规则是「原文本必须恰好出现 1 次」，否则构建直接失败 ——
+源码漂移时立刻变红，绝不静默产出一个「补丁没打上」的包。幂等，可反复跑。
+
+| 文件 | 改动 |
+|---|---|
+| `nnue/network.h` | `verify()` → `bool`；文件尾新增 5 个诊断访问器声明 |
+| `nnue/network.cpp` | 加 `<cstdio>`；加 TU 级静态诊断量；`read_header` 拆开「读不出」与「版本不符」；`read_parameters` 四类失败分别记录；`load_external` 记录解压字节数与实际路径；**`verify()` 删除 `exit(EXIT_FAILURE)`，改 `return false`** |
+| `engine.h` | `verify_network()` → `bool` |
+| `engine.cpp` | `go()` 失败时提前 return（不 `start_thinking`、不 exit）；`perft()` 失败返回 `u64(0)`；`verify_network()` 返回 `ok` 并给 `onVerifyNetwork` 判空 |
+
+失败时输出的那一行是这次的关键产物：
+
+```
+info string JJ-NNUE FAIL reason=<原因> | path=<实际路径> | decompressed=<字节> |
+            fileHash=0x<文件架构哈希> engineHash=0x<本引擎架构哈希> | requested=<请求的文件名>
+```
+
+`reason` 的取值直接对应剩余可能：
+`header unreadable (file missing, empty or not zstd)` /
+`format Version mismatch` / `architecture hash mismatch (net not built for this engine)` /
+`feature-transformer parameters unreadable` / `layer-stack parameters unreadable` /
+`trailing bytes or bad stream state`
+
+**为什么不给 `Network` 加成员存错误**：官方注释明确要求它保持 trivially-copyable（要映射进共享内存、不能有析构），加 `std::string` 会破坏这个契约。所以诊断量放 TU 级 `static`，通过 free function 读。
+
+### 12.3 构建与 CI
+
+- `engine/build-ios.sh`：编译前调 `patch-engine.py`；产物断言 lib 里存在 `_jj_last_network_load_error`（缺符号 = 补丁没生效，拒绝出包）；`needs_build()` 也检查这个符号，避免复用打补丁前的旧 `.a`。
+- `.github/workflows/build-roothide-deb.yml`：缓存键纳入 `patch-engine.py`；新增「校验 NNUE 权重指纹」步骤，`PIKA_NET_SHA256` 钉死为 `071aefc0…e458`。`scripts/net.sh` 拉的是滚动发布 `master-net`，官方换网络后新权重可能与本 `PIKA_TAG` 架构不符 —— 一漂构建就红。
+- `engine/check-net.py`（新增）：校验存在性、大小下限、zstd 头（`28b52ffd`）、sha256。
+
+### 12.4 OC 侧
+
+- `JJPikafish.m::handleLineOnQueue:`：**`info string` 判断提到 `info ` 之前**。这是「引擎有没有加载上权重」一直看不见的直接原因（详见 §11.6）。新增 `lastEngineNotice` 保存该行。
+- `JJPikafish.h`：暴露 `lastEngineNotice`。
+- `JJGameController.m::showEngineStatus`：「皮卡鱼引擎」详情面板显示引擎自述；判定失败时补一句「网络校验没通过 → 引擎会跳过搜索（不会再闪退）」。
+- `featureMark` → `pikafishNative2168`。
+
+### 12.5 本地校验
+
+`node tools/bundle.js`（288,538 B）+ `node tools/regression.js`（全绿）+ `bash tools/check-syntax.sh`（11 文件全绿）。补丁脚本在真实 Pikafish 源上跑过两遍：第一遍 14 处全替，第二遍全部「已是目标状态，跳过」。
+
+### 12.6 待真机验证
+
+- commit `4b416edc` / run #68；HANDOFF 另推 `de27e95b`
+- 期望：**HUD 显示「思考中」后不再闪退**。若 NNUE 真有问题，HUD 详情面板与 syslog 会出现
+  `引擎自述: info string JJ-NNUE FAIL reason=… fileHash=… engineHash=…`
+- 判读：
+  - `decompressed=0` → 文件没打开或不是 zstd（查沙盒路径 / postinst 是否落盘）
+  - `fileHash ≠ engineHash` → 权重与本源码不配套 → 换权重或改 `PIKA_TAG`，这是当前最可疑的一条
+  - 其它 reason → 按字面查参数布局/尾部字节
+  - 出现 `NNUE evaluation using …` → 网络终于加载成功，接着看 bestmove 与箭头
+
+---
+
+## §13 权重与源码必须成对 —— 一次走错又走对的排查（结论已更正）
+
+> **本节 17:0x 重写过。下面 13.4 之前那版结论（"随包 4.19MB 网络"）是错的，已作废。**
+
+### 13.1 真机把剩余可能性收敛成一个
+
+2.1.70 补丁按设计工作（App 不再闪退），日志直接给出原因：
+
+```
+engine=思考中
+info string JJ-NNUE FAIL reason=architecture hash mismatch (net not built for this engine)
+  | path=…/Pikafish/pikafish.nnue | decompressed=64701992 B
+  | fileHash=0xCACA41C8 engineHash=0x40C70FA6 | requested=pikafish.nnue
+info string NNUE not ready, search skipped (process kept alive)
+```
+
+文件在、路径对、zstd 解压成功 → 不是"读不到文件"，是**架构哈希不符**。
+
+### 13.2 第一次走错：以为 tag 的发布包里带着"配套网络"
+
+`Pikafish-2026-09-06` 的 Release 里确实有个 `pikafish.nnue`（4,186,919 B，zstd，
+解压 5,505,024 B，头 hash `0x40C70FA6` —— 与该 tag 源码算出来的一致）。
+2.1.71 装上去后：识别正常 `verifyDiff=0`、容器里 50MB 旧权重被 `kJJMaxNetSize`
+判无效并重拷、hash mismatch 也不再报 —— 但换成了下一个错：
+
+```
+info string JJ-NNUE FAIL reason=feature-transformer parameters unreadable
+```
+
+解剖文件才明白：那份网络解压只有 **5.5MB**，而该版本架构的
+`ThreatWeightSize = ThreatInputDimensions(45547) × L1(1024)` ≈ **46.6MB** ——
+**数据量根本不够**。它是另一条架构线的网络，只是头部哈希碰巧等于 FT^NA。
+**教训：文件头 hash 相等 ≠ 文件可用，还要看解压后的字节数对不对得上架构尺寸。**
+
+### 13.3 真正的答案：master 的 `Network::hash` 多了一项
+
+master `nnue/network.h`：
+
+```cpp
+static constexpr u32 LayerStackTableHash = 0x5A7AB1E5u;
+static constexpr u32 hash = FeatureTransformer::get_hash_value()
+                          ^ NetworkArchitecture::get_hash_value()
+                          ^ LayerStackTableHash;
+```
+
+之前的编译期探针只算前两项（`0x90B0F02D`），漏了第三个常量。补上：
+
+```
+0x90B0F02D ^ 0x5A7AB1E5 = 0xCACA41C8   ← 与 master-net 权重头一字不差
+```
+
+交叉验证：master-net 参数区第一个 u32 正是 `0x5A7AB1E5`，随后是 `RawLayerStacks=32`
+与 32 项 u16 fallback 表，与该版本 `read_parameters` 逐字段对得上。
+
+**所以 master 源码 + master-net 本来就是配套的一对。** 一直不匹配是因为
+源码钉在 tag `Pikafish-2026-09-06`（旧架构 `0x40C70FA6`），而 `scripts/net.sh`
+永远拉最新 master-net（`0xCACA41C8`）—— 两者错位，仅此而已。
+
+### 13.4 最终改动
+
+| 位置 | 改动 |
+|---|---|
+| `engine/build-ios.sh` | 源码钉 **commit**（`PIKA_COMMIT=8d8db92f77190dece8bd4fca9609fe2eab531844`，master HEAD 2026-11-15）；用 codeload tarball 取（`git clone --branch` 吃不了 commit）；权重回到 `scripts/net.sh` |
+| `engine/check-net.py` | `MIN_SIZE` 40MB；校验 zstd 头与 sha256 |
+| `workflow` | `PIKA_TAG` → `PIKA_COMMIT`；`PIKA_NET_SHA256=071aefc0…e458`（master-net） |
+| `Engine/JJPikafishInstaller.m` | 尺寸窗口 20~120MB（太小=截断或残留旧小网络；太大=异常；上限同时保证老用户容器里的旧文件被判无效并重拷） |
+| `engine/pikafish.nnue` | **已删除**（云端也删了），不再随包 |
+
+### 13.5 顺手修正一处误导性 HUD 文案
+
+引擎拒绝搜索时（NNUE 没就绪 / 引擎不可用），HUD 原来落到兜底分支显示
+**「视角未对齐 · 请回开局画面」** —— 那句话把人往识别方向引，而问题在引擎。
+现在 `JJGameController` 透传 `engineBlocked`，HUD 显示
+「引擎网络未就绪 · 点球看⑥详情」；真的识别失败才说视角未对齐。
+
+> 这也是 2026-11-17 17:02 用户看到"视角未对齐"的原因 —— 当时引擎因 NNUE
+> 加载失败跳过了搜索，根本没有建议可画，与视角无关。
+
+### 13.6 换版本时的清单
+
+1. 定 `PIKA_COMMIT` 为 Pikafish 某个 commit（master 或某个稳定点）
+2. 取 `scripts/net.sh` 的 master-net，算 `Network::hash` 与文件头比对
+   （注意 master 的公式含 `^ LayerStackTableHash`）
+3. **再核对解压后字节数与架构尺寸**（`ThreatWeightSize` 等），别只看 hash
+4. 更新 workflow 的 `PIKA_NET_SHA256`
+5. 尺寸若跨出 20~120MB 窗口，同步改 `check-net.py` 与 `JJPikafishInstaller.m`
