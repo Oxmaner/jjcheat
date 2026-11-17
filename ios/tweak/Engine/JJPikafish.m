@@ -359,15 +359,15 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
 - (void)handleLineOnQueue:(NSString *)line {
     if ([line hasPrefix:@"uciok"]) {
         self.sawUciok = YES;
-        /* 手机资源画像：单线程、小哈希。
-           EvalFile 显式设一次绝对路径：引擎构造时会按 argv[0] 的目录找
-           pikafish.nnue，正常情况下已经加载成功；再设一次是为了让
-           「容器被重定向 / 路径含空格」这类边角情况也能自愈。 */
-        if (self.netPath.length) {
-            [self writeLine:[NSString stringWithFormat:@"setoption name EvalFile value %@",
-                             self.netPath]];
-        }
-        [self writeLine:@"setoption name Threads value 1"];
+        /* 2.1.63：只设「无副作用」的 UCI 选项。
+           2.1.60~62 在这里发过 setoption Threads=1 和 setoption EvalFile，
+           两者都会触发引擎内部重建：Threads.set() 会 threads.clear() 再
+           pthread_create 8MB 栈的搜索线程；EvalFile 会重新加载 50MB NNUE。
+           Pikafish 默认 Threads 就是 1、构造时已按 argv[0] 目录加载 NNUE，
+           重设只是把已经就绪的线程池/权重推倒重建。iOS 上 pthread 重建不干净
+           → worker 悬空 → go movetime 时 main_thread()->worker->limits 在 0x0
+           解引用 SIGSEGV（§25.3 真机证实、§25.5 静态分析）。
+           去掉这两条，用构造时的默认线程池与权重；其余选项不重建线程。 */
         [self writeLine:[NSString stringWithFormat:@"setoption name Hash value %d",
                          JJ_PIKA_HASH_MB]];
         [self writeLine:@"setoption name Move Overhead value 0"];
