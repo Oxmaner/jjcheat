@@ -70,16 +70,27 @@ fi
 cd "$SRC/src"
 
 # ---------- NNUE 网络 ----------
-if [ ! -f pikafish.nnue ]; then
-    log "下载 NNUE 网络（约 48~60MB）"
-    sh ../scripts/net.sh || die "NNUE 下载失败（GitHub Releases 不通？）"
-else
-    log "复用已有 NNUE: $(wc -c < pikafish.nnue | tr -d ' ') 字节"
-fi
-[ -s pikafish.nnue ] || die "pikafish.nnue 是空的"
+# 【2.1.68 关键修复】不要再用官方 scripts/net.sh。
+#
+# scripts/net.sh 从 Networks 仓库的滚动发布 master-net 拉权重，而那里只有
+# "最新架构"的一个文件。它和这里钉住的 $TAG 并不配套 —— 2026-11-17 真机实测：
+#   tag Pikafish-2026-09-06 的 engineHash = 0x40C70FA6
+#   master-net 的 fileHash              = 0xCACA41C8   ← 架构不符
+# 而 Pikafish 对"架构不符"的原生反应是 Network::verify 里 exit(EXIT_FAILURE)，
+# 进程内引擎会把宿主 App 一起杀掉，历史表现就是"HUD 思考中 → 闪退"。
+#
+# 正解：用**随本仓库提交**的 engine/pikafish.nnue —— 它是从该 tag 的官方发布包
+# Pikafish.<tag>.7z 里原样取出的，架构哈希与源码严格一致（0x40C70FA6）。
+# 好处：构建不依赖外网、版本固定可复现、包体积也从 50MB 降到 4.2MB。
+BUNDLED_NET="$ROOT/engine/pikafish.nnue"
+[ -s "$BUNDLED_NET" ] || die "缺少随包网络 engine/pikafish.nnue（应与 $TAG 配套）"
+cp -f "$BUNDLED_NET" pikafish.nnue
 NET_SIZE="$(wc -c < pikafish.nnue | tr -d ' ')"
-[ "$NET_SIZE" -gt 20000000 ] || die "pikafish.nnue 只有 $NET_SIZE 字节，下载不完整"
-log "权重   : $NET_SIZE 字节"
+# 配套网络 zstd 压缩后约 4.19MB（解压 5.5MB）；master-net 那个是新架构的 50MB，
+# 两者大小差一个数量级，顺便用它兜住"又拿错文件"的情况。
+[ "$NET_SIZE" -gt 3000000 ] || die "pikafish.nnue 只有 $NET_SIZE 字节，不对"
+[ "$NET_SIZE" -lt 20000000 ] || die "pikafish.nnue 有 $NET_SIZE 字节 —— 这像是 master-net 的新架构网络，与 $TAG 不配套"
+log "权重   : $NET_SIZE 字节（engine/pikafish.nnue，与 $TAG 架构配套）"
 
 # ---------- 源码补丁（2.1.68 起） ----------
 # Network::verify 在「网络没加载成功」时会 exit(EXIT_FAILURE)，而 Engine::go

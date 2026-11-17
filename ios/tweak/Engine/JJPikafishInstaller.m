@@ -13,13 +13,20 @@
 /* 复制指纹：NSUserDefaults 记录「上次复制时源文件的大小」。
    装了新 deb（换了网）→ 大小几乎必变 → 下次启动自动重拷。 */
 #define kJJKeyNetSize @"JJCheat.pikaNetSize"
-/* 权重正常 48MB 上下；小于这个数一律当没下全 */
-#define kJJMinNetSize (20LL * 1024 * 1024)
+/* 权重尺寸窗口。2.1.68 起换成「随 tag 配套」的网络：zstd 后约 4.19MB、解压 5.5MB。
+   而官方 master-net 那个是**新架构**的 50MB 网络，与 Pikafish-2026-09-06 架构不符
+   （fileHash 0xCACA41C8 vs engineHash 0x40C70FA6），引擎会拒绝加载。
+   所以两头都要卡：太小=没下全；太大=又拿成 master-net 了。
+   加上限还有第二个作用：老用户容器里存着 50MB 旧网络，靠它把旧文件判定为无效并重拷。 */
+#define kJJMinNetSize (3LL * 1024 * 1024)
+#define kJJMaxNetSize (24LL * 1024 * 1024)
 
 static NSString *sResolvedNet = nil;
 
 @interface JJPikafishInstaller ()
 + (nullable NSString *)findSourcePath;
+/* 权重尺寸是否落在可用窗口内（见 kJJMinNetSize / kJJMaxNetSize 的说明） */
++ (BOOL)netSizeOK:(unsigned long long)size;
 @end
 
 @implementation JJPikafishInstaller
@@ -78,6 +85,10 @@ static NSString *sResolvedNet = nil;
     return paths;
 }
 
++ (BOOL)netSizeOK:(unsigned long long)size {
+    return size >= (unsigned long long)kJJMinNetSize && size <= (unsigned long long)kJJMaxNetSize;
+}
+
 + (NSString *)findSourcePath {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray<NSString *> *cands = [self candidateSources];
@@ -89,9 +100,10 @@ static NSString *sResolvedNet = nil;
             continue;
         }
         NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
-        if ([attr fileSize] < (unsigned long long)kJJMinNetSize) {
-            NSLog(@"[JJCheat][Pika] 权重源位 %lu 太小（%llu 字节），跳过: %@",
-                  (unsigned long)i, [attr fileSize], p);
+        if (![self netSizeOK:[attr fileSize]]) {
+            NSLog(@"[JJCheat][Pika] 权重源位 %lu 尺寸不对（%llu 字节，期望 %lld~%lld），跳过: %@",
+                  (unsigned long)i, [attr fileSize], (long long)kJJMinNetSize,
+                  (long long)kJJMaxNetSize, p);
             continue;
         }
         NSLog(@"[JJCheat][Pika] 权重命中源位 %lu: %@（%llu 字节）", (unsigned long)i, p,
@@ -138,7 +150,7 @@ static NSString *sResolvedNet = nil;
     long long recorded = [[NSUserDefaults standardUserDefaults] integerForKey:kJJKeyNetSize];
 
     /* 情况 1：容器副本可用，且源没变（或压根没有源）→ 直接用，省掉 48MB 复制 */
-    if (dstSize >= (unsigned long long)kJJMinNetSize) {
+    if ([self netSizeOK:dstSize]) {
         BOOL srcChanged = src && (long long)srcSize != recorded && srcSize != dstSize;
         if (!srcChanged && [self fileLooksReadable:dst]) {
             sResolvedNet = dst;
@@ -183,7 +195,7 @@ static NSString *sResolvedNet = nil;
     }
 
     /* 情况 3：源没了但容器还有旧副本 → 继续用，不因为升级失败把引擎弄没 */
-    if (dstSize >= (unsigned long long)kJJMinNetSize && [self fileLooksReadable:dst]) {
+    if ([self netSizeOK:dstSize] && [self fileLooksReadable:dst]) {
         sResolvedNet = dst;
         return dst;
     }
