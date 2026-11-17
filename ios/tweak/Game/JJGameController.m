@@ -494,6 +494,25 @@ static BOOL JJFrameFingerprint(NSData *rgba, int w, int h,
     return YES;
 }
 
+/* 2.1.77：单点最大差。
+   累加差会被 270 个值的基数稀释 —— 一个低对比度的子移动只影响 2 个点，
+   每点差 30 左右，累加 ≈ 180，低于 JJ_FRAME_DIFF_THRESHOLD（260）就被判「画面没变」，
+   整轮跳过。这正是「对方走了但没反应」的另一个来源。
+   单点差不会被稀释：某一点跳变 45 以上就认为画面确实变了。 */
+static int JJFrameFingerprintMaxPointDiff(const int32_t *a, const int32_t *b) {
+    int mx = 0;
+    for (int i = 0; i < JJ_FP_POINTS; i++) {
+        int d = 0;
+        for (int k = 0; k < 3; k++) {
+            int v = (int)(a[i * 3 + k] - b[i * 3 + k]);
+            if (v < 0) v = -v;
+            d += v;
+        }
+        if (d > mx) mx = d;
+    }
+    return mx;
+}
+
 static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     int d = 0;
     for (int i = 0; i < JJ_FP_VALUES; i++) {
@@ -539,17 +558,28 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
 
     [[JJCalibrator shared] applyForFrameWidth:w height:h];
 
+    NSArray *fpCorners = [JJCalibrator shared].finalCorners.count == 4
+        ? [JJCalibrator shared].finalCorners
+        : [[JJCalibrator shared] cornersForWidth:w height:h];
+
+    /* 2.1.77：把棋盘四角交给抓帧层，让它能在 IOSurface 锁内只采 90 点判变化，
+       而不是每 1.5 秒无条件拷 14MB。
+       只在标定完成后启用：学习棋盘阶段必须保证「每 1.5 秒必有一帧」，
+       否则静止画面靠 3 秒心跳供帧，学习重试节奏会被拖慢。
+       没把握到角点时不传（nil），抓帧层自动退回旧的定时拷贝。 */
+    JJMetalSetBoardCorners(self.learnedBoard && fpCorners.count == 4 ? fpCorners : nil);
+
     /* 帧差驱动：新帧但画面没变 → 整轮跳过（静态局面连 JS 都不调） */
     if (self.learnedBoard) {
-        NSArray *fpCorners = [JJCalibrator shared].finalCorners.count == 4
-            ? [JJCalibrator shared].finalCorners
-            : [[JJCalibrator shared] cornersForWidth:w height:h];
         if (fpCorners.count == 4) {
             int32_t sample[JJ_FP_VALUES];
             if (JJFrameFingerprint(rgba, w, h, fpCorners, sample)) {
-                if (self.lastFingerprint.length == sizeof(sample) &&
-                    JJFrameFingerprintDiff((const int32_t *)self.lastFingerprint.bytes,
-                                           sample) < JJ_FRAME_DIFF_THRESHOLD) {
+                const int32_t *prevFP = self.lastFingerprint.length == sizeof(sample)
+                    ? (const int32_t *)self.lastFingerprint.bytes : NULL;
+                BOOL unchanged = prevFP &&
+                    JJFrameFingerprintDiff(prevFP, sample) < JJ_FRAME_DIFF_THRESHOLD &&
+                    JJFrameFingerprintMaxPointDiff(prevFP, sample) < JJ_FP_POINT_DELTA;
+                if (unchanged) {
                     if (now - self.lastHeartbeatTs >= JJ_HEARTBEAT_GAP) {
                         self.lastHeartbeatTs = now;
                         NSLog(@"[JJCheat] 画面静止 · 跳过本帧（静态零开销）");
@@ -797,7 +827,12 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     BOOL newGame = [result[@"newGame"] boolValue];
 
     if (stalled) {
-        self.processNotBefore = [[NSDate date] timeIntervalSince1970] + JJ_PROCESS_ILLEGAL_GAP;
+        /* 2.1.77：分级退避。旧值 2.5 秒是一刀切黑洞，对手在此期间落子会被整个漏掉。
+           偶发一帧垃圾（illegalStreak <= 1）只歇 0.4 秒就重试；
+           连续垃圾说明画面确实读不出来，才逐步拉到 1.2 秒。 */
+        NSInteger streak = [result[@"illegalStreak"] integerValue];
+        NSTimeInterval gap = (streak >= 3) ? JJ_PROCESS_ILLEGAL_GAP_LONG : JJ_PROCESS_ILLEGAL_GAP;
+        self.processNotBefore = [[NSDate date] timeIntervalSince1970] + gap;
         self.lastSearchFen = nil;
         self.engineResult = nil;
         self.engineGen++;
@@ -805,7 +840,7 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
               result[@"legalNow"] ?: @"-", result[@"codesValid"] ?: @"-",
               result[@"codesStableCount"] ?: @"-", result[@"repairedCount"] ?: @"-",
               result[@"illegalStreak"] ?: @"-", result[@"skipReason"] ?: @"-",
-              JJ_PROCESS_ILLEGAL_GAP);
+              gap);
     }
 
     if (newGame) {

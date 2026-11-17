@@ -57,6 +57,18 @@ void JJMetalSetCaptureEnabled(BOOL enabled);
     （16:39 真机日志：启动首帧 CALayer 全黑 → 第一次学习 verifyDiff=32）。 */
 BOOL JJMetalCaptureEnabled(void);
 
+/** 2.1.77：告诉抓帧层「棋盘四角在哪」（4 个 [x,y]，帧像素坐标）。
+ *
+ *  给了之后抓帧从「定时拷贝 14MB」改成「先廉价采样 90 点判有无变化，
+ *  变了才拷」—— 对方落子到我们发现的延迟从 1.5 秒降到约 0.15 秒，
+ *  而 14MB 拷贝次数反而从每秒 0.67 次降到「每步 1 次」。
+ *
+ *  为什么必须限定在棋盘内采样：整屏采样会被倒计时、动画、提示高亮带偏，
+ *  每一帧都判「变了」就退化成旧的定时拷贝。
+ *  传 nil / 非 4 点 → 自动退回旧的定时拷贝（未标定阶段需要这个兜底）。
+ *  角点变化会让旧摘要失效，强制重新出一帧。 */
+void JJMetalSetBoardCorners(NSArray *corners);
+
 #ifdef __cplusplus
 }
 #endif

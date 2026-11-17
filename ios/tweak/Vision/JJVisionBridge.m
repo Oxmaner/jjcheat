@@ -30,7 +30,7 @@
    2.1.0  = pikafishNative（JS 只识别不搜索，搜索交给独立进程 Pikafish）；
    2.1.58 = alignGridToOpening（开局匹配滤波网格对齐）；
    2.1.59 = 对齐 probeL 改盘均值（积分图），空盘/棋盘线不再被当成棋子。 */
-static NSString * const kJJEngineFeatureMark = @"pikafishNative2176";
+static NSString * const kJJEngineFeatureMark = @"pikafishNative2177";
 
 // roothide 适配：jbroot 每次越狱都会换一个随机路径，必须在运行时解析。
 // 非 roothide 构建（rootful/rootless）不引这个头，避免多出 libroothide 依赖。

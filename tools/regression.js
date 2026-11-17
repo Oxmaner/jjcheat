@@ -498,6 +498,50 @@ function main() {
     console.log('H5 马二进三合法 | H6 马横走拒绝 | H7 车穿子拒绝');
   }
 
+  /* ================================================================
+   * I. 2.1.77 规则校验连败逃生（防止锚盘出错导致永久卡死）
+   *
+   * 背景：2.1.76 加了 stepIsRuleLegal，推锚盘前必须这一步在规则上走得通。
+   * 但如果锚盘本身记错了（某格兵种认错），之后每一步真走法都会被判不合法：
+   *   锚盘不推进 → 锚盘又覆盖本帧识别 → 下一帧同样局面 → 再判不合法……
+   * 而差异只有 2 格，够不到 JJ_RESEAT_MIN_DIFF(8) 的重锚门槛 → 永久卡死。
+   * 2.1.77 加了连败计数：连续 5 次不通过就认为「错的是锚盘」，以当前识别重锚。
+   *
+   * 这里用「红车斜着走」构造结构性合法、但规则上非法的走法（车的走法形状不对）。
+   * ================================================================ */
+  console.log('');
+  console.log('========== I. 规则校验连败 → 强制重锚（防死锁） ==========');
+  {
+    const I = makeFixture(src, false);
+    I.learnOpening(true);
+    I.frame('I1 开局', I.S0.slice(), r => {
+      if (r.reseat) throw new Error('I1 开局不该 reseat');
+    });
+
+    /* 红车在 (9,0)=81，斜着挪到 (8,1)=73：结构上是「走子」，规则上不合法 */
+    const bad = I.S0.slice();
+    bad[81] = 0;
+    bad[73] = 5;          // 5 = 红车
+    let reseated = 0;
+    for (let k = 1; k <= 6; k++) {
+      I.frame('I2 非法走法第' + k + '次', bad.slice(), r => {
+        if (r.reseat === 1) reseated = k;
+      });
+    }
+    if (reseated === 0) {
+      throw new Error('I2 连续 6 次规则不通过仍未重锚 → 死锁（锚盘永远推不动）');
+    }
+    if (reseated > 5) {
+      throw new Error('I2 重锚来得太晚（第 ' + reseated + ' 次），应在第 5 次');
+    }
+
+    /* I3 重锚后同一局面应稳定：不再反复 reseat、不再重复派发搜索 */
+    I.frame('I3 重锚后静止', bad.slice(), r => {
+      if (r.reseat) throw new Error('I3 重锚后不该继续 reseat');
+      if (r.needSearch) throw new Error('I3 同一局面不该重复派发搜索');
+    });
+  }
+
   console.log('');
   console.log('全部通过 OK  engine.js = %d 字节, mark=%s',
     fs.statSync(ENGINE).size, /pikafishNative/.test(src) ? 'pikafishNative OK' : 'MISSING');

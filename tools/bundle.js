@@ -531,6 +531,7 @@ var session = {
   reseatPrev: null,        // 换局候选：上一帧 codes（做帧间差异比较）
   reseatCount: 0,
   anchorRejected: 0,       // 连续被丢弃的噪声帧
+  ruleFail: 0,             // 2.1.77 连续「规则不通过」次数（≥5 强判锚盘错了，重锚）
   reseatDone: 0,           // 本帧刚完成换局重锚（诊断输出后置 0）
   lastMoveText: '',        // 最近一步的 UCCI，供日志/HUD 诊断
   // 2.0.0 红先黑后：JJ 象棋「由执红棋的一方先走，双方轮流走一步」。
@@ -546,7 +547,7 @@ var JJEngine = {
   /* 2.1.58：开局匹配滤波对齐（alignGridToOpening）。标记必须变：
      容器里那份 engine.js 只认「缺当前标记 → 覆盖升级」，标记不变 = 2.1.57
      的旧脚本一直被用下去，新对齐逻辑根本跑不到。 */
-  featureMark: 'pikafishNative2176',
+  featureMark: 'pikafishNative2177',
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
@@ -1589,9 +1590,34 @@ var JJEngine = {
                先手」的依据 —— 开局 ply=0 归红方，对面走完 ply=1 才轮到我。 */
             session.movePly = (session.movePly || 0) + 1;
             session.plyGuessed = 0;
+            session.ruleFail = 0;
           } else {
+            /* 2.1.77：规则校验连败逃逸。
+               2.1.76 加了 stepIsRuleLegal 之后有个隐患：如果锚盘本身记错了
+               （某格兵种认错），之后每一步真走法都会被判「不合法」→ 锚盘不推进
+               → 但锚盘又会覆盖本帧识别 → 下一帧同样的局面 → 再判不合法……
+               而差异只有 2 格，够不到 JJ_RESEAT_MIN_DIFF(8) 的重锚门槛，
+               于是永久卡死，只能手动重锚。
+               所以连续 N 次规则不通过，就认为「错的是锚盘不是棋」，
+               直接以当前识别为准重锚（前提是它自己是一盘合法棋）。 */
+            session.ruleFail = (session.ruleFail || 0) + 1;
             stepInfo = { changed: stepInfo.changed, move: null, noise: stepInfo.noise };
             anchorRejected = 1;
+            if (session.ruleFail >= 5 &&
+                codesLegal(engCodes) && codesPositionPlausible(engCodes)) {
+              anchor = Array.prototype.slice.call(engCodes);
+              session.anchorCodes = anchor;
+              session.anchorFen = codesToBoardFen(anchor);
+              session.prevAnchorFen = '';
+              session.lastBoardFen = session.anchorFen;
+              session.lastResult = null;
+              session.lastDispatchedFen = '';
+              session.ruleFail = 0;
+              session.reseatDone = 1;
+              // 重锚后轮次无从得知，假设轮到我方，plyGuessed 供日志追溯
+              session.movePly = session.flipped ? 1 : 0;
+              session.plyGuessed = 1;
+            }
           }
         }
         // 用锚盘（可能已推进一步）覆盖本帧 codes/grid，噪声格一律不落地
