@@ -18,6 +18,7 @@
 #include <mutex>
 #include <streambuf>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "attacks.h"
@@ -179,6 +180,32 @@ std::once_flag g_streamOnce;
 
 }  // namespace
 
+/* ---------------------------------------------------------------------------
+   版本兼容：不同 Pikafish 的初始化入口不完全一样。
+   2026-09-06 及更早的 main() 是 Attacks::init() + Position::init()；
+   master（2026-11 起）把 Position::init() 删掉了（Zobrist 改为编译期生成）。
+   这里用 SFINAE 探测「有没有这个静态成员」，有就调、没有就跳过 ——
+   同一份桥接层可以配不同版本的引擎，不用为每个版本改这里。
+   --------------------------------------------------------------------------- */
+namespace jjdetail {
+
+template <typename T, typename = void>
+struct HasPositionInit : std::false_type {};
+
+template <typename T>
+struct HasPositionInit<T, decltype(T::init(), void())> : std::true_type {};
+
+/* 必须是模板：if constexpr 只有在模板里才会真正"丢弃"未选中的分支；
+   写成普通函数时 clang 仍会实例化 else 分支，导致 Position::init 不存在的
+   版本直接编译失败（这是 2.1.68 第一次改这里时踩的坑）。 */
+template <typename P = Stockfish::Position>
+inline void initPositionIfNeeded() {
+    if constexpr (HasPositionInit<P>::value)
+        P::init();
+}
+
+}  // namespace jjdetail
+
 extern "C" int jjpika_start(const char *argv0_path) {
     if (argv0_path == nullptr || *argv0_path == '\0') return -1;
 
@@ -206,7 +233,7 @@ extern "C" int jjpika_start(const char *argv0_path) {
 
     Stockfish::CommandLine cli(1, argv);
     Stockfish::Attacks::init();
-    Stockfish::Position::init();
+    jjdetail::initPositionIfNeeded();
     auto uci = std::make_unique<Stockfish::UCIEngine>(std::move(cli));
     Stockfish::Tune::init(uci->engine_options());
     uci->loop();
