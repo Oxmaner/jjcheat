@@ -421,7 +421,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 
     /* 步进器：每档 50ms。为什么用步进而不是键盘 —— 键盘会盖住棋盘，
        而且这个值调一次就长期不动，微调比重新输入更顺手。 */
-    JJSheetRow *step = [JJSheetRow stepper:@"时长"
+    __block __weak JJSheetRow *step = nil;
+    step = [JJSheetRow stepper:@"时长"
                                     symbol:@"timer"
                                      value:[NSString stringWithFormat:@"%ld ms", (long)o.thinkMs]
                                   onChange:^(NSInteger delta) {
@@ -441,7 +442,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
         [NSMutableArray arrayWithArray:@[@(350), @(650), @(1000), @(2000)]];
     if (![presets containsObject:@(o.thinkMs)]) [presets insertObject:@(o.thinkMs) atIndex:0];
     for (NSNumber *n in presets) {
-        JJSheetRow *r = [JJSheetRow action:[NSString stringWithFormat:@"%@ ms", n]
+        __block __weak JJSheetRow *r = nil;
+    r = [JJSheetRow action:[NSString stringWithFormat:@"%@ ms", n]
                                         symbol:@"bolt.horizontal"
                                         detail:nil
                                        handler:^{
@@ -500,7 +502,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     byTime.on = (o.thinkDepth == 0);
     [rows addObject:byTime];
 
-    JJSheetRow *timeStep = [JJSheetRow stepper:@"时长"
+    __block __weak JJSheetRow *timeStep = nil;
+    timeStep = [JJSheetRow stepper:@"时长"
                                         symbol:@"timer"
                                          value:[NSString stringWithFormat:@"%ld ms", (long)o.thinkMs]
                                       onChange:^(NSInteger delta) {
@@ -528,7 +531,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     byDepth.on = (o.thinkDepth > 0);
     [rows addObject:byDepth];
 
-    JJSheetRow *depthStep = [JJSheetRow stepper:@"深度"
+    __block __weak JJSheetRow *depthStep = nil;
+    depthStep = [JJSheetRow stepper:@"深度"
                                          symbol:@"arrow.down.to.line"
                                           value:(o.thinkDepth > 0
                                                  ? [NSString stringWithFormat:@"%ld 层", (long)o.thinkDepth]
@@ -548,7 +552,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [rows addObject:depthStep];
 
     /* ---- 资源 ---- */
-    JJSheetRow *hash = [JJSheetRow stepper:@"哈希表"
+    __block __weak JJSheetRow *hash = nil;
+    hash = [JJSheetRow stepper:@"哈希表"
                                     symbol:@"memorychip"
                                      value:[NSString stringWithFormat:@"%ld MB", (long)o.hashMb]
                                   onChange:^(NSInteger delta) {
@@ -564,7 +569,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     }];
     [rows addObject:hash];
 
-    JJSheetRow *mpv = [JJSheetRow stepper:@"多线路"
+    __block __weak JJSheetRow *mpv = nil;
+    mpv = [JJSheetRow stepper:@"多线路"
                                    symbol:@"list.number"
                                     value:[NSString stringWithFormat:@"%ld", (long)o.multiPV]
                                  onChange:^(NSInteger delta) {
@@ -581,7 +587,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [rows addObject:mpv];
 
     /* ---- 其它（2.1.80 补齐：此前有配置键但无 UI 入口）---- */
-    JJSheetRow *overhead = [JJSheetRow stepper:@"落子余量"
+    __block __weak JJSheetRow *overhead = nil;
+    overhead = [JJSheetRow stepper:@"落子余量"
                                         symbol:@"hourglass"
                                          value:[NSString stringWithFormat:@"%ld ms", (long)o.moveOverhead]
                                       onChange:^(NSInteger delta) {
@@ -597,7 +604,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     }];
     [rows addObject:overhead];
 
-    JJSheetRow *wdl = [JJSheetRow action:@"显示胜率"
+    __block __weak JJSheetRow *wdl = nil;
+    wdl = [JJSheetRow action:@"显示胜率"
                                   symbol:@"percent"
                                   detail:(o.showWDL ? @"开" : @"关")
                                  handler:^{
@@ -652,7 +660,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
         @"真机出现过重建后搜索闪退。改完会立即重启引擎（重载 50MB 权重 1~3 秒）。"
         @"若闪退，重进 App 把线程数改回 1 即可恢复。", (long)o.threads]]];
 
-    JJSheetRow *step = [JJSheetRow stepper:@"线程数"
+    __block __weak JJSheetRow *step = nil;
+    step = [JJSheetRow stepper:@"线程数"
                                     symbol:@"cpu"
                                      value:[NSString stringWithFormat:@"%ld", (long)o.threads]
                                   onChange:^(NSInteger delta) {

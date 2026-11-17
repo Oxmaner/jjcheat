@@ -53,7 +53,9 @@ done
 
 CFLAGS="-fsyntax-only -target arm64-apple-ios15.0 -isysroot $SDK_PATH
         -fobjc-arc -fblocks -std=gnu11 -DTHEOS_PACKAGE_SCHEME_ROOTHIDE
-        -Wno-deprecated-declarations -Wno-unused-variable -Wno-nullability-completeness
+        -Wno-deprecated-declarations -Wno-nullability-completeness
+        -Wall -Werror -Wuninitialized
+        -Wno-unused-variable -Wno-unused-function
         -Wno-error=int-to-void-pointer-cast -Wno-error=void-pointer-to-int-cast
         -I$STUB"
 
