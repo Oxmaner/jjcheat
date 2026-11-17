@@ -116,10 +116,8 @@ needs_build() {
     # 库存在但桥接符号缺失（上次编到一半）→ 重编
     nm -g "$LIB_OUT" 2>/dev/null | grep -q " T _jjpika_start$" || return 0
     # 库是「没打补丁」的旧产物 → 重编。
-    # 注意这个符号是 C++ 名字（在 Stockfish::Eval::NNUE 命名空间里），nm 看到的是
-    # _ZN9Stockfish4Eval4NNUE27jj_last_network_load_errorEv，不能像 extern "C" 的
-    # _jjpika_start 那样加行尾锚点，只能匹配 mangled 名里的子串。
-    nm -g "$LIB_OUT" 2>/dev/null | grep -q " T .*jj_last_network_load_error" || return 0
+    # 用补丁的产物字符串判定，别用 nm 符号（C++ 修饰名 + arm64e $ 变体容易误判）
+    strings "$LIB_OUT" 2>/dev/null | grep -q "JJ-NNUE FAIL" || return 0
     # 只有单架构（旧产物）也要重编
     lipo -info "$LIB_OUT" 2>/dev/null | grep -q "arm64e" || return 0
     return 1
@@ -204,14 +202,17 @@ log "符号齐全: jjpika_start/stop/send/recv/running（arm64 + arm64e）"
 
 # 补丁符号必须在：没有就说明 patch-engine.py 没生效，包里的引擎仍会在
 # 网络校验失败时 exit，一搜索就把 App 带走。
-# 符号是 C++ 名字（mangled: _ZN9Stockfish4Eval4NNUE27jj_last_network_load_errorEv），
-# 只能匹配子串，不能加行尾锚点 —— 否则永远匹配不到（2.1.68 首次构建就栽在这）。
-for arch in $ARCH_LIST; do
-    if ! nm -g -arch "$arch" "$LIB_OUT" 2>/dev/null | grep -q " T .*jj_last_network_load_error"; then
-        die "[$arch] 缺 jj_last_network_load_error —— 引擎补丁没生效"
-    fi
-done
-log "引擎补丁已生效: 网络校验失败不再 exit（jj_last_network_load_error 在）"
+#
+# 判据用 strings 而不是 nm 符号匹配：
+#   - jj_last_network_load_error 是 C++ 符号，Mach-O 里是
+#     __ZN9Stockfish4Eval4NNUE26jj_last_network_load_errorEv，
+#     且 arm64e 还可能有 $ 变体，nm 匹配容易误判（2.1.68 的 #68/#69 两次都栽在这）；
+#   - 而 "JJ-NNUE FAIL" 是补丁唯一的产物标记，只要补丁编进去了就必然在。
+strings "$LIB_OUT" 2>/dev/null | grep -q "JJ-NNUE FAIL" \
+    || die "引擎补丁没生效：库里找不到 'JJ-NNUE FAIL' 标记"
+log "引擎补丁已生效: 网络校验失败不再 exit（JJ-NNUE FAIL 标记在库里）"
+# 顺带把符号情况打出来，方便以后核对（不参与判定）
+nm -g "$LIB_OUT" 2>/dev/null | grep -o "[Tt] .*jj_last_network_load_error" | head -2 || true
 
 # ---------- 落盘 ----------
 mkdir -p "$DEST_DIR"
