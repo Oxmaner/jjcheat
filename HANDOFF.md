@@ -113,6 +113,12 @@ images:    TuanjieFramework（游戏引擎）, QuartzCore, JJCheat.dylib(uuid 11
 
 **这条栈里没有一帧 JJCheat，也没有一帧 JJPikafish。**
 
+> ⚠️ **15:55 更正 —— 上面这个结论只对 thread 0 成立，整体结论是错的。请先读 §11。**
+>
+> 这份 `.ips` 一共 **100 个线程**（`threads` 数组在 JSON 第 39 行，普通 Read 会被 2000 字符截断，看起来像只有主线程）。其中 **thread 91 就是引擎线程，栈全部带 JJCheat.dylib 符号**，末尾停在 `Network::verify → exit(EXIT_FAILURE)`。
+>
+> 也就是说：**这次崩溃确实是插件引起的**；主线程的 0x0 是引擎线程调用 `exit()` 拆进程时，撞上正在跑的渲染循环造成的二次伤害。2.1.61/62/63 修的方向（线程栈、SIGSEGV handler、setoption）全部无关。
+
 而 2.1.61 / 2.1.62 / 2.1.63 三个 commit 修的分别是「NSThread 栈 512KB→16MB」、「装 SIGSEGV handler 抓 backtrace」、「去掉 `setoption Threads/EvalFile`」—— 全部针对**引擎线程**。SIGSEGV 只影响出错线程，`faultingThread=0` 已经明确是主线程。
 
 结论：**这份崩溃大概率与引擎搜索无关**；若当时 tweak 也没注入成功（§2），那它根本与插件无关，是游戏自身的崩溃。
@@ -277,3 +283,168 @@ void JJMetalAfterNextDrawable(id drawable) { … JJStorePending(s, …); }
 - 自动标定只做两件事：判断哪方在下（底线颜色）+ 学习背景阈值（`warmThreshold`）；**四个角点仍需手点**
 - `JJ_LEARN_MAX_DIFF = 8`，学习校验超过就拒绝，避免把已收敛的锚盘冲成乱码
 - 历史遗留：仓库 Releases 里还有 `roothide-build-19/21/22/23/24`，可删（未确认）
+
+---
+
+## §11 更正 §3：14:31 崩溃的真因是引擎线程调用了 `exit()`
+
+> 本节由前一轮会话在拿到 `.ips` 全文后补充。**请连同 §3 一起读，§3 的结论以此节为准。**
+
+### 11.1 先把全部线程打印出来（`.ips` 的 `threads` 数组有 100 条）
+
+`threads` 在 JSON 第 39 行、是一整行，任何按行截断的查看方式都会丢掉后面 99 个线程。用这段脚本还原（`imageIndex` 会被映射成模块名，dylib 内的帧自带符号）：
+
+```bash
+node -e "
+const fs=require('fs');
+const p='<路径>/TKLobby_chess_tuanjie-2026-11-17-143138.ips';
+const raw=fs.readFileSync(p,'utf8');const i=raw.indexOf('\n');
+const body=JSON.parse(raw.slice(i+1));
+const imgs=body.usedImages||[];
+body.threads.forEach((t,ix)=>{
+  const fr=t.frames||[];
+  if(!fr.some(f=>imgs[f.imageIndex]&&imgs[f.imageIndex].name==='JJCheat.dylib')) return;
+  console.log('=== thread',ix,t.name||t.queue||'');
+  fr.forEach((f,k)=>{const im=imgs[f.imageIndex]||{name:'?'};
+    console.log(' #'+k,im.name,f.symbol||('0x'+f.imageOffset.toString(16)));});
+});
+"
+```
+
+### 11.2 thread 91 = 引擎线程，栈是完整带符号的
+
+```
+#0  libsystem_kernel   __psynch_cvwait
+#1  libsystem_pthread  _pthread_cond_wait
+#2  libc++             std::__1::condition_variable::wait(unique_lock<mutex>&)
+#3  TKLobby            0xf38e74
+#4  TKLobby            0xf37ea4
+#5  TKLobby            0xf157cc
+#6  TKLobby            0x102a204
+#7  libsystem_c        __cxa_finalize_ranges
+#8  libsystem_c        exit                                  ← 关键
+#9  JJCheat.dylib      Stockfish::Eval::NNUE::Network::verify(function<void(string_view)> const&, EvalFile const&, __fs::filesystem::path) const   (+2456)
+#10 JJCheat.dylib      Stockfish::Engine::verify_network() const                     (+224)
+#11 JJCheat.dylib      Stockfish::Engine::go(Search::LimitsType&)                    (+40)
+#12 JJCheat.dylib      Stockfish::UCIEngine::loop()                                  (+3816)
+#13 JJCheat.dylib      jjpika_start                                                  (+1036)
+#14 JJCheat.dylib      0x79578
+#15 Foundation         __NSThread__start__ → _pthread_start → thread_start
+```
+
+读法：帧号越小越内层。`exit` 的返回地址落在 `Network::verify+2456`，即 **`Network::verify` 调用了 `exit`**；`exit` 再跑 `__cxa_finalize_ranges`（全局析构），析构链里某个 `TKLobby` 静态析构函数在等条件变量。
+
+### 11.3 源码依据（Pikafish-2026-09-06，与我们 `engine/build-ios.sh` 的 `PIKA_TAG` 一致）
+
+```cpp
+void Engine::go(Search::LimitsType& limits) {
+    assert(limits.perft == 0);
+    verify_network();                       // ← go 的第一件事就是校验网络
+    threads.start_thinking(pos, states, limits);
+}
+
+void Engine::verify_network() const {
+    const auto file = path_from_utf8(std::string(options["EvalFile"]));
+    network->verify(onVerifyNetwork, networkFile, file);
+    ...
+}
+
+void Network::verify(const std::function<void(std::string_view)>& f,
+                     const EvalFile& evalFile, fs::path evalfilePath) const {
+    if (evalfilePath.empty()) evalfilePath = evalFile.defaultName;
+    if (evalFile.current != evalfilePath) {          // ← 网络没加载成功
+        if (f) { /* 打印 5 行 ERROR: ... The engine will be terminated now. */ }
+        exit(EXIT_FAILURE);                          // ← 唯一出口，直接杀进程
+    }
+    if (f) { f("NNUE evaluation using ..."); }
+}
+```
+
+`evalFile.current` 只在 `Network::load_external` 里、且 `load(stream)` 解析成功时才被赋值。所以 **`exit` 只有一种触发条件：NNUE 网络没被成功加载**。
+
+### 11.4 为什么崩的是主线程（解释所有旧现象）
+
+`exit()` 跑在引擎线程上，会执行 atexit + 全部全局析构（**包括 TuanjieFramework 的静态对象**）。此时主线程还活着，正在 `CA::Display::DisplayLink::dispatch_items` 里逐帧渲染。渲染代码踩到已被析构的状态 → 主线程 `EXC_BAD_ACCESS at 0x0`，栈里全是 TuanjieFramework 的帧。这就同时解释了：
+
+- 为什么「HUD 显示 `engine=思考中`，马上闪退」——`思考中` 就是 `go` 发出去的那一刻；
+- 为什么 thread 0 的栈里没有任何 JJCheat 帧——真正的元凶在另一个线程；
+- 为什么 2.1.62 的进程内 SIGSEGV handler 从来没落盘——它挂在**主线程**上，但 `exit` 走的是正常退出流程，不是我们的 handler 路径；
+- 为什么越狱机的 CrashReporter 之前拿不到 `.ips`——这是 `bug_type 309` / `isCorpse:1`，属于「进程自己走了」而不是标准崩溃上报路径。
+
+**结论：`0x0 SIGSEGV` 不是搜索里的空指针，是 `exit()` 拆进程时的二次伤害。** 2.1.61（16MB 栈）、2.1.62（signal handler）、2.1.63（去掉 `setoption Threads/EvalFile`）全都打在症状上。
+
+### 11.5 一个必须接受的重构性事实
+
+`verify_network()` 是 `go` 的必经路径，而它在网络没加载时**直接 `exit`**。这意味着：**2.1.5x 至今没有任何一个版本在真机上真正搜过一步棋**。所有「引擎就绪 / uciok=1 / 引擎自报 Pikafish」都只说明构造与握手成功，和网络加载是两件事；而 `verifyDiff=0 ok=1` 是**棋盘识别**的判据，跟引擎完全无关。之前把这些读成「引擎 OK、建议要出来了」，是本轮最大的误导源。
+
+### 11.6 为什么这条 ERROR 从来没人看见（我们自己的日志把证据吞了）
+
+`ios/tweak/Engine/JJPikafish.m::handleLineOnQueue:` 的判断顺序是：
+
+```objc
+if ([line hasPrefix:@"info "]) { self.lastInfo = ...; return; }      // ← 先命中这里
+...
+if ([line hasPrefix:@"info string"] || ... || [line rangeOfString:@"NNUE"]...) {
+    NSLog(@"%@ 引擎输出: %@", kPikaLog, line);                        // ← 永远到不了
+}
+```
+
+引擎的错误块是以 `info string ERROR: ...` 输出的（`print_info_string` 会统一加 `info string ` 前缀），**全部被第一个分支吃掉并 return**。所以包括 `NNUE evaluation using ...`、`Network replica 1: ...` 在内的所有引擎自述，一次都没进过日志。修法：把 `info string` 判断挪到 `info ` **之前**。
+
+### 11.7 权重本身是好的（已逐项核对）
+
+| 项 | 值 | 判读 |
+|---|---|---|
+| 包内文件 | `…/JJCheat/Pikafish/pikafish.nnue`，50,308,806 B | 在 |
+| sha256 | `071aefc0730e124876a97609a4a75624d62fa5d3155858c9646a1a8272e9e458` | 记录备查 |
+| 文件头 | `28 b5 2f fd` | **zstd 帧 magic**，是压缩网络，`read_compressed_nnue` 负责解压 |
+| 解压后 | 64,701,992 B | 解压正常完成 |
+| 头部 version | `0x6A448AFA` | == 源码 `constexpr u32 Version = 0x6A448AFAu`，**版本匹配** |
+| 头部 desc | `Network trained with the https://github.com/official-pikafish/pikafish-nnue-pytorch trainer.` | 官方网络 |
+| 远端 `master-net/pikafish.nnue` | `Content-Length: 50308806` | 与我们这份**同尺寸**，即当前官方 master-net |
+
+`read_compressed_nnue` 解压失败会返回空 stream，随后 `read_header` 失败 → `current` 不赋值 → `verify` → `exit`。所以链路上还有三种可能，**现有证据无法区分**：
+
+1. 运行时 `std::ifstream` 打不开（`binaryDirectory` 由 `argv[0].parent_path()` 推出，shim 传的是权重文件本身，理论上对）；
+2. `hashValue != Network::hash`（架构哈希不符）；
+3. `Detail::read_parameters` / `stream.peek()==eof` 不符（参数布局或尾部多余字节）。
+
+`master-net` 是**滚动发布**（`scripts/net.sh` 直接拉这个 tag），源码却钉在 `Pikafish-2026-09-06`。版本号一致只说明粗粒度格式没变，**不能保证 `Network::hash` 与参数布局一致** —— 这是最可疑的一条。
+
+### 11.8 2.1.68 应该怎么做（建议方案，尚未实施）
+
+我们自己在 CI 里编 Pikafish（`engine/build-ios.sh` 里 `git clone --branch $TAG`），所以可以直接打补丁，**让网络校验失败变成可观测的降级，而不是杀掉宿主 App**：
+
+**① 编译期补丁（新增 `engine/patches/0001-no-exit-on-verify.patch`，在 clone 之后 `git apply`）**
+
+- `src/nnue/network.cpp`：`void verify(...)` → `bool verify(...)`；删掉 `exit(EXIT_FAILURE)`，改为 `return false;`（ERROR 文本照旧先打印）；成功分支 `return true;`
+- `src/nnue/network.h`：同步改声明
+- `src/engine.cpp`：`void verify_network() const` → `bool`（`verify` 结果 && 各 replica 状态）；`go()` 改成
+  ```cpp
+  if (!verify_network()) { onVerifyNetwork("JJ: 网络校验失败，本次不搜索"); return; }
+  threads.start_thinking(pos, states, limits);
+  ```
+  **必须提前 return**：网络没加载就 `start_thinking` 会在评估里解引用未初始化的权重。
+
+**② 让失败原因自己说清楚（同一补丁里加 3 条 `info string JJ-NNUE:`）**
+
+- `Network::load_external`：打印 `dir/evalfilePath` 与 `read_compressed_nnue` 返回的字节数（0 = 解压/开文件失败）
+- `Network::read_parameters`：`read_header` 失败、`hashValue != Network::hash`（打印**文件哈希与引擎哈希的十六进制**）、参数解析失败、尾部多余字节，四种分别打不同文案
+- `verify`：成功后打印 `NNUE evaluation using ...`（原本就有，只是被日志过滤器吞了）
+
+**③ OC 侧**：`handleLineOnQueue:` 调整判断顺序（见 §11.6）；`info string` 一律 `NSLog`，并把最后 5 条引擎输出显示到 HUD，这样失败原因在球上一眼可见。
+
+**④ CI 护栏（防再犯）**：在 `macos-15` runner 上编一个 10 行小程序，`#include "nnue/nnue_architecture.h"` + `nnue_feature_transformer.h`，打印
+`NetworkArchitecture::get_hash_value() ^ FeatureTransformer::get_hash_value()`，再读权重文件头的 `u32[1]` 比对，不一致就让构建失败；同时把权重 sha256（`071aefc0…`）钉进 workflow，`master-net` 漂移时立刻报警。
+
+### 11.9 对 §2「tweak 未注入」的一条旁证
+
+这份 14:31 的 `.ips` 里 **`usedImages[21]` 就是我们**：
+
+```
+name : JJCheat.dylib
+path : /private/var/containers/Bundle/Application/.jbroot-DB287DC7EB4CA44A/usr/lib/TweakInject/JJCheat.dylib
+uuid : 11f986fc-38c2-3d81-9c8d-218f15b0b588
+```
+
+而且 thread 91 正在跑 `jjpika_start`。所以 **14:31 时注入是成功的、引擎线程是活的**。注入失效发生在 **14:31 之后**（时间上最接近的是 2.1.67 诊断包的重装），§2 的排查范围可以据此收窄。
