@@ -337,7 +337,9 @@ function main() {
         const n = Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]));
         for (let t = 0; t <= n; t++) {
           const x = a[0] + (b[0] - a[0]) * t / n, y = a[1] + (b[1] - a[1]) * t / n;
-          put(x, y, 90, 70, 55); put(x, y + 1, 90, 70, 55);
+          /* 1px 细线：真机帧里空格墨迹基线 0.02~0.07 正是这种细线贡献的
+             （2px 会把基线推到 0.10+，adaptive 阈值被抬高，反而测不出真机行为） */
+          put(x, y, 90, 70, 55);
         }
       };
       for (let r = 0; r < 10; r++) for (let c = 0; c < 8; c++) line(ptOf(sCS, r, c), ptOf(sCS, r, c + 1));
@@ -354,10 +356,40 @@ function main() {
           if (!spm[i]) continue;
           const r = (i / 9) | 0, c = i % 9;
           const p = ptOf(sCS, r, c);
-          const col = r <= 4 ? [70, 55, 45] : [240, 200, 140];
-          for (let dy = -25; dy <= 25; dy++)
-            for (let dx = -25; dx <= 25; dx++)
-              if (dx * dx + dy * dy <= 625) put(p[0] + dx, p[1] + dy, col[0], col[1], col[2]);
+          /* 2.1.60 真机皮肤（2.1.59 失败帧实锤）：黑子 = 浅木色盘面 + 黑字黑边、
+             红子 = 象牙盘面 + 红字红边 —— 盘面亮度与棋盘底色几乎重合（L≈150
+             vs 木色 170），只有「墨迹」能把有无子分开。所以这里必须画出字和边，
+             否则合成帧对墨迹判据就是一批「光板棋子」，测不出真机场景。 */
+          const isBlack = r <= 4;
+          const face = isBlack ? [176, 142, 108] : [236, 196, 140];
+          const ink = isBlack ? [40, 34, 30] : [150, 30, 24];
+          for (let dy = -25; dy <= 25; dy++) {
+            for (let dx = -25; dx <= 25; dx++) {
+              const d2 = dx * dx + dy * dy;
+              if (d2 > 625) continue;
+              if (d2 >= 484) { put(p[0] + dx, p[1] + dy, ink[0], ink[1], ink[2]); continue; }
+              put(p[0] + dx, p[1] + dy, face[0], face[1], face[2]);
+            }
+          }
+          /* 字：内圈 + 按兵种码点的 4×4 点阵笔画（每个 code 图案唯一）。
+             真机上 14 种棋子各有不同的字，模板才分得出兵种 —— 合成帧若全画同一个
+             字，模板比对必然认错（G2 就是被这个坑住的：占位对、兵种全错）。 */
+          const code = spm[i] || 0;
+          for (let dy = -12; dy <= 12; dy++) {
+            for (let dx = -12; dx <= 12; dx++) {
+              const d2 = dx * dx + dy * dy;
+              if (d2 >= 81 && d2 <= 144) { put(p[0] + dx, p[1] + dy, ink[0], ink[1], ink[2]); }
+            }
+          }
+          for (let k = 0; k < 16; k++) {
+            if (!((code >> (k % 4)) & 1)) continue;
+            const gx = -8 + (k % 4) * 4, gy = -8 + ((k / 4) | 0) * 4;
+            for (let dy = 0; dy < 3; dy++) {
+              for (let dx = 0; dx < 3; dx++) {
+                put(p[0] + gx + dx, p[1] + gy + dy, ink[0], ink[1], ink[2]);
+              }
+            }
+          }
         }
       }
       return px;
@@ -385,8 +417,26 @@ function main() {
     if (!r3 || r3.already !== true || r3.accepted) throw new Error('F3 已对齐应走 already 分支');
     if (r3.occHit < 22) throw new Error('F3 恒等网格应 ≥22 命中: ' + r3.occHit);
 
+    /* G：浅木皮肤（2.1.59 真机皮肤 —— 黑子=浅木盘面+黑字、红子=象牙盘面+红字）。
+       棋子盘面亮度与棋盘底色几乎重合，亮度三峰模型会整盘判空 → 自举闸门不过 →
+       verifyDiff=32。这条断言守的是「墨迹判据 + 无墨才判空」这条修复链：
+       判有子必须 ≈32，且现场自举的模板认同一帧必须与标准开局一致。 */
+    const recG = new RECM.BoardRecognizer({ corners: CS, enableLowConfRefine: true });
+    const stG = recG.sampleAll(synthFrame(true, 0, 0), W, H, true);
+    recG.learnBackground(stG, []);
+    const ccG = recG.classifyByColor(stG);
+    let occG = 0;
+    for (let i = 0; i < 90; i++) if (ccG.grid[i] !== 0) occG++;
+    if (occG < 30) throw new Error('G1 浅木皮肤判有子应 ≈32: ' + occG);
+    recG.learnTemplates(stG, spm);
+    const clsG = recG.classify(stG);
+    let diffG = 0;
+    for (let i = 0; i < 90; i++) if ((clsG.codes[i] || 0) !== (spm[i] || 0)) diffG++;
+    if (diffG > 4) throw new Error('G2 自举后与标准开局差应 ≤4: ' + diffG);
+
     console.log('F1 偏移修复: 命中=%d/32 平移=%d,%d | F2 空盘拒绝: 命中=%d | F3 already: 命中=%d',
       r1.occHit, r1.shiftX, r1.shiftY, r2.occHit, r3.occHit);
+    console.log('G 浅木皮肤: 判有子=%d/32 | 自举后与标准开局差=%d 格', occG, diffG);
   }
 
   console.log('');

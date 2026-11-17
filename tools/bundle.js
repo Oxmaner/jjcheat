@@ -478,7 +478,7 @@ var JJEngine = {
   /* 2.1.58：开局匹配滤波对齐（alignGridToOpening）。标记必须变：
      容器里那份 engine.js 只认「缺当前标记 → 覆盖升级」，标记不变 = 2.1.57
      的旧脚本一直被用下去，新对齐逻辑根本跑不到。 */
-  featureMark: 'pikafishNative2159',
+  featureMark: 'pikafishNative2160',
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
@@ -786,6 +786,16 @@ var JJEngine = {
       hiTh: bgSnap ? Math.round(bgSnap.hiTh) : -1,
       loTh: bgSnap ? Math.round(bgSnap.loTh) : -1,
       mad: bgSnap && bgSnap.mad ? Math.round(bgSnap.mad * 10) / 10 : -1,
+      /* 2.1.60 墨迹占位模型：inkThOcc=自适应占位阈值、boardInkMed=空格墨迹基线。
+         判读：棋子 ink(0.20+) 应 ≥ inkThOcc，空格(0.02~0.07)/星标(0.10) 应 < inkThOcc。 */
+      inkThOcc: bgSnap && typeof bgSnap.inkThOcc === 'number'
+        ? Math.round(bgSnap.inkThOcc * 1000) / 1000 : -1,
+      boardInkMed: bgSnap && typeof bgSnap.boardInkMed === 'number'
+        ? Math.round(bgSnap.boardInkMed * 1000) / 1000 : -1,
+      /* 簇差 = 棋子簇与空格簇的墨迹均值差。≥0.06 才算真的分出来，
+         <0.06 说明整盘墨迹是单峰（空盘 / 画面里没棋子 / 四角完全跑飞）。 */
+      inkGap: bgSnap && typeof bgSnap.inkGap === 'number'
+        ? Math.round(bgSnap.inkGap * 1000) / 1000 : -1,
       occludedN: redN + blkN,
       /* 2.1.57 模板自举：bootOccDiff 是与标准开局的占位数差（≤4 才会自举），
          bootMade=1 表示这一帧成功裁出了同源模板。 */

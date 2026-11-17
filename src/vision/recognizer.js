@@ -958,6 +958,40 @@ function edgeDetectBoard(pixels, w, h) {
 
 
 
+/**
+ * 墨迹阈值 Otsu 分簇（2.1.60）
+ *
+ * 输入 90 格的墨迹占比，把「空格基线」和「棋子」分成两簇，返回谷底阈值。
+ * 为什么不用「中位数×系数」：采样盘 47px 会把邻格细线也算进来，空格基线能到
+ * 0.12，×2.2 = 0.267 反而高过一半棋子的墨迹（真机帧 0.18~0.26），整盘判空。
+ *
+ * gap 是两簇均值的差，调用方用它判断「到底有没有两簇」：
+ * 空盘 / 满盘是单峰分布，gap 很小，此时必须判空（宁可不出箭头，不能乱认）。
+ *
+ * @returns {{th:number, gap:number, med:number, ok:boolean}}
+ */
+function inkOtsuThreshold(values) {
+  const n = values.length;
+  if (n < 20) return { th: 0.30, gap: 0, med: -1, ok: false };
+  const v = Array.prototype.slice.call(values).sort((a, b) => a - b);
+  const med = v[n >> 1];
+  let sumAll = 0;
+  for (let i = 0; i < n; i++) sumAll += v[i];
+  let sumLow = 0, bestG = -1, bestT = 0, gap = 0;
+  for (let i = 1; i < n; i++) {
+    sumLow += v[i - 1];
+    const w0 = i / n, w1 = 1 - w0;
+    const mLow = sumLow / i, mHigh = (sumAll - sumLow) / (n - i);
+    const g = w0 * w1 * (mHigh - mLow) * (mHigh - mLow);
+    if (g > bestG) { bestG = g; bestT = (v[i - 1] + v[i]) * 0.5; gap = mHigh - mLow; }
+  }
+  const ok = (gap >= 0.06 && bestT >= 0.10);
+  return {
+    th: ok ? Math.min(0.32, Math.max(0.13, bestT)) : 0.30,
+    gap: gap, med: med, ok: ok
+  };
+}
+
 class BoardRecognizer {
 
   /**
@@ -1612,7 +1646,24 @@ class BoardRecognizer {
     // 免得低对比皮肤把「棋盘格自己」判成棋子。
     const hiTh = med + Math.max(16, 3 * mad);
     const loTh = med - Math.max(18, 3 * mad);
-    return { boardL: med, mad: mad, hiTh: hiTh, loTh: loTh, levelN: ls.length };
+    /* ★ 2.1.60 墨迹占位模型：亮度三峰只对「深色盘面」皮肤有效。浅木色盘面 +
+       黑字的皮肤里，棋子盘面亮度与棋盘底色重合，[loTh, hiTh] 把棋子全吞进去
+       （2.1.59 真机帧：判有子=6）。而墨迹（黑字/红字笔画）皮肤无关：
+       空格 0.02~0.07、星标 0.10、棋子 0.20+（真机帧实测）。空格占多数 →
+       inkR 中位数 ≈ 空格基线，阈值 = max(0.13, 基线×2.2) 自适应。 */
+    const inks = [];
+    for (let i = 0; i < stats.length; i++) {
+      const s = stats[i];
+      if (s && s.n > 0 && typeof s.inkR === 'number') inks.push(s.inkR);
+    }
+    /* ★ 2.1.60：墨迹阈值用 Otsu 分簇（空格基线 vs 棋子），不用「中位数×系数」。
+       真机帧实锤：采样盘 47px 会把邻格细线也算进来，空格基线到 0.12，
+       ×2.2 = 0.267 —— 高过一半棋子的墨迹（0.18~0.26），整盘判空。
+       Otsu 直接找两簇之间的谷底（本帧 0.17：空格 ≤0.16、棋子 ≥0.18）。
+       两簇分不开（空盘 / 满盘 = 单峰）时判空：宁可不出箭头，也不能乱认。 */
+    const inkO = inkOtsuThreshold(inks);
+    return { boardL: med, mad: mad, hiTh: hiTh, loTh: loTh, levelN: ls.length,
+             inkThOcc: inkO.th, boardInkMed: inkO.med, inkGap: inkO.gap, inkOk: inkO.ok ? 1 : 0 };
   }
 
   /**
@@ -1700,12 +1751,20 @@ class BoardRecognizer {
 
     /* 2.1.57：空格预筛改用亮度。
        warmRatio 在木色棋盘上恒约 0.8（木色 R-B=87 也算暖），原来这条 0.18 的
-       判断一次都不会命中，空格照样全部进模板比对 —— 这是「81 格有子」的另一半原因。 */
+       判断一次都不会命中，空格照样全部进模板比对 —— 这是「81 格有子」的另一半原因。
+       ★ 2.1.60：亮度预筛在「浅木色盘面 + 黑字」皮肤上会把**所有棋子**判成空格
+       （棋子盘面 L148~178 落在空格区间 [145,219] 里，2.1.59 真机帧就是这么
+       整盘判空的）。改成「没墨迹**且**亮度在空格区间」才算空 —— 墨迹是皮肤无关
+       信号，有墨就必须进模板比对。 */
     const bgm = this.bgModel;
+    const inkGate0 = (bgm && typeof bgm.inkThOcc === 'number' && bgm.inkThOcc > 0)
+      ? bgm.inkThOcc : 0.13;
+    const inkR0 = (typeof stats.inkR === 'number') ? stats.inkR : 0;
+    const noInk = (inkR0 < inkGate0);
     if (bgm && typeof bgm.hiTh === 'number' && typeof bgm.loTh === 'number') {
       const Lc = stats.meanL || 0;
-      if (Lc <= bgm.hiTh && Lc >= bgm.loTh) return { key: 'E', score: 0, warmRatio };
-    } else if (warmRatio < 0.18) {
+      if (noInk && Lc <= bgm.hiTh && Lc >= bgm.loTh) return { key: 'E', score: 0, warmRatio };
+    } else if (noInk && warmRatio < 0.18) {
       // 没有 boardLevel 模型时退回旧判据
       return { key: 'E', score: warmRatio, warmRatio };
     }
@@ -1846,8 +1905,14 @@ class BoardRecognizer {
 
       // 河界两行（row 4/5）中央有「楚河」「汉界」和水印文字，
       // 那文字是深色的，会被墨迹判据当成棋子。这两行阈值单独抬高。
+      // 2.1.60：基准阈值改由墨迹占位模型自适应（bgModel.inkThOcc，
+      // 真机帧实测空格 0.02~0.07 / 星标 0.10 / 棋子 0.20+ → 0.13）；
+      // 河界行在自适应值上再抬 0.05（浅色水印的皮肤里河界行墨迹并不高，
+      // 但保留余量防其它皮肤河界文字干扰）。
       const isRiverRow = (sq >= 4 * 9 && sq < 6 * 9);
-      const inkTh = isRiverRow ? 0.22 : 0.085;
+      const inkBase = (bgT && typeof bgT.inkThOcc === 'number' && bgT.inkThOcc > 0)
+        ? bgT.inkThOcc : 0.13;
+      const inkTh = isRiverRow ? Math.max(0.16, inkBase + 0.05) : inkBase;
 
       const inkR = (typeof s.inkR === 'number') ? s.inkR : 0;
       const warmR = (typeof s.warmR === 'number') ? s.warmR : 0;
@@ -2111,13 +2176,26 @@ class BoardRecognizer {
       // 暖色 / 大片暗色只说明「有东西」，还要有墨迹才认作棋子（挡住木色背景）
       /* 2.1.57：占位判据换成「偏离棋盘底色亮度」（真机日志推翻暖色判据的证据见
          calibrateBoardLevel 的注释）。暖色通道在木色棋盘上恒为真，交叉点网格线
-         又给出 inkR，两个条件一起把空格整片判成棋子 —— 真机 81/90 格有子。 */
-      let occupied;
+         又给出 inkR，两个条件一起把空格整片判成棋子 —— 真机 81/90 格有子。
+         ★ 2.1.60：亮度判据在「浅木色盘面 + 黑字」皮肤上整体失效（2.1.59 真机帧
+         判有子=6），改为**墨迹为主、亮度偏离为辅**：
+           inkR ≥ inkThOcc（自适应，空格基线×2.2 起）→ 有子，皮肤无关；
+           亮度只在明显偏离时兜底（devL>0.25，防老深色皮肤里墨迹被高光冲淡）。
+         真机帧实测墨迹分离度：空格 0.02~0.07 / 星标 0.10 / 棋子 0.20+。 */
+      const inkThOcc = (bg && typeof bg.inkThOcc === 'number' && bg.inkThOcc > 0)
+        ? bg.inkThOcc : 0.13;
+      const isRiverSq = (sq >= 4 * 9 && sq < 6 * 9);
+      const inkGate = isRiverSq ? Math.max(0.16, inkThOcc + 0.05) : inkThOcc;
+      let devL = -1;
       if (lvOK) {
-        occupied = (s.meanL > bg.hiTh) || (s.meanL < bg.loTh);
         const dHi = (s.meanL - bg.hiTh) / Math.max(1, bg.hiTh - bg.boardL);
         const dLo = (bg.loTh - s.meanL) / Math.max(1, bg.boardL - bg.loTh);
-        conf[sq] = dHi > dLo ? dHi : dLo;
+        devL = dHi > dLo ? dHi : dLo;
+      }
+      let occupied;
+      if (lvOK) {
+        occupied = (inkR >= inkGate) || (devL > 0.25);
+        conf[sq] = Math.max(inkR / inkGate, devL);
         if (conf[sq] < 0) conf[sq] = 0;
       } else {
         occupied = (warmR >= warmTh || darkR >= o.darkFace) &&
@@ -2266,15 +2344,16 @@ function alignGridToOpening(pixels, w, h, corners, openingIdx, emptyIdx) {
   const em = Array.isArray(emptyIdx) ? emptyIdx : null;
   if (!op || !em || op.length < 24 || em.length < 40) return null;
 
-  /* ★ 2.1.59：probeL 从「2×2 点采样」改为「矩形盘均值」（积分图 O(1)）。
-   * 2.1.58 真机日志实锤：2×2 点采样会被棋盘线 / 兵卒位定位标记骗 ——
-   * 空棋盘画面上它照样凑出 13→19 的「命中」（探针读到的 (105,72,61) 是
-   * 标记不是棋子：同帧 sampleCell 的 94px 采样盘 90 格全木色、判有子=0），
-   * 对齐器在噪声上完成假对齐，learnBoard 在被挪走的格点上整盘判空。
-   * 盘均值与 sampleCell 同口径：细线只占盘面 5~8% 拉不动均值，真棋子
-   * （直径约 0.85 格距）整盘盖住、亮度差 50+ 稳定命中。空盘上命中归零，
-   * 「宁缺毋滥」的闸门从此真正生效。
-   * 积分图只建棋盘 bbox 外扩区，一次 O(ROI)，此后任意候选 90 次 O(1) 查询。 */
+  /* ★ 2.1.60：probeL 从「亮度均值」改为「墨迹占比」（积分图 O(1)）。
+   * 2.1.59 真机帧实锤（失败帧 JPEG 落盘 + 离线复现）：这局皮肤的黑子是
+   * 浅木色盘面 + 黑字 + 黑描边 —— 盘面亮度 L≈150 与棋盘底色几乎重合，
+   * 亮度三峰模型完全失效（判有子=6），对齐器的亮度信号也是死的。
+   * 而「墨迹」（黑字笔画 / 红字笔画，sampleCell 的 isDarkInk/isRedInk 同式）
+   * 在真机帧 90 格上完美分离：
+   *   空格 ink 0.02~0.07 / 楚河汉界中心星 0.10 / 黑子 0.20~0.24 / 红子 0.25~0.31
+   * （旧深色皮肤整盘深色 → ink≈0.9+，同样轻松命中 —— 皮肤无关）。
+   * 阈值取 max(0.13, 恒等网格墨迹中位数×2.2)：本帧 → 0.13，网格线更黑的
+   * 皮肤会自动抬高到 0.22+，星标/网格线不会误报。 */
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (let i = 0; i < 4; i++) {
     const p = corners[i];
@@ -2306,12 +2385,16 @@ function alignGridToOpening(pixels, w, h, corners, openingIdx, emptyIdx) {
     const prevOff = yy * IW;
     for (let xx = 0; xx < roiW; xx++) {
       const i4 = (srcRow + xx) * 4;
-      run += 0.299 * pixels[i4] + 0.587 * pixels[i4 + 1] + 0.114 * pixels[i4 + 2];
+      const pr = pixels[i4], pg = pixels[i4 + 1], pb = pixels[i4 + 2];
+      const L = 0.299 * pr + 0.587 * pg + 0.114 * pb;
+      const isRedInk = (pr > 95 && pg < 115 && (pr - pg) > 55 && (pr - pb) > 65);
+      const isInk = isRedInk || (L < 85 && !isRedInk) ? 1 : 0;
+      run += isInk;
       integ[rowOff + xx + 1] = integ[prevOff + xx + 1] + run;
     }
   }
 
-  /** 以 (x,y) 为中心的 (2R+1)² 矩形均值亮度。出界返回 -1（候选作废） */
+  /** 以 (x,y) 为中心的 (2R+1)² 矩形墨迹占比。出界返回 -1（候选作废） */
   function probeL(x, y) {
     const xi = x | 0, yi = y | 0;
     const x0 = xi - R - roiX, x1 = xi + R - roiX;
@@ -2336,36 +2419,38 @@ function alignGridToOpening(pixels, w, h, corners, openingIdx, emptyIdx) {
   for (let i = 0; i < 90; i++) FLIP[i] = (9 - ((i / 9) | 0)) * 9 + (8 - (i % 9));
 
   const dev = new Float32Array(90);
-  let med = 0;
+  let inkTh = 0;
   let evals = 0;
 
-  /** 对一组四角打分；med 只在第一次（恒等网格）时从中位数求出 */
+  /** 对一组四角打分；inkTh 只在第一次（恒等网格）时从中位数求出 */
   function evalCorners(cs) {
     evals++;
     const p00 = cs[0], p10 = cs[1], p11 = cs[2], p01 = cs[3];
     for (let i = 0; i < 90; i++) {
       const p = bilinear(p00, p10, p11, p01, UV[i * 2], UV[i * 2 + 1]);
-      const L = probeL(p[0], p[1]);
-      if (L < 0) return null;
-      dev[i] = L;
+      const v = probeL(p[0], p[1]);
+      if (v < 0) return null;
+      dev[i] = v;
     }
-    if (med <= 0) {
-      const sorted = Array.prototype.slice.call(dev).sort((a, b) => a - b);
-      med = sorted[45];
-      if (med <= 0) med = 1;
+    if (inkTh <= 0) {
+      /* 空格永远占多数 → 用 Otsu 在「空格基线」与「棋子」两簇之间切一刀
+         （与 calibrateBoardLevel 同一套，见 inkOtsuThreshold 注释：
+         真机帧谷底 0.17，空格 ≤0.16 / 棋子 ≥0.18）。 */
+      inkTh = inkOtsuThreshold(dev).th;
     }
+    const TH = inkTh * 100;           // 打分用百分比刻度
     let best = null;
     for (let f = 0; f < 2; f++) {
       let s = 0, oh = 0, eh = 0;
       for (let k2 = 0; k2 < op.length; k2++) {
-        const d = Math.min(150, Math.abs(dev[f ? FLIP[op[k2]] : op[k2]] - med));
+        const d = Math.min(45, dev[f ? FLIP[op[k2]] : op[k2]] * 100);
         s += d;
-        if (d > 25) oh++;
+        if (d >= TH) oh++;
       }
       for (let k2 = 0; k2 < em.length; k2++) {
-        const d = Math.min(150, Math.abs(dev[f ? FLIP[em[k2]] : em[k2]] - med));
+        const d = Math.min(45, dev[f ? FLIP[em[k2]] : em[k2]] * 100);
         s -= 0.8 * d;
-        if (d > 25) eh++;
+        if (d >= TH) eh++;
       }
       if (!best || s > best.s) best = { s: s, occHit: oh, emptyHit: eh, flip: f };
     }

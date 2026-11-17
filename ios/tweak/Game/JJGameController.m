@@ -634,11 +634,15 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
               info[@"bottomRed"] ?: @"-", info[@"bottomBlack"] ?: @"-",
               info[@"topRed"] ?: @"-", info[@"topBlack"] ?: @"-");
         /* 2.1.57：亮度三峰模型。空格必须落在 [loTh, hiTh] 之内，
-           暗子 < loTh、亮子 > hiTh；有子数 occludedN 应等于当前盘面子数（开局 32）。 */
-        NSLog(@"[JJCheat] 亮度模型 盘面L=%@ 空格区间=[%@,%@] mad=%@ 判有子=%@",
+           暗子 < loTh、亮子 > hiTh；有子数 occludedN 应等于当前盘面子数（开局 32）。
+           2.1.60：墨迹占位模型 —— 浅木色盘面的皮肤里亮度三峰失效，
+           占位判据改看墨迹（inkThOcc 自适应阈值 / boardInkMed 空格基线）。 */
+        NSLog(@"[JJCheat] 亮度模型 盘面L=%@ 空格区间=[%@,%@] mad=%@ 判有子=%@ 墨迹阈值=%@ 墨迹基线=%@ 簇差=%@",
               info[@"boardL"] ?: @"-", info[@"loTh"] ?: @"-",
               info[@"hiTh"] ?: @"-", info[@"mad"] ?: @"-",
-              info[@"occludedN"] ?: @"-");
+              info[@"occludedN"] ?: @"-",
+              info[@"inkThOcc"] ?: @"-", info[@"boardInkMed"] ?: @"-",
+              info[@"inkGap"] ?: @"-");
         /* 2.1.57：占位差 ≤4 才会现场裁模板；bootMade=1 说明这一帧的模板
            与真机像素同源，之后 score 才有意义。 */
         NSLog(@"[JJCheat] 模板自举 尝试=%@ 占位差=%@ 成功=%@ 模板数=%@",
