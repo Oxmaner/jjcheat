@@ -478,7 +478,7 @@ var JJEngine = {
   /* 2.1.58：开局匹配滤波对齐（alignGridToOpening）。标记必须变：
      容器里那份 engine.js 只认「缺当前标记 → 覆盖升级」，标记不变 = 2.1.57
      的旧脚本一直被用下去，新对齐逻辑根本跑不到。 */
-  featureMark: 'pikafishNative2158',
+  featureMark: 'pikafishNative2159',
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
@@ -887,6 +887,7 @@ var JJEngine = {
       o.alignOccHit = alignR ? alignR.occHit : -1;
       o.alignEmptyHit = alignR ? alignR.emptyHit : -1;
       o.alignIdOccHit = alignR ? alignR.idOccHit : -1;
+      o.alignIdEmptyHit = alignR ? alignR.idEmptyHit : -1;
       o.alignShiftX = alignR ? Math.round(alignR.shiftX || 0) : 0;
       o.alignShiftY = alignR ? Math.round(alignR.shiftY || 0) : 0;
       o.alignScaleX = alignR ? Math.round((alignR.scaleX || 1) * 1000) / 1000 : 1;
@@ -895,7 +896,12 @@ var JJEngine = {
     }
 
     var refined = null, err = '', tried = 0;
-    if (base) {
+    /* ★ 2.1.59：对齐已采纳就不再跑 refineGrid。
+       真机 2.1.57/58 日志实锤：refineGrid 的暖亮掩码在木色棋盘上整块命中，
+       无先验拟合等于对噪声对齐（把格点从棋子上拖走几十像素）；而
+       alignGridToOpening 有「开局 32 子」物理先验 + 严格闸门，可信度远高。
+       两条路二选一，对齐赢的时候不能再让拟合把格点拖回去。 */
+    if (base && !(alignR && alignR.accepted)) {
       tried = 1;
       try {
         var sm = halfPixels(pixels, w, h);
@@ -1801,6 +1807,8 @@ var JJEngine = {
 };
 
 global.JJEngine = JJEngine;
+/* 仅离线回归用：宿主注入钩子时暴露识别器与开局表（生产环境不设置，零开销） */
+if (typeof global.__JJ_TEST_HOOK__ === 'function') global.__JJ_TEST_HOOK__(REC, TRK);
 if (typeof module !== 'undefined' && module.exports) module.exports = JJEngine;
 
 })(typeof globalThis !== 'undefined' ? globalThis : this);

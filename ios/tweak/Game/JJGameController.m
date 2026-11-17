@@ -42,6 +42,8 @@ typedef NS_ENUM(NSInteger, JJGameState) {
 @property (nonatomic, assign) NSInteger learnFailCount;
 /* 插件总开关 */
 @property (nonatomic, assign) BOOL enabled;
+/* 2.1.59：学习失败帧落盘（诊断用，见 dumpFrameJPEG） */
+- (void)dumpFrameJPEG:(NSData *)rgba width:(int)w height:(int)h;
 /* 思考时长（ms，Pikafish 的 go movetime），持久化 */
 @property (nonatomic, assign) NSInteger thinkMs;
 @property (nonatomic, assign) NSTimeInterval lastProcessTime;
@@ -644,10 +646,13 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
               info[@"bootMade"] ?: @"-", info[@"tplCount"] ?: @"-");
         /* 2.1.58：开局匹配滤波对齐。命中=开局 32 位里偏离棋盘亮度的格数，
            原命中=对齐前恒等网格的命中数。手指点四角误差 ±30px 会让采样窗
-           只擦到棋子边缘 → 32 子全判空（2.1.57 根因），对齐就是治这个的。 */
-        NSLog(@"[JJCheat] 格点对齐 采纳=%@ 命中=%@/32 空格误报=%@ 原命中=%@ 平移=%@,%@ 缩放=%@,%@",
+           只擦到棋子边缘 → 32 子全判空（2.1.57 根因），对齐就是治这个的。
+           2.1.59 补打 原误报：恒等网格的空格误报数，与「采纳但误报超限」
+           这类矛盾能当场对账。 */
+        NSLog(@"[JJCheat] 格点对齐 采纳=%@ 命中=%@/32 空格误报=%@ 原命中=%@ 原误报=%@ 平移=%@,%@ 缩放=%@,%@",
               info[@"alignAccepted"] ?: @"-", info[@"alignOccHit"] ?: @"-",
               info[@"alignEmptyHit"] ?: @"-", info[@"alignIdOccHit"] ?: @"-",
+              info[@"alignIdEmptyHit"] ?: @"-",
               info[@"alignShiftX"] ?: @"-", info[@"alignShiftY"] ?: @"-",
               info[@"alignScaleX"] ?: @"-", info[@"alignScaleY"] ?: @"-");
         NSLog(@"[JJCheat] 墨迹图 i=%@", info[@"diagI"] ?: @"-");
@@ -658,6 +663,7 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
               info[@"gotFen"] ?: @"-");
         NSLog(@"[JJCheat] 差异格 %@", info[@"mismatch"] ?: @"-");
         [[JJCalibrator shared] dumpSamplesWithPixels:rgba width:w height:h];
+        [self dumpFrameJPEG:rgba width:w height:h];
         if (self.calibrationPending && [[JJCalibrator shared] hasSnapshot] &&
             self.learnFailCount >= JJ_CALIB_ROLLBACK_FAILS) {
             [self rollbackCalibration];
@@ -728,6 +734,40 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     [self startTimer];
     [[JJHUDWindow shared] showStatus:@"标定未成功 · 已恢复上次标定"];
     NSLog(@"[JJCheat] 重标定失败，回滚到上一次成功标定（JS 锚盘未清空）");
+}
+
+/* 2.1.59：学习失败时把这一帧落盘成 JPEG。
+   2.1.58 真机日志出现「探针读到棋子色、90 格采样盘全木色」的矛盾，事后
+   无法区分「帧里根本没有棋子（停错画面/棋子在别的渲染层）」还是「采样
+   路径有 bug」。这张图一锤定音。固定文件名覆盖写，不堆积垃圾。 */
+- (void)dumpFrameJPEG:(NSData *)rgba width:(int)w height:(int)h {
+    if (!rgba.length || w <= 0 || h <= 0) return;
+    if ((NSUInteger)w * (NSUInteger)h * 4 != rgba.length) return;
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    if (!space) return;
+    CGDataProviderRef prov = CGDataProviderCreateWithCFData((__bridge CFDataRef)rgba);
+    CGImageRef img = prov ? CGImageCreate(w, h, 8, 32, (size_t)w * 4, space,
+                                          kCGBitmapByteOrder32Big | kCGImageAlphaLast,
+                                          prov, NULL, false, kCGRenderingIntentDefault)
+                          : NULL;
+    if (prov) CFRelease(prov);
+    if (img) {
+        UIImage *ui = [UIImage imageWithCGImage:img];
+        CGImageRelease(img);
+        NSData *jpg = ui ? UIImageJPEGRepresentation(ui, 0.55) : nil;
+        if (jpg.length) {
+            NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+            NSString *path = [dir stringByAppendingPathComponent:@"JJCheat_frame_dump.jpg"];
+            NSError *werr = nil;
+            if ([jpg writeToFile:path options:NSDataWritingAtomic error:&werr]) {
+                NSLog(@"[JJCheat] 失败帧已存图: %@（%lu B，取图看画面里到底有没有棋子）",
+                      path, (unsigned long)jpg.length);
+            } else {
+                NSLog(@"[JJCheat] 失败帧存图失败: %@", werr.localizedDescription ?: @"-");
+            }
+        }
+    }
+    CGColorSpaceRelease(space);
 }
 
 #pragma mark - 识别结果 → 引擎 → HUD

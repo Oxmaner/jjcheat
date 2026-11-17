@@ -2266,6 +2266,62 @@ function alignGridToOpening(pixels, w, h, corners, openingIdx, emptyIdx) {
   const em = Array.isArray(emptyIdx) ? emptyIdx : null;
   if (!op || !em || op.length < 24 || em.length < 40) return null;
 
+  /* ★ 2.1.59：probeL 从「2×2 点采样」改为「矩形盘均值」（积分图 O(1)）。
+   * 2.1.58 真机日志实锤：2×2 点采样会被棋盘线 / 兵卒位定位标记骗 ——
+   * 空棋盘画面上它照样凑出 13→19 的「命中」（探针读到的 (105,72,61) 是
+   * 标记不是棋子：同帧 sampleCell 的 94px 采样盘 90 格全木色、判有子=0），
+   * 对齐器在噪声上完成假对齐，learnBoard 在被挪走的格点上整盘判空。
+   * 盘均值与 sampleCell 同口径：细线只占盘面 5~8% 拉不动均值，真棋子
+   * （直径约 0.85 格距）整盘盖住、亮度差 50+ 稳定命中。空盘上命中归零，
+   * 「宁缺毋滥」的闸门从此真正生效。
+   * 积分图只建棋盘 bbox 外扩区，一次 O(ROI)，此后任意候选 90 次 O(1) 查询。 */
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < 4; i++) {
+    const p = corners[i];
+    if (p[0] < minX) minX = p[0];
+    if (p[0] > maxX) maxX = p[0];
+    if (p[1] < minY) minY = p[1];
+    if (p[1] > maxY) maxY = p[1];
+  }
+  /* 单格距 = 顶边长 / 8（gridPoints 的 u 参数化就是 c/8）。
+   * 【现场 bug】最初写成整条边长（8 倍），R 被放大到 8 倍、采样盘远超 ROI，
+   * probeL 处处出界 → evalCorners 恒 null → 对齐永远返回 null。 */
+  const cell = Math.hypot(corners[1][0] - corners[0][0], corners[1][1] - corners[0][1]) / 8;
+  if (!(cell > 20)) return null;
+  const R = Math.max(14, Math.round(cell * 0.30));
+  /* 覆盖缩放 ±10% 与四角微调 ±64px 的移动范围 */
+  const pad = R + 120;
+  const roiX = Math.max(0, Math.floor(minX - pad));
+  const roiY = Math.max(0, Math.floor(minY - pad));
+  const roiW = Math.min(w, Math.ceil(maxX + pad)) - roiX;
+  const roiH = Math.min(h, Math.ceil(maxY + pad)) - roiY;
+  if (roiW < R * 4 + 8 || roiH < R * 4 + 8) return null;
+
+  const IW = roiW + 1;
+  const integ = new Float64Array(IW * (roiH + 1));
+  for (let yy = 0; yy < roiH; yy++) {
+    const srcRow = (roiY + yy) * w + roiX;
+    let run = 0;
+    const rowOff = (yy + 1) * IW;
+    const prevOff = yy * IW;
+    for (let xx = 0; xx < roiW; xx++) {
+      const i4 = (srcRow + xx) * 4;
+      run += 0.299 * pixels[i4] + 0.587 * pixels[i4 + 1] + 0.114 * pixels[i4 + 2];
+      integ[rowOff + xx + 1] = integ[prevOff + xx + 1] + run;
+    }
+  }
+
+  /** 以 (x,y) 为中心的 (2R+1)² 矩形均值亮度。出界返回 -1（候选作废） */
+  function probeL(x, y) {
+    const xi = x | 0, yi = y | 0;
+    const x0 = xi - R - roiX, x1 = xi + R - roiX;
+    const y0 = yi - R - roiY, y1 = yi + R - roiY;
+    if (x0 < 0 || y0 < 0 || x1 > roiW - 1 || y1 > roiH - 1) return -1;
+    const a = integ[y0 * IW + x0], b = integ[y0 * IW + x1 + 1];
+    const c = integ[(y1 + 1) * IW + x0], d = integ[(y1 + 1) * IW + x1 + 1];
+    return (d - c - b + a) / ((x1 - x0 + 1) * (y1 - y0 + 1));
+  }
+
   // 90 个交叉点的归一化坐标（u=c/8, v=r/9，与 gridPoints 同参数化）
   const UV = new Float32Array(180);
   for (let r = 0; r < 10; r++) {
@@ -2278,18 +2334,6 @@ function alignGridToOpening(pixels, w, h, corners, openingIdx, emptyIdx) {
   // 翻转坐标映射（红黑互换时的对应格）
   const FLIP = new Int32Array(90);
   for (let i = 0; i < 90; i++) FLIP[i] = (9 - ((i / 9) | 0)) * 9 + (8 - (i % 9));
-
-  /** 2×2 均值亮度。出界返回 -1（该候选直接作废） */
-  function probeL(x, y) {
-    const xi = x | 0, yi = y | 0;
-    if (xi < 1 || yi < 1 || xi + 1 >= w || yi + 1 >= h) return -1;
-    const r0 = (yi * w + xi) * 4, r1 = r0 + w * 4;
-    const a = pixels[r0], b = pixels[r0 + 1], c = pixels[r0 + 2];
-    const d = pixels[r0 + 4], e = pixels[r0 + 5], f = pixels[r0 + 6];
-    const g = pixels[r1], hh = pixels[r1 + 1], ii = pixels[r1 + 2];
-    const j = pixels[r1 + 4], k = pixels[r1 + 5], l = pixels[r1 + 6];
-    return (0.299 * (a + d + g + j) + 0.587 * (b + e + hh + k) + 0.114 * (c + f + ii + l)) * 0.25;
-  }
 
   const dev = new Float32Array(90);
   let med = 0;

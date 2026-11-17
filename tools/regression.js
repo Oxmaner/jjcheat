@@ -142,6 +142,13 @@ function makeFixture(src, blackBottom) {
 function main() {
   const src = loadEngineSource();
 
+  /* F 段要直接调识别器的 alignGridToOpening：bundle 模板里有
+     __JJ_TEST_HOOK__ 钩子，engine.js 装载时把 REC/TRK 模块递出来 */
+  global.__JJ_TEST_HOOK__ = function (RECm, TRKm) {
+    global.__REC = RECm;
+    global.__TRK = TRKm;
+  };
+
   console.log('========== A. 执红：红先手 + 走子轮次 + 噪声门槛 + 派出去重 ==========');
   const A = makeFixture(src, false);
   A.learnOpening(true);
@@ -291,6 +298,96 @@ function main() {
     if (rows[9] !== 'RNBAKABNR') throw new Error('执黑时红方仍应原样在底: ' + rows[9]);
     if (r.searchFen.split(' ')[1] !== 'b') throw new Error('红走完应轮到黑 b');
   });
+
+  console.log('');
+  console.log('========== F. 格点对齐（2.1.59 盘均值口径）：偏移修复 / 空盘拒绝 / 已对齐不动 ==========');
+  {
+    /* 2.1.58 真机教训：2×2 点采样把棋盘线 / 兵卒位定位标记当棋子，空盘也
+       能凑出「命中」造成假对齐。断言换成盘均值口径后的三种关键行为。 */
+    const RECM = global.__REC;
+    const TRKM = global.__TRK;
+    if (!RECM || !TRKM) throw new Error('测试钩子未注入（bundle 模板缺 __JJ_TEST_HOOK__？）');
+    const spm = TRKM.startPieceMap();
+    const opIdx = [], emIdx = [];
+    for (let i = 0; i < 90; i++) (spm[i] ? opIdx : emIdx).push(i);
+
+    const W = 600, H = 660;
+    const CS = [[60, 60], [540, 60], [540, 600], [60, 600]];
+    const ptOf = (cs, r, c) => {
+      const u = c / 8, v = r / 9;
+      return [
+        (1-u)*(1-v)*cs[0][0] + u*(1-v)*cs[1][0] + u*v*cs[2][0] + (1-u)*v*cs[3][0],
+        (1-u)*(1-v)*cs[0][1] + u*(1-v)*cs[1][1] + u*v*cs[2][1] + (1-u)*v*cs[3][1]
+      ];
+    };
+    /** 合成帧：木色底 + 2px 深色网格线 + 兵卒/炮位十字标记 + 可选 32 子 */
+    function synthFrame(withPieces, offX, offY) {
+      const px = new Uint8ClampedArray(W * H * 4);
+      for (let i = 0; i < W * H; i++) {
+        px[i * 4] = 190; px[i * 4 + 1] = 150; px[i * 4 + 2] = 100; px[i * 4 + 3] = 255;
+      }
+      const put = (x, y, r, g, b) => {
+        const xi = x | 0, yi = y | 0;
+        if (xi < 0 || yi < 0 || xi >= W || yi >= H) return;
+        const i = (yi * W + xi) * 4;
+        px[i] = r; px[i + 1] = g; px[i + 2] = b;
+      };
+      const sCS = CS.map(p => [p[0] + offX, p[1] + offY]);
+      const line = (a, b) => {
+        const n = Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]));
+        for (let t = 0; t <= n; t++) {
+          const x = a[0] + (b[0] - a[0]) * t / n, y = a[1] + (b[1] - a[1]) * t / n;
+          put(x, y, 90, 70, 55); put(x, y + 1, 90, 70, 55);
+        }
+      };
+      for (let r = 0; r < 10; r++) for (let c = 0; c < 8; c++) line(ptOf(sCS, r, c), ptOf(sCS, r, c + 1));
+      for (let c = 0; c < 9; c++) for (let r = 0; r < 9; r++) line(ptOf(sCS, r, c), ptOf(sCS, r + 1, c));
+      const marks = [];
+      for (const r of [2, 7]) for (const c of [0, 2, 4, 6, 8]) marks.push([r, c]);
+      for (const [r, c] of [[1, 1], [1, 7], [8, 1], [8, 7]]) marks.push([r, c]);
+      for (const [r, c] of marks) {
+        const p = ptOf(sCS, r, c);
+        for (let d = -2; d <= 2; d++) { put(p[0] + d, p[1], 70, 55, 45); put(p[0], p[1] + d, 70, 55, 45); }
+      }
+      if (withPieces) {
+        for (let i = 0; i < 90; i++) {
+          if (!spm[i]) continue;
+          const r = (i / 9) | 0, c = i % 9;
+          const p = ptOf(sCS, r, c);
+          const col = r <= 4 ? [70, 55, 45] : [240, 200, 140];
+          for (let dy = -25; dy <= 25; dy++)
+            for (let dx = -25; dx <= 25; dx++)
+              if (dx * dx + dy * dy <= 625) put(p[0] + dx, p[1] + dy, col[0], col[1], col[2]);
+        }
+      }
+      return px;
+    }
+
+    /* F1：整盘偏移 (40,-30)（超出棋子+采样盘的覆盖范围，恒等网格打不到子）
+       → 必须被修复采纳，命中 ≥28，平移量收敛到真实偏移 ±6px */
+    const r1 = RECM.alignGridToOpening(synthFrame(true, 40, -30), W, H, CS, opIdx, emIdx);
+    if (!r1 || !r1.accepted) {
+      throw new Error('F1 偏移 40,-30 应被采纳修复: occ=' + (r1 && r1.occHit) + ' id=' + (r1 && r1.idOccHit));
+    }
+    if (r1.occHit < 28) throw new Error('F1 修复后命中应 ≥28: ' + r1.occHit);
+    if (Math.abs(r1.shiftX - 40) > 6 || Math.abs(r1.shiftY + 30) > 6) {
+      throw new Error('F1 平移量不符: ' + r1.shiftX + ',' + r1.shiftY);
+    }
+
+    /* F2：空棋盘（只有网格线与定位标记，2.1.58 真机就是这种画面骗过了点采样）
+       → 必须拒绝，且命中 <10（HUD 才能提示「画面里没看到棋子」） */
+    const r2 = RECM.alignGridToOpening(synthFrame(false, 0, 0), W, H, CS, opIdx, emIdx);
+    if (!r2 || r2.accepted) throw new Error('F2 空盘必须拒绝（2.1.58 被线/标记骗过一次）');
+    if (r2.occHit >= 10) throw new Error('F2 空盘命中应 <10: ' + r2.occHit);
+
+    /* F3：已对齐（恒等网格 32/32 全命中）→ already，四角一个像素都不动 */
+    const r3 = RECM.alignGridToOpening(synthFrame(true, 0, 0), W, H, CS, opIdx, emIdx);
+    if (!r3 || r3.already !== true || r3.accepted) throw new Error('F3 已对齐应走 already 分支');
+    if (r3.occHit < 22) throw new Error('F3 恒等网格应 ≥22 命中: ' + r3.occHit);
+
+    console.log('F1 偏移修复: 命中=%d/32 平移=%d,%d | F2 空盘拒绝: 命中=%d | F3 already: 命中=%d',
+      r1.occHit, r1.shiftX, r1.shiftY, r2.occHit, r3.occHit);
+  }
 
   console.log('');
   console.log('全部通过 OK  engine.js = %d 字节, mark=%s',
