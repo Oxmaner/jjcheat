@@ -927,6 +927,15 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     }
     disp[@"engineState"] = [[JJPikafish shared] stateText];
     disp[@"enginePending"] = self.enginePending ? @1 : @0;
+    /* 2.1.68：把引擎"拒绝搜索"的真实原因透给 HUD。
+       以前引擎网络加载失败时，HUD 会落到兜底分支显示「视角未对齐 · 请回开局画面」——
+       那句话把人往识别方向引，而实际问题在引擎。这里明确区分开。 */
+    NSString *notice = [JJPikafish shared].lastEngineNotice;
+    if ([notice hasPrefix:@"JJ-NNUE FAIL"]) {
+        disp[@"engineBlocked"] = @"网络未就绪";
+    } else if ([[JJPikafish shared] state] == JJPikaStateDead) {
+        disp[@"engineBlocked"] = @"引擎不可用";
+    }
     disp[@"sideToMove"] = rec[@"sideToMove"] ?: (waiting ? @"black" : @"red");
     [[JJHUDWindow shared] showResult:disp
                           gridPoints:[JJCalibrator shared].gridPts

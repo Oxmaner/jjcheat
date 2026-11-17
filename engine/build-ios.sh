@@ -22,8 +22,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TAG="${PIKA_TAG:-Pikafish-2026-09-06}"
-REPO="${PIKA_REPO:-https://github.com/official-pikafish/Pikafish.git}"
+# 用 commit 而不是 tag：master-net 那份权重是"滚动发布"，只与 master 的最新
+# 架构匹配（2026-11-17 实测：master HEAD 的 Network::hash = FT ^ NA ^ LayerStackTableHash
+# = 0x90B0F02D ^ 0x5A7AB1E5 = 0xCACA41C8，与权重头一字不差）。
+# 而 tag Pikafish-2026-09-06 的架构是旧的一套（0x40C70FA6），配 master-net 必然失败。
+# 固定 commit 保证可复现；master-net 若漂移，PIKA_NET_SHA256 护栏会让构建变红。
+TAG="${PIKA_COMMIT:-8d8db92f77190dece8bd4fca9609fe2eab531844}"
+REPO="${PIKA_REPO:-https://github.com/official-pikafish/Pikafish}"
 WORK="$ROOT/engine/.build"
 SRC="$WORK/src"
 OBJ="$WORK/obj"
@@ -54,43 +59,50 @@ TARGET_FLAGS="-target arm64-apple-ios$MIN_IOS -isysroot $SDK -mios-version-min=$
 
 # ---------- 取源码 ----------
 mkdir -p "$WORK"
-if [ ! -d "$SRC/.git" ]; then
-    log "克隆 Pikafish@$TAG"
-    rm -rf "$SRC"
-    git clone --depth 1 --branch "$TAG" "$REPO" "$SRC" \
-        || die "克隆失败（tag $TAG 是否存在？）"
-else
-    CUR="$(git -C "$SRC" describe --tags --always 2>/dev/null || echo unknown)"
-    if [ "$CUR" != "$TAG" ] && [ "$NFORCE" != "1" ]; then
-        log "已有源码是 ${CUR}，切换不到 $TAG 时请 PIKA_FORCE=1 重来"
+if [ -d "$SRC/.git" ] && [ "$NFORCE" != "1" ]; then
+    CUR="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+    if [ "$CUR" = "$TAG" ]; then
+        log "复用已有源码: $CUR"
+    else
+        log "已有源码 $CUR != $TAG，重新取"
+        rm -rf "$SRC"
     fi
-    log "复用已有源码: $CUR"
+fi
+if [ ! -d "$SRC" ]; then
+    log "取 Pikafish 源码 @ $TAG"
+    rm -rf "$SRC" "$WORK/src.tgz"
+    # 用 codeload 的 tarball：可以直接钉 commit（git clone --branch 只吃分支/tag）
+    curl -sSL --retry 3 --max-time 300 \
+        "https://github.com/official-pikafish/Pikafish/archive/$TAG.tar.gz" \
+        -o "$WORK/src.tgz" || die "源码下载失败（commit $TAG）"
+    mkdir -p "$SRC"
+    tar xzf "$WORK/src.tgz" -C "$SRC" --strip-components=1 || die "源码解包失败"
+    git -C "$SRC" init -q 2>/dev/null || true
+    # 记下实际版本，便于日志追溯
+    printf '%s\n' "$TAG" > "$SRC/.jj-commit"
 fi
 
 cd "$SRC/src"
 
 # ---------- NNUE 网络 ----------
-# 【2.1.68 关键修复】不要再用官方 scripts/net.sh。
-#
-# scripts/net.sh 从 Networks 仓库的滚动发布 master-net 拉权重，而那里只有
-# "最新架构"的一个文件。它和这里钉住的 $TAG 并不配套 —— 2026-11-17 真机实测：
-#   tag Pikafish-2026-09-06 的 engineHash = 0x40C70FA6
-#   master-net 的 fileHash              = 0xCACA41C8   ← 架构不符
-# 而 Pikafish 对"架构不符"的原生反应是 Network::verify 里 exit(EXIT_FAILURE)，
-# 进程内引擎会把宿主 App 一起杀掉，历史表现就是"HUD 思考中 → 闪退"。
-#
-# 正解：用**随本仓库提交**的 engine/pikafish.nnue —— 它是从该 tag 的官方发布包
-# Pikafish.<tag>.7z 里原样取出的，架构哈希与源码严格一致（0x40C70FA6）。
-# 好处：构建不依赖外网、版本固定可复现、包体积也从 50MB 降到 4.2MB。
-BUNDLED_NET="$ROOT/engine/pikafish.nnue"
-[ -s "$BUNDLED_NET" ] || die "缺少随包网络 engine/pikafish.nnue（应与 $TAG 配套）"
-cp -f "$BUNDLED_NET" pikafish.nnue
+# 用官方 scripts/net.sh 拉 Networks 仓库的 master-net（约 50MB，滚动发布）。
+# 它只与 master 的**最新架构**配套，所以本脚本必须钉 master 的 commit（见上面 TAG）。
+# 实测对应关系（2026-11-17）：
+#   权重头 Network::hash = 0xCACA41C8
+#   master 源码 = FT ^ NA ^ LayerStackTableHash = 0x90B0F02D ^ 0x5A7AB1E5 = 0xCACA41C8 ✅
+# 一旦官方换网（权重漂移），CI 的 PIKA_NET_SHA256 护栏会让构建立刻变红，
+# 而不是等到真机上表现为「引擎拒绝搜索」。
+if [ ! -f pikafish.nnue ] || [ "$NFORCE" = "1" ]; then
+    log "下载 NNUE 网络（master-net，约 50MB）"
+    rm -f pikafish.nnue
+    sh ../scripts/net.sh || die "NNUE 下载失败（GitHub Releases 不通？）"
+else
+    log "复用已有 NNUE: $(wc -c < pikafish.nnue | tr -d ' ') 字节"
+fi
+[ -s pikafish.nnue ] || die "pikafish.nnue 是空的"
 NET_SIZE="$(wc -c < pikafish.nnue | tr -d ' ')"
-# 配套网络 zstd 压缩后约 4.19MB（解压 5.5MB）；master-net 那个是新架构的 50MB，
-# 两者大小差一个数量级，顺便用它兜住"又拿错文件"的情况。
-[ "$NET_SIZE" -gt 3000000 ] || die "pikafish.nnue 只有 $NET_SIZE 字节，不对"
-[ "$NET_SIZE" -lt 20000000 ] || die "pikafish.nnue 有 $NET_SIZE 字节 —— 这像是 master-net 的新架构网络，与 $TAG 不配套"
-log "权重   : $NET_SIZE 字节（engine/pikafish.nnue，与 $TAG 架构配套）"
+[ "$NET_SIZE" -gt 40000000 ] || die "pikafish.nnue 只有 $NET_SIZE 字节（master-net 应约 50MB）"
+log "权重   : $NET_SIZE 字节（master-net，与钉住的 $TAG 配套）"
 
 # ---------- 源码补丁（2.1.68 起） ----------
 # Network::verify 在「网络没加载成功」时会 exit(EXIT_FAILURE)，而 Engine::go

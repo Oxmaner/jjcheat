@@ -385,6 +385,7 @@ static NSString *JJFormatNodes(NSInteger nodes) {
     NSString *side = [result[@"sideToMove"] isEqual:@"black"] ? @"黑方" : @"红方";
     NSString *engine = result[@"engineState"] ?: @"";
     if (!engine.length) engine = pending ? @"思考中" : @"-";
+    NSString *blocked = result[@"engineBlocked"] ?: @"";
 
     // ---- 第一行：记谱 + 分值 ----
     if (stalled) {
@@ -398,6 +399,11 @@ static NSString *JJFormatNodes(NSInteger nodes) {
         self.lineScore.text = scoreText;
     } else if (pending) {
         self.lineMain.text = @"引擎思考中…";
+        self.lineScore.text = @"";
+    } else if (blocked.length) {
+        /* 引擎自己拒绝了本次搜索（网络没加载上 / 引擎异常）。
+           这时说「视角未对齐」是误导 —— 识别可能是好的，只是没有建议可画。 */
+        self.lineMain.text = [NSString stringWithFormat:@"引擎%@ · 点球看⑥详情", blocked];
         self.lineScore.text = @"";
     } else {
         self.lineMain.text = @"视角未对齐 · 请回开局画面";

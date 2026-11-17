@@ -13,13 +13,12 @@
 /* 复制指纹：NSUserDefaults 记录「上次复制时源文件的大小」。
    装了新 deb（换了网）→ 大小几乎必变 → 下次启动自动重拷。 */
 #define kJJKeyNetSize @"JJCheat.pikaNetSize"
-/* 权重尺寸窗口。2.1.68 起换成「随 tag 配套」的网络：zstd 后约 4.19MB、解压 5.5MB。
-   而官方 master-net 那个是**新架构**的 50MB 网络，与 Pikafish-2026-09-06 架构不符
-   （fileHash 0xCACA41C8 vs engineHash 0x40C70FA6），引擎会拒绝加载。
-   所以两头都要卡：太小=没下全；太大=又拿成 master-net 了。
-   加上限还有第二个作用：老用户容器里存着 50MB 旧网络，靠它把旧文件判定为无效并重拷。 */
-#define kJJMinNetSize (3LL * 1024 * 1024)
-#define kJJMaxNetSize (24LL * 1024 * 1024)
+/* 权重尺寸窗口。2.1.68 用 master-net：zstd 后约 50MB（解压 64.7MB），
+   与构建脚本钉住的 Pikafish master commit 配套（Network::hash 0xCACA41C8）。
+   两头都要卡：太小 = 没下全 / 或残留了 2026-09-06 那套小网络（4.19MB）；
+   太大 = 文件异常。上限同时保证老用户容器里的旧文件会被判无效并重拷。 */
+#define kJJMinNetSize (20LL * 1024 * 1024)
+#define kJJMaxNetSize (120LL * 1024 * 1024)
 
 static NSString *sResolvedNet = nil;
 

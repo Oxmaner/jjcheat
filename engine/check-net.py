@@ -3,15 +3,13 @@
 #  NNUE 权重指纹护栏
 #
 #  为什么需要：
-#    权重不再是"构建时从网上拉"，而是**随本仓库提交**的 engine/pikafish.nnue
-#    （从该 tag 的官方发布包 Pikafish.<tag>.7z 里原样取出，架构哈希与源码一致）。
-#    这里守两道门：文件形态（zstd 帧）与 sha256 指纹。
+#    权重由 scripts/net.sh 从 Networks 仓库的 master-net 拉取（滚动发布），
+#    它只与 Pikafish master 的**最新架构**配套。所以构建脚本钉 master 的一个 commit，
+#    这里再用 sha256 钉住权重 —— 任何一边漂移，构建立刻变红。
 #
-#    背景（2026-11-17 真机实测）：官方 scripts/net.sh 拉的滚动发布 master-net
-#    是"最新架构"的网络，与钉住的 PIKA_TAG 不配套 ——
-#      Pikafish-2026-09-06 的 engineHash = 0x40C70FA6
-#      master-net 的 fileHash           = 0xCACA41C8
-#    而 Pikafish 对架构不符的原生反应是 Network::verify 里 exit(EXIT_FAILURE)，
+#    背景（2026-11-17 真机实测）：tag Pikafish-2026-09-06 的架构是旧的一套
+#    （Network::hash = 0x40C70FA6），而 master-net 是 0xCACA41C8，配 tag 必然不匹配；
+#    Pikafish 对架构不符的原生反应是 Network::verify 里 exit(EXIT_FAILURE)，
 #    进程内引擎会把宿主 App 一起杀掉（「HUD 思考中 → 闪退」的真因）。
 #
 #  所以把权重 sha256 钉进 workflow：官方换网络时构建立刻变红，
@@ -31,7 +29,7 @@ import sys
 # zstd 压缩流内部，构建机上不一定有解压工具），所以这里只做「文件指纹」，
 # 即「同一份文件」的强保证。架构哈希由引擎自己打印：
 #   info string JJ-NNUE FAIL reason=architecture hash mismatch ... fileHash=… engineHash=…
-MIN_SIZE = 3_000_000  # 配套网络 zstd 后约 4.19MB（解压 5.5MB）；更小一定是截断
+MIN_SIZE = 40_000_000  # master-net 约 50MB（解压 64.7MB）；更小一定是截断
 
 
 def main() -> int:
