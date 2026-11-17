@@ -1,4 +1,4 @@
-﻿#ifndef JJConfig_h
+#ifndef JJConfig_h
 #define JJConfig_h
 
 /* ============================================================
