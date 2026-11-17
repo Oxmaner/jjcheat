@@ -18,8 +18,30 @@
 #import <os/lock.h>
 #import <math.h>
 #import <unistd.h>
+#import <signal.h>
+#import <fcntl.h>
+#import <execinfo.h>
 
 static NSString *const kPikaLog = @"[JJCheat][Pika]";
+
+/* 2.1.62：崩溃诊断。iOS 的 ReportCrash 在越狱机上常因「Log limit exceeded」
+   写不出 .ips；这里在进程内捕获 SIGSEGV/SIGBUS，把 backtrace 直接写进容器
+   Documents/JJCheat_crash_bt.txt。dylib 未 strip，符号可直接读。 */
+static char sJJCrashPath[1024] = {0};
+static void JJFatalSignalHandler(int sig) {
+    int fd = open(sJJCrashPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        char hdr[128];
+        int n = snprintf(hdr, sizeof(hdr), "\n=== signal=%d pid=%d ===\n", sig, getpid());
+        if (n > 0) (void)write(fd, hdr, (size_t)n);
+        void *frames[128];
+        int cnt = backtrace(frames, 128);
+        backtrace_symbols_fd(frames, cnt, fd);
+        close(fd);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 
 /* 握手超时：起线程后等 uciok/readyok 的上限。
    首次要 mmap 48MB 权重，冷启动比独立进程时代慢，给足 15s。 */
@@ -89,6 +111,13 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
         dispatch_set_target_queue(_pikaQueue,
                                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
         _state = JJPikaStateIdle;
+        /* 崩溃诊断：预先算好容器路径，装 SIGSEGV/SIGBUS handler */
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                             NSUserDomainMask, YES).firstObject;
+        NSString *btPath = [docs stringByAppendingPathComponent:@"JJCheat_crash_bt.txt"];
+        strncpy(sJJCrashPath, btPath.fileSystemRepresentation, sizeof(sJJCrashPath) - 1);
+        signal(SIGSEGV, JJFatalSignalHandler);
+        signal(SIGBUS, JJFatalSignalHandler);
     }
     return self;
 }
