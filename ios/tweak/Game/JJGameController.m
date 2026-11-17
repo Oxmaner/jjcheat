@@ -187,9 +187,10 @@ typedef NS_ENUM(NSInteger, JJGameState) {
             case 0: [self2 setPluginEnabled:!self2.enabled]; break;
             case 1: [self2 autoCalibrate];                   break;
             case 2: [self2 manualCalibrate];                 break;
-            case 3: [self2 toggleHUD];                       break;
-            case 4: [self2 editThinkMs];                     break;
-            case 5: [self2 showEngineStatus];                break;
+            case 3: [self2 resetToStartPosition];             break;
+            case 4: [self2 toggleHUD];                       break;
+            case 5: [self2 editThinkMs];                     break;
+            case 6: [self2 showEngineStatus];                break;
             default: break;
         }
     };
@@ -199,16 +200,42 @@ typedef NS_ENUM(NSInteger, JJGameState) {
 #pragma mark - 悬浮球菜单
 
 - (void)showMenu {
-    NSArray<NSString *> *titles = @[
-        [NSString stringWithFormat:@"① 插件开关：%@", self.enabled ? @"开" : @"关"],
-        @"② 自动标定棋盘（开局画面）",
-        @"③ 手动标定棋盘（点四角）",
-        [NSString stringWithFormat:@"④ HUD 显示：%@", self.hudVisible ? @"开" : @"关"],
-        [NSString stringWithFormat:@"⑤ 思考时间：%ld ms", (long)self.thinkMs],
-        [NSString stringWithFormat:@"⑥ 引擎：%@（点开详情）",
-            [[JJPikafish shared] stateText]]
-    ];
-    [self.ballWindow showMenuWithTitles:titles];
+    /* 2.1.78：从「6 行长文案」改成「2×3 图标网格」。
+       每格 = 图标 + 2~4 字标签，开/关用颜色表达，状态值拼在标签后面。
+       旧版每行一句「① 插件开关：开」压在棋盘上，既挡视线又要读半天。 */
+    NSMutableArray<JJMenuEntry *> *arr = [NSMutableArray arrayWithCapacity:6];
+
+    JJMenuEntry *e0 = [JJMenuEntry title:@"插件" symbol:@"power"];
+    e0.value = self.enabled ? @"开" : @"关";
+    e0.on = self.enabled;
+    [arr addObject:e0];
+
+    [arr addObject:[JJMenuEntry title:@"自动标定" symbol:@"viewfinder.circle"]];
+    [arr addObject:[JJMenuEntry title:@"手动标定" symbol:@"hand.tap"]];
+
+    JJMenuEntry *e3 = [JJMenuEntry title:@"HUD" symbol:@"rectangle.topthird.inset.filled"];
+    e3.value = self.hudVisible ? @"开" : @"关";
+    e3.on = self.hudVisible;
+    [arr addObject:e3];
+
+    /* 2.1.78：resetToStartPosition 原先**没有任何 UI 入口**（声明+实现都有，
+       但全工程没人调用），「重置到开局」等于不存在。现在补进菜单。 */
+    [arr addObject:[JJMenuEntry title:@"重置开局" symbol:@"arrow.counterclockwise"]];
+
+    JJMenuEntry *e4 = [JJMenuEntry title:@"思考" symbol:@"timer"];
+    e4.value = [NSString stringWithFormat:@"%ldms", (long)self.thinkMs];
+    [arr addObject:e4];
+
+    /* 引擎状态：就绪=绿、启动中/搜索中=绿、异常=红。
+       颜色直接反映健康度，不必点进去才知道。 */
+    JJPikaState st = [[JJPikafish shared] state];
+    JJMenuEntry *e5 = [JJMenuEntry title:@"引擎" symbol:@"cpu"];
+    e5.value = [[JJPikafish shared] stateText];
+    e5.on = (st == JJPikaStateReady || st == JJPikaStateSearching);
+    e5.warn = (st == JJPikaStateDead);
+    [arr addObject:e5];
+
+    [self.ballWindow showMenuWithEntries:arr];
     [self refreshEngineDot];
 }
 
@@ -229,6 +256,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
             [self startTimer];
         }
         [[JJHUDWindow shared] showStatus:@"插件已开启"];
+        [self.ballWindow toast:@"插件已开启 · 正在识别棋盘"];
         NSLog(@"[JJCheat] 插件开关 → 开");
     } else {
         [self.timer invalidate];
@@ -240,6 +268,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
         [[JJHUDWindow shared] setHUDHidden:YES];
         [self.ballWindow setActive:NO];
         [self.ballWindow setEngineDotColor:nil];
+        [self.ballWindow toast:@"插件已关闭 · 抓帧与引擎都已停"];
         NSLog(@"[JJCheat] 插件开关 → 关（停止抓帧 / 识别 / 引擎）");
     }
 }
@@ -249,6 +278,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     [[NSUserDefaults standardUserDefaults] setBool:self.hudVisible forKey:JJ_KEY_HUD_VISIBLE];
     [[NSUserDefaults standardUserDefaults] synchronize];
     [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
+    [self.ballWindow toast:self.hudVisible ? @"HUD 已显示" : @"HUD 已隐藏（建议文字仍可在球上看到）"];
     NSLog(@"[JJCheat] HUD 显示=%@", self.hudVisible ? @"开" : @"关");
 }
 
@@ -259,6 +289,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     [[NSUserDefaults standardUserDefaults] setInteger:v forKey:JJ_KEY_THINK_MS];
     [[NSUserDefaults standardUserDefaults] synchronize];
     [[JJHUDWindow shared] showStatus:[NSString stringWithFormat:@"思考时间已设为 %ld ms", (long)v]];
+    [self.ballWindow toast:[NSString stringWithFormat:@"思考时间 %ld ms", (long)v]];
     NSLog(@"[JJCheat] 思考时间=%ld ms", (long)v);
 }
 
@@ -284,8 +315,17 @@ typedef NS_ENUM(NSInteger, JJGameState) {
         if (!self2 || !alert) return;
         [self2 applyThinkMs:[alert.textFields.firstObject.text integerValue]];
     }]];
-    for (NSNumber *n in @[@(300), @(800), @(1500), @(3000)]) {
-        [ac addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@ ms", n]
+    /* 2.1.78：快捷档里必须包含「当前值」，并且标出来。
+       旧版固定给 300/800/1500/3000，而默认值是 650 —— 用户看不到自己现在的设定，
+       也选不回 650，只能手动输入。 */
+    NSMutableArray<NSNumber *> *presets =
+        [NSMutableArray arrayWithArray:@[@(350), @(650), @(1000), @(2000)]];
+    if (![presets containsObject:@(cur)]) [presets insertObject:@(cur) atIndex:0];
+    for (NSNumber *n in presets) {
+        NSString *t = [n isEqual:@(cur)]
+            ? [NSString stringWithFormat:@"%@ ms（当前）", n]
+            : [NSString stringWithFormat:@"%@ ms", n];
+        [ac addAction:[UIAlertAction actionWithTitle:t
                                                style:UIAlertActionStyleDefault
                                              handler:^(UIAlertAction *action) {
             __strong typeof(weakSelf) self2 = weakSelf;
@@ -294,6 +334,12 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     }
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     if (self.ballWindow.hidden) [self.ballWindow attach];
+    /* 已经有一个模态在展示时再 present 会失败（UIKit 只打警告，弹窗根本不出现）。
+       连点两次菜单就会踩到，所以这里直接挡掉。 */
+    if (self.ballWindow.rootViewController.presentedViewController) {
+        [self.ballWindow toast:@"请先关闭当前弹窗"];
+        return;
+    }
     [self.ballWindow.rootViewController presentViewController:ac animated:YES completion:nil];
     NSLog(@"[JJCheat] 打开思考时间设置");
 }
@@ -334,6 +380,10 @@ typedef NS_ENUM(NSInteger, JJGameState) {
                                                         preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
     if (self.ballWindow.hidden) [self.ballWindow attach];
+    if (self.ballWindow.rootViewController.presentedViewController) {
+        [self.ballWindow toast:@"请先关闭当前弹窗"];
+        return;
+    }
     [self.ballWindow.rootViewController presentViewController:ac animated:YES completion:nil];
 }
 
@@ -362,6 +412,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
 - (void)autoCalibrate {
     if (!self.enabled) {
         [[JJHUDWindow shared] showStatus:@"请先开启插件"];
+        [self.ballWindow toast:@"请先开启插件"];
         return;
     }
     if (!self.activated) [self activate];
@@ -378,12 +429,14 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     self.state = JJGameStateWaitingBoard;
     [self startTimer];
     [[JJHUDWindow shared] showStatus:@"自动标定中…请停在【开局】棋盘画面"];
+    [self.ballWindow toast:@"自动标定中 · 请停在开局棋盘画面"];
     NSLog(@"[JJCheat] 自动标定棋盘：备份旧标定，重新学习（不清空 JS 锚盘）");
 }
 
 - (void)manualCalibrate {
     if (!self.enabled) {
         [[JJHUDWindow shared] showStatus:@"请先开启插件"];
+        [self.ballWindow toast:@"请先开启插件"];
         return;
     }
     if (!self.activated) [self activate];
@@ -398,6 +451,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     self.learnedBoard = NO;
     self.state = JJGameStateCalibrating;
 
+    [self.ballWindow toast:@"点棋盘四个角：左上→右上→右下→左下"];
     __weak typeof(self) weakSelf = self;
     [[JJHUDWindow shared] beginCalibrationWithCompletion:^(NSArray<NSValue *> *corners) {
         __strong typeof(weakSelf) self2 = weakSelf;
@@ -416,6 +470,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
             self.calibrationPending = NO;
             [self startTimer];
             [[JJHUDWindow shared] showStatus:@"四角无效 · 已恢复上次标定"];
+            [self.ballWindow toast:@"四角无效 · 已恢复上次标定"];
         } else {
             self.state = JJGameStateWaitingBoard;
             [self startTimer];
@@ -434,6 +489,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     [self startTimer];
     [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
     [[JJHUDWindow shared] showStatus:@"标定完成 · 请进入一局新棋（开局布局）"];
+    [self.ballWindow toast:@"标定完成 · 请进入一局新棋"];
 }
 
 - (void)resetToStartPosition {
@@ -455,6 +511,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
     self.state = JJGameStateWaitingBoard;
     [self startTimer];
     [[JJHUDWindow shared] showStatus:@"已重置 · 等开局画面"];
+    [self.ballWindow toast:@"已重置 · 请停在开局棋盘画面"];
 }
 
 #pragma mark - 画面指纹（主线程极轻计算）

@@ -11,10 +11,28 @@
 #endif
 
 static const CGFloat kJJBallSize      = 52.0;
-static const CGFloat kJJMenuWidth     = 232.0;
-static const CGFloat kJJMenuRowHeight = 44.0;
 /** 引擎状态点直径（2.1.0 新增：球右上角小圆点） */
 static const CGFloat kJJEngineDotSize = 12.0;
+
+/* ---- 2.1.78 菜单网格尺寸 ----
+   为什么从「竖排文字长条」改成「2 列图标网格」：
+   旧的 232×264 文字列表贴在球内侧，几乎必然压住棋盘右半边，而且每行一句长文案
+   要读半天。现在 174×226、纯图标 + 2~4 字标签，横向只占屏幕边缘一条，
+   配合毛玻璃让底下的棋子仍然可辨 —— 这才是「不遮挡视线」的实质。 */
+static const CGFloat kJJMenuCellW  = 76.0;
+static const CGFloat kJJMenuCellH  = 66.0;
+static const CGFloat kJJMenuGap    = 6.0;
+static const CGFloat kJJMenuPad    = 8.0;
+static const NSInteger kJJMenuCols = 2;
+
+/* 主色：激活 / 正常，青绿 */
+#define JJ_COLOR_ON      [UIColor colorWithRed:0.25 green:0.85 blue:0.63 alpha:1.0]
+/* 警示：引擎异常 */
+#define JJ_COLOR_WARN    [UIColor colorWithRed:1.00 green:0.42 blue:0.34 alpha:1.0]
+/* 常规 */
+#define JJ_COLOR_IDLE    [UIColor colorWithWhite:0.90 alpha:1.0]
+#define JJ_COLOR_TITLE   [UIColor colorWithWhite:0.92 alpha:1.0]
+#define JJ_COLOR_BORDER  [UIColor colorWithWhite:1 alpha:0.14]
 
 /** 插件图标：优先读随 deb 落到 jbroot 的 logo.png，读不到就回退文字「象棋」。 */
 static UIImage *JJLoadLogoImage(void) {
@@ -44,13 +62,31 @@ static UIImage *JJLoadLogoImage(void) {
     return nil;
 }
 
+#pragma mark - JJMenuEntry
+
+@implementation JJMenuEntry
+
++ (instancetype)title:(NSString *)title symbol:(NSString *)symbol {
+    JJMenuEntry *e = [[JJMenuEntry alloc] init];
+    e.title = title ?: @"";
+    e.symbol = symbol;
+    return e;
+}
+
+@end
+
+#pragma mark - JJBallWindow
+
 @interface JJBallWindow ()
 @property (nonatomic, strong) UIButton *ball;
 @property (nonatomic, strong) UIView *engineDot;
 @property (nonatomic, strong) UIView *backdrop;
 @property (nonatomic, strong) UIView *menuView;
+@property (nonatomic, strong) UIVisualEffectView *menuBlur;
 @property (nonatomic, assign) BOOL usesLogo;
 @property (nonatomic, assign, readwrite) BOOL menuVisible;
+@property (nonatomic, assign) NSInteger entryCount;
+@property (nonatomic, strong) UILabel *toastLabel;
 @end
 
 @implementation JJBallWindow
@@ -64,27 +100,42 @@ static UIImage *JJLoadLogoImage(void) {
         self.rootViewController.view.backgroundColor = [UIColor clearColor];
 
         CGRect scr = [UIScreen mainScreen].bounds;
-        /* 菜单遮罩：点空白处收起菜单，避免把触摸漏给游戏造成误落子 */
+
+        /* 菜单遮罩：**完全透明但可点击**。
+           旧版是 0.22 全屏黑，一开菜单整块画面就暗下去 —— 这是「遮挡视线」最主要的来源。
+           用 clearColor 意味着背景色 alpha=0，但 view 自身 alpha 仍是 1.0，
+           hitTest 照常命中，所以「点空白处收起菜单」的能力一点没丢，画面却不再被压暗。 */
         _backdrop = [[UIView alloc] initWithFrame:scr];
-        _backdrop.backgroundColor = [UIColor colorWithWhite:0 alpha:0.22];
+        _backdrop.backgroundColor = [UIColor clearColor];
         _backdrop.hidden = YES;
         [_backdrop addGestureRecognizer:[[UITapGestureRecognizer alloc]
                                          initWithTarget:self action:@selector(closeMenuTap)]];
         [self.rootViewController.view addSubview:_backdrop];
 
+        /* 菜单面板：毛玻璃 + 细边框。
+           毛玻璃是「不遮挡视线」的关键 —— 底下的棋盘与棋子仍然透得出来。 */
         _menuView = [[UIView alloc] initWithFrame:CGRectZero];
-        _menuView.backgroundColor = [UIColor colorWithRed:0.07 green:0.08 blue:0.11 alpha:0.97];
-        _menuView.layer.cornerRadius = 12.0;
-        _menuView.layer.borderWidth = 1.0;
-        _menuView.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
+        _menuView.layer.cornerRadius = 18.0;
+        _menuView.layer.borderWidth = 0.5;
+        _menuView.layer.borderColor = JJ_COLOR_BORDER.CGColor;
         _menuView.clipsToBounds = YES;
         _menuView.hidden = YES;
+        /* 底层只留一点深色保证文字对比度；真正的观感交给下面的 UltraThin 毛玻璃。
+           用 UltraThin（不是 Thin/Regular）是因为棋盘是暖色木纹，材质越薄越透，
+           底下的棋子才看得出来 —— 这是「不遮挡视线」的核心。 */
+        _menuView.backgroundColor = [UIColor colorWithRed:0.05 green:0.06 blue:0.09 alpha:0.30];
+
+        UIBlurEffect *eff = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
+        if (eff) {
+            _menuBlur = [[UIVisualEffectView alloc] initWithEffect:eff];
+            _menuBlur.userInteractionEnabled = NO;
+            [_menuView addSubview:_menuBlur];
+        }
         [self.rootViewController.view addSubview:_menuView];
 
         CGFloat d = kJJBallSize;
         _ball = [UIButton buttonWithType:UIButtonTypeCustom];
         _ball.frame = CGRectMake(0, 0, d, d);
-        _ball.center = CGPointMake(scr.size.width - 34, scr.size.height * 0.45);
         _ball.backgroundColor = [UIColor colorWithRed:0.85 green:0.1 blue:0.2 alpha:0.85];
         _ball.layer.cornerRadius = d / 2;
         _ball.layer.borderWidth = 2;
@@ -112,7 +163,16 @@ static UIImage *JJLoadLogoImage(void) {
         [_ball addGestureRecognizer:lp];
         [self.rootViewController.view addSubview:_ball];
 
-        /* 引擎状态点：默认隐藏，等控制器设色 */
+        /* 球位置持久化：允许用户把球拖到不碍事的地方，重启后还在那儿。
+           这也是「不遮挡视线」的一环 —— 球本身也会压住棋子。 */
+        NSArray *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:@"JJCheat.ballCenter"];
+        if (saved.count == 2) {
+            CGPoint c = CGPointMake([saved[0] doubleValue], [saved[1] doubleValue]);
+            _ball.center = [self clampBallCenter:c inScreen:scr];
+        } else {
+            _ball.center = CGPointMake(scr.size.width - 34, scr.size.height * 0.45);
+        }
+
         _engineDot = [[UIView alloc] initWithFrame:CGRectMake(d - kJJEngineDotSize + 1,
                                                             1,
                                                             kJJEngineDotSize,
@@ -126,6 +186,13 @@ static UIImage *JJLoadLogoImage(void) {
         [_ball addSubview:_engineDot];
     }
     return self;
+}
+
+- (CGPoint)clampBallCenter:(CGPoint)c inScreen:(CGRect)scr {
+    CGFloat half = kJJBallSize / 2.0;
+    CGFloat top = 60.0, bottom = scr.size.height - 40.0;
+    return CGPointMake(MAX(half + 4.0, MIN(c.x, scr.size.width - half - 4.0)),
+                       MAX(top + half, MIN(c.y, bottom)));
 }
 
 /* 未激活：半透明；激活后：实心（有 logo 时只改透明度，别把图片标题冲掉） */
@@ -149,66 +216,222 @@ static UIImage *JJLoadLogoImage(void) {
 
 - (void)closeMenuTap { [self hideMenu]; }
 
-/** 在球旁边竖排列出设置项；点击任意项先收起菜单再回调上层。 */
+#pragma mark - 菜单
+
 - (void)showMenuWithTitles:(NSArray<NSString *> *)titles {
-    for (UIView *v in [self.menuView.subviews copy]) [v removeFromSuperview];
+    NSMutableArray<JJMenuEntry *> *arr = [NSMutableArray arrayWithCapacity:titles.count];
+    for (NSString *t in titles) [arr addObject:[JJMenuEntry title:t symbol:nil]];
+    [self showMenuWithEntries:arr];
+}
 
-    CGFloat w = kJJMenuWidth;
-    CGFloat rowH = kJJMenuRowHeight;
-    CGFloat menuH = rowH * (CGFloat)titles.count;
+- (void)showMenuWithEntries:(NSArray<JJMenuEntry *> *)entries {
+    if (!entries.count) return;
+    for (UIView *v in [self.menuView.subviews copy]) {
+        if (v != self.menuBlur) [v removeFromSuperview];
+    }
+
+    const NSInteger cols = kJJMenuCols;
+    const NSInteger rows = (NSInteger)((entries.count + cols - 1) / cols);
+    const CGFloat w = kJJMenuPad * 2 + cols * kJJMenuCellW + (cols - 1) * kJJMenuGap;
+    const CGFloat h = kJJMenuPad * 2 + rows * kJJMenuCellH + (rows - 1) * kJJMenuGap;
     CGRect scr = [UIScreen mainScreen].bounds;
+    UIEdgeInsets safe = UIEdgeInsetsZero;
+    if (@available(iOS 11.0, *)) safe = self.safeAreaInsets;
 
-    CGFloat x = CGRectGetMinX(self.ball.frame) - w - 10.0;
-    if (x < 8.0) x = CGRectGetMaxX(self.ball.frame) + 10.0;
-    x = MAX(8.0, MIN(x, scr.size.width - w - 8.0));
-    CGFloat y = CGRectGetMidY(self.ball.frame) - menuH / 2.0;
-    y = MAX(60.0, MIN(y, scr.size.height - menuH - 40.0));
-    self.menuView.frame = CGRectMake(x, y, w, menuH);
+    /* 贴球所在那一侧的屏幕边缘：横向只占一条，尽量不压棋盘中心 */
+    BOOL rightSide = CGRectGetMidX(self.ball.frame) > scr.size.width / 2.0;
+    CGFloat x = rightSide ? (scr.size.width - w - 8.0) : 8.0;
 
-    for (NSUInteger i = 0; i < titles.count; i++) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-        b.frame = CGRectMake(0, (CGFloat)i * rowH, w, rowH);
+    /* 纵向避开球：优先放球下方，放不下再放上方，都不行才允许重叠（球 z 序更高，仍可点） */
+    CGFloat belowY = CGRectGetMaxY(self.ball.frame) + 10.0;
+    CGFloat aboveY = CGRectGetMinY(self.ball.frame) - 10.0 - h;
+    CGFloat topLimit = safe.top + 10.0;
+    CGFloat bottomLimit = scr.size.height - safe.bottom - 10.0;
+    CGFloat y;
+    if (belowY + h <= bottomLimit) y = belowY;
+    else if (aboveY >= topLimit) y = aboveY;
+    else y = MAX(topLimit, MIN(belowY, bottomLimit - h));
+
+    self.menuView.frame = CGRectMake(x, y, w, h);
+    self.menuBlur.frame = self.menuView.bounds;
+    self.entryCount = (NSInteger)entries.count;
+
+    for (NSUInteger i = 0; i < entries.count; i++) {
+        JJMenuEntry *e = entries[i];
+        NSUInteger r = i / cols, c = i % cols;
+        /* 奇数项时最后一项独占两列宽，否则右下角留个空格子很难看 */
+        BOOL wide = (entries.count % 2 == 1) && (i == entries.count - 1);
+        CGFloat cw = wide ? (cols * kJJMenuCellW + (cols - 1) * kJJMenuGap) : kJJMenuCellW;
+        CGRect cell = CGRectMake(kJJMenuPad + c * (kJJMenuCellW + kJJMenuGap),
+                                 kJJMenuPad + r * (kJJMenuCellH + kJJMenuGap),
+                                 cw, kJJMenuCellH);
+        UIButton *b = [self makeCellForEntry:e rect:cell];
         b.tag = (NSInteger)(100 + i);
-        [b setTitle:titles[i] forState:UIControlStateNormal];
-        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont systemFontOfSize:14.0];
-        b.titleLabel.numberOfLines = 2;
-        b.titleLabel.adjustsFontSizeToFitWidth = YES;
-        b.titleLabel.minimumScaleFactor = 0.8;
         [b addTarget:self action:@selector(menuItemTapped:) forControlEvents:UIControlEventTouchUpInside];
         [self.menuView addSubview:b];
-        if (i > 0) {
-            UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(10, (CGFloat)i * rowH, w - 20, 0.5)];
-            sep.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
-            [self.menuView addSubview:sep];
-        }
     }
+
     self.backdrop.hidden = NO;
     self.menuView.hidden = NO;
     self.menuVisible = YES;
+
+    /* 轻微放大淡入，提示「从这里展开了」 */
+    self.menuView.alpha = 0.0;
+    self.menuView.transform = CGAffineTransformMakeScale(0.94, 0.94);
+    [UIView animateWithDuration:0.16 animations:^{
+        self.menuView.alpha = 1.0;
+        self.menuView.transform = CGAffineTransformIdentity;
+    }];
+}
+
+/** 一个网格单元：SF Symbol 图标在上，短标签在下，状态用颜色和右侧小字表达。 */
+- (UIButton *)makeCellForEntry:(JJMenuEntry *)e rect:(CGRect)rect {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = rect;
+    b.backgroundColor = [UIColor colorWithWhite:1 alpha:e.on ? 0.10 : 0.04];
+    b.layer.cornerRadius = 12.0;
+    b.layer.borderWidth = 0.5;
+    b.layer.borderColor = (e.on ? [JJ_COLOR_ON colorWithAlphaComponent:0.55]
+                               : [UIColor colorWithWhite:1 alpha:0.08]).CGColor;
+
+    UIColor *tint = e.warn ? JJ_COLOR_WARN : (e.on ? JJ_COLOR_ON : JJ_COLOR_IDLE);
+
+    /* 图标：SF Symbols（iOS 13+）。取不到就只显示文字，不留白块。 */
+    UIImage *icon = nil;
+    if (e.symbol.length) {
+        icon = [UIImage systemImageNamed:e.symbol];
+        if (icon) {
+            UIImageSymbolConfiguration *cfg =
+                [UIImageSymbolConfiguration configurationWithPointSize:21
+                                                                weight:UIImageSymbolWeightMedium];
+            icon = [icon imageByApplyingSymbolConfiguration:cfg];
+            icon = [icon imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        }
+    }
+    CGFloat iconY = 16.0;
+    if (icon) {
+        UIImageView *iv = [[UIImageView alloc] initWithImage:icon];
+        iv.tintColor = tint;
+        iv.contentMode = UIViewContentModeScaleAspectFit;
+        iv.frame = CGRectMake((rect.size.width - 26) / 2, iconY, 26, 24);
+        iv.userInteractionEnabled = NO;
+        [b addSubview:iv];
+    }
+
+    NSString *label = e.title ?: @"";
+    if (e.value.length) label = [NSString stringWithFormat:@"%@ %@", label, e.value];
+    UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(2, rect.size.height - 26,
+                                                          rect.size.width - 4, 18)];
+    lb.text = label;
+    lb.textColor = e.on ? tint : JJ_COLOR_TITLE;
+    lb.font = [UIFont systemFontOfSize:11.5 weight:(e.on ? UIFontWeightSemibold : UIFontWeightRegular)];
+    lb.textAlignment = NSTextAlignmentCenter;
+    lb.adjustsFontSizeToFitWidth = YES;
+    lb.minimumScaleFactor = 0.75;
+    lb.userInteractionEnabled = NO;
+    [b addSubview:lb];
+    return b;
 }
 
 - (void)hideMenu {
+    if (!self.menuVisible) {
+        self.backdrop.hidden = YES;
+        self.menuView.hidden = YES;
+        return;
+    }
+    self.menuVisible = NO;
     self.backdrop.hidden = YES;
     self.menuView.hidden = YES;
-    self.menuVisible = NO;
+    self.menuView.transform = CGAffineTransformIdentity;
+    self.menuView.alpha = 1.0;
 }
 
 - (void)menuItemTapped:(UIButton *)b {
     NSInteger idx = b.tag - 100;
-    [self hideMenu];
-    if (self.onMenuItem) self.onMenuItem(idx);
+    if (idx < 0 || idx >= self.entryCount) return;
+
+    /* 先给一次明确的视觉反馈再收起。
+       旧版点完立刻 hideMenu，加上很多动作的反馈只落在 HUD 上（HUD 关掉时就完全没反馈），
+       用户会觉得「点了没反应」。现在按钮自己先亮一下。 */
+    b.backgroundColor = [UIColor colorWithWhite:1 alpha:0.22];
+    b.userInteractionEnabled = NO;
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(ws) s2 = ws;
+        if (!s2) return;
+        [s2 hideMenu];
+        if (s2.onMenuItem) s2.onMenuItem(idx);
+    });
 }
+
+#pragma mark - Toast
+
+- (void)toast:(NSString *)text {
+    if (!text.length) return;
+    if (!self.toastLabel) {
+        UILabel *lb = [[UILabel alloc] initWithFrame:CGRectZero];
+        lb.backgroundColor = [UIColor colorWithRed:0.06 green:0.07 blue:0.10 alpha:0.90];
+        lb.textColor = [UIColor colorWithWhite:0.96 alpha:1.0];
+        lb.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium];
+        lb.textAlignment = NSTextAlignmentCenter;
+        lb.numberOfLines = 2;
+        lb.layer.cornerRadius = 10.0;
+        lb.layer.masksToBounds = YES;
+        lb.layer.borderWidth = 0.5;
+        lb.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.16].CGColor;
+        lb.alpha = 0.0;
+        lb.userInteractionEnabled = NO;
+        [self.rootViewController.view addSubview:lb];
+        self.toastLabel = lb;
+    }
+    UILabel *lb = self.toastLabel;
+    lb.text = text;
+
+    CGRect scr = [UIScreen mainScreen].bounds;
+    UIEdgeInsets safe = UIEdgeInsetsZero;
+    if (@available(iOS 11.0, *)) safe = self.safeAreaInsets;
+    CGFloat maxW = scr.size.width - 40.0;
+    CGSize fit = [lb sizeThatFits:CGSizeMake(maxW, 200.0)];
+    CGFloat w = MIN(maxW, MAX(120.0, fit.width + 28.0));
+    CGFloat h = MAX(30.0, fit.height + 12.0);
+    /* 放球的下方；贴底就翻到上方，保证不出屏 */
+    CGFloat cx = self.ball.center.x;
+    cx = MAX(safe.left + w / 2 + 10, MIN(cx, scr.size.width - safe.right - w / 2 - 10));
+    CGFloat y = CGRectGetMaxY(self.ball.frame) + 8.0;
+    if (y + h > scr.size.height - safe.bottom - 10.0) {
+        y = CGRectGetMinY(self.ball.frame) - 8.0 - h;
+    }
+    lb.frame = CGRectMake(cx - w / 2, y, w, h);
+
+    [lb.layer removeAllAnimations];
+    CGFloat dur = 2.2;
+    [UIView animateWithDuration:0.18 animations:^{ lb.alpha = 1.0; }
+                     completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.35 delay:dur options:0 animations:^{
+            lb.alpha = 0.0;
+        } completion:nil];
+    }];
+}
+
+#pragma mark - 手势
 
 - (void)lpBall:(UILongPressGestureRecognizer *)g {
     if (g.state == UIGestureRecognizerStateBegan && self.onLongPress) self.onLongPress();
 }
 
 - (void)panBall:(UIPanGestureRecognizer *)g {
-    if (g.state == UIGestureRecognizerStateChanged || g.state == UIGestureRecognizerStateEnded) {
+    CGRect scr = [UIScreen mainScreen].bounds;
+    if (g.state == UIGestureRecognizerStateChanged) {
         CGPoint t = [g translationInView:self];
-        self.ball.center = CGPointMake(self.ball.center.x + t.x, self.ball.center.y + t.y);
+        self.ball.center = [self clampBallCenter:CGPointMake(self.ball.center.x + t.x,
+                                                            self.ball.center.y + t.y)
+                                        inScreen:scr];
         [g setTranslation:CGPointZero inView:self];
+    } else if (g.state == UIGestureRecognizerStateEnded ||
+               g.state == UIGestureRecognizerStateCancelled) {
+        NSArray *saved = @[@(self.ball.center.x), @(self.ball.center.y)];
+        [[NSUserDefaults standardUserDefaults] setObject:saved forKey:@"JJCheat.ballCenter"];
     }
 }
 
@@ -225,14 +448,28 @@ static UIImage *JJLoadLogoImage(void) {
     self.hidden = NO;
 }
 
+/* 触摸分发：**白名单放行**，其余透传给游戏。
+ *
+ * 【2.1.78 修的关键 bug】旧实现是「除球外一律 return nil」：
+ *     if (v == self.ball) return v;
+ *     if (menuVisible && (遮罩||菜单)) return v;
+ *     return nil;                    ← 弹窗的一切触摸都掉进这里
+ * 而 ⑤思考时间 / ⑥引擎详情 都是 present 出来的 UIAlertController，
+ * 它的视图既不是球、也不是菜单子视图 → 全部返回 nil →
+ * **弹窗看得见但完全点不动，也关不掉，只能杀 App**。
+ * 这就是「菜单各项功能失效」的真凶。
+ * 现在补一条：只要 rootViewController 有 presentedViewController，就整窗放行。 */
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *v = [super hitTest:point withEvent:event];
-    if (v == self.ball) return v;
-    /* 菜单打开时放行遮罩与菜单按钮（点遮罩即收起），其余一律透传给游戏 */
-    if (self.menuVisible && v &&
-        (v == self.backdrop || [v isDescendantOfView:self.menuView])) {
-        return v;
-    }
+    if (!v) return nil;
+    /* ① 球（含状态点）始终可交互 */
+    if (v == self.ball || [v isDescendantOfView:self.ball]) return v;
+    /* ② 菜单打开时，遮罩与菜单项可交互 */
+    if (self.menuVisible &&
+        (v == self.backdrop || [v isDescendantOfView:self.menuView])) return v;
+    /* ③ 有模态弹窗在场 → 全窗放行，否则弹窗点不动（见上面的说明） */
+    if (self.rootViewController.presentedViewController) return v;
+    /* ④ 其余透传给下层 window（游戏画面） */
     return nil;
 }
 
