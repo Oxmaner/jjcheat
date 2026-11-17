@@ -28,6 +28,11 @@ static NSString *const kPikaLog = @"[JJCheat][Pika]";
 #define KIKA_BESTMOVE_GRACE_MS 3000
 /* 等引擎线程置位 running 的上限（每 50ms 一次） */
 #define KIKA_ENGINE_WAIT_TRIES 120
+/* 2.1.61：NSThread 默认栈只有 512KB，uci 握手过得去，但 Pikafish 的
+   search<> 递归一进 go movetime 就栈溢出 → 整个 App SIGSEGV（launchd 11）。
+   真机 04:39:59 的日志把它钉死：verifyDiff=0 → engine=思考中 → 进程没了。
+   显式给引擎线程 16MB 栈（Stockfish 官方建议 ≥8MB）。 */
+#define KIKA_ENGINE_STACK_BYTES (16 * 1024 * 1024)
 
 @interface JJPikafish ()
 @property (nonatomic, strong) dispatch_queue_t pikaQueue;
@@ -203,9 +208,14 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
     self.engineThreadRunning = YES;
     self.readerRunning = YES;
 
-    [NSThread detachNewThreadSelector:@selector(engineThreadMain:)
-                             toTarget:self
-                           withObject:net];
+    /* 2.1.61：必须用 initWithTarget + stackSize，detachNewThreadSelector 拿不到
+       栈大小设置入口；默认 512KB 栈在第一次 go movetime 搜索时 SIGSEGV。 */
+    NSThread *engineThread = [[NSThread alloc] initWithTarget:self
+                                                      selector:@selector(engineThreadMain:)
+                                                        object:net];
+    engineThread.stackSize = KIKA_ENGINE_STACK_BYTES;
+    [engineThread start];
+
     [NSThread detachNewThreadSelector:@selector(readerThreadMain:)
                              toTarget:self
                            withObject:nil];
