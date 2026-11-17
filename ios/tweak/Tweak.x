@@ -19,6 +19,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 
+#import "JJConfig.h"
 #import "JJGameController.h"
 #import "JJVisionBridge.h"
 #import "JJHUDWindow.h"
@@ -89,6 +90,7 @@ static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
  *  %orig 后记住本次 drawable 的 surface，交给第 N+1 帧。
  *  14MB 读回在专用 QOS_UTILITY 队列执行，渲染线程只做零拷贝登记。
  * ============================================================ */
+#if !JJ_DISABLE_METAL_HOOK
 %hook CAMetalLayer
 
 - (id<CAMetalDrawable>)nextDrawable {
@@ -99,6 +101,7 @@ static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
 }
 
 %end
+#endif
 
 /* ============================================================
  *  入口
