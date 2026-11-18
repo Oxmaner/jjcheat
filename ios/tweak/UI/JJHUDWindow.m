@@ -423,6 +423,17 @@ static NSString *JJFormatNodes(NSInteger nodes) {
     } else if (pending) {
         [sub appendString:@" · 正在搜索"];
     }
+    /* 2.1.85 诊断（临时）：d=变化格数 mv=最近走子方 st=本帧是否配出走法 inf=兜底命中次数
+       真机没有 log 命令，靠这一行定位「对方走子不认」到底卡在哪一环。 */
+    {
+        id d = result[@"diffChanged"], mv = result[@"dbgMover"],
+           st = result[@"dbgStep"], inf = result[@"dbgInferred"],
+           sk = result[@"skipReason"];
+        if (d != nil || mv != nil) {
+            [sub appendFormat:@" │ d%@ mv%@ st%f inf%@ %@",
+             d ?: @"-", mv ?: @"-", [st doubleValue], inf ?: @"-", sk ?: @""];
+        }
+    }
     self.lineSub.text = sub;
 
     if (self.topPanel.hidden) [self layoutTopPanel];   // 首次显示时保险再摆一次

@@ -1446,6 +1446,11 @@ var JJEngine = {
     out.anchorRejected = anchorRejected ? 1 : 0;
     out.anchorRejectedStreak = session.anchorRejected || 0;
     out.diffChanged = stepInfo.changed;
+    /* 2.1.85 诊断：真机没有 log 命令，把定位轮次判定所需的三个关键量
+       直接透到 HUD 第二行，肉眼就能判断「是没认出变化」还是「认错了走子方」。 */
+    out.dbgMover = session.lastMoverSide || '-';
+    out.dbgInferred = session.highlightInferred || 0;
+    out.dbgStep = stepInfo.move ? 1 : 0;
     out.anchorFen = session.anchorFen || '';
     out.flipped = session.flipped ? 1 : 0;
     out.unsureCount = session.lowConfCount || 0;
