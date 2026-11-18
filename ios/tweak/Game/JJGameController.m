@@ -1174,6 +1174,29 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
 
     BOOL accepted = [info[@"ok"] boolValue] &&
         [info[@"verifyDiff"] integerValue] <= JJ_LEARN_MAX_DIFF;
+
+    /* ★ 2.1.102：真机没有 log 命令，把整份学习诊断落到容器 Documents 里。
+     * 关键要看两条：① verifyDiff 到底多大 ② 学习那一刻用的 corners 是什么。
+     * 离线用同一份抓帧跑 learnAndRefine 是 verifyDiff=0，真机却失败，
+     * 说明差异只可能在「真机传进去的四角」或「抓帧内容」上。 */
+    {
+        NSMutableString *dg = [NSMutableString string];
+        [dg appendFormat:@"accepted=%d verifyDiff=%@ ok=%@ templateCount=%@\n",
+            accepted, info[@"verifyDiff"] ?: @"-", info[@"ok"] ?: @"-", info[@"templateCount"] ?: @"-"];
+        [dg appendFormat:@"finalCorners=%@\n", [JJCalibrator shared].finalCorners ?: @"nil"];
+        [dg appendFormat:@"gridDetectTried=%d autoCalibrating=%d\n", self.gridDetectTried, self.autoCalibrating];
+        [dg appendFormat:@"cell=%@ radius=%@ gain=%@ meanL=%@ gridAspect=%@\n",
+            info[@"cell"] ?: @"-", info[@"radius"] ?: @"-", info[@"gain"] ?: @"-",
+            info[@"meanL"] ?: @"-", info[@"gridAspect"] ?: @"-"];
+        [dg appendFormat:@"redN=%@ blkN=%@ alignOccHit=%@ alignAccepted=%@\n",
+            info[@"redN"] ?: @"-", info[@"blkN"] ?: @"-",
+            info[@"alignOccHit"] ?: @"-", info[@"alignAccepted"] ?: @"-"];
+        [dg appendFormat:@"mismatch=%@\n", info[@"mismatch"] ?: @"-"];
+        [dg appendFormat:@"size=%dx%d\n", w, h];
+        NSString *dp = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/JJCheat_learn_diag.txt"];
+        [dg writeToFile:dp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+
     if (!accepted) {
         self.learnFailCount++;
         NSLog(@"[JJCheat] 学习校验未通过 verifyDiff=%@ ok=%@（第 %ld 次）",

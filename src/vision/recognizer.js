@@ -1576,13 +1576,39 @@ class BoardRecognizer {
     const mg = [];
     for (let i = 0; i < peaks.length; i++) {
       const p = peaks[i];
-      if (mg.length && p - mg[mg.length - 1] <= 5) {
+      if (mg.length && p - mg[mg.length - 1] <= 6) {
         if (probe[p] > probe[mg[mg.length - 1]]) mg[mg.length - 1] = p;
       } else mg.push(p);
     }
     if (mg.length < 4) return null;
 
-    /* 象棋单格近似正方形：dy ≈ 0.955 * dx（两幅真机截图实测 44/46） */
+    /* ★★ 2.1.103：横线选解 —— 除「连续等距」外，再加一条**亮度硬约束**。
+     *
+     * 真机实锤：这个棋盘皮肤的首尾两条横线被木框盖住，测不到。
+     * 实测中间 8 条为 918/1050/1183/1314/1447/1580/1716/1850，
+     * 而把 918 误当第一条就会整体偏 133px（一格），得到 (86,917)~(1198,2111)。
+     *
+     * 单靠「等距」分不清，但两者 y9 落在完全不同的区域：
+     *     y=1980（正确）→ 行亮度 138   ← 棋盘木面
+     *     y=2112（错误）→ 行亮度  65   ← 棋盘外的暗背景
+     * 整幅画面 2 倍差距，用「y9 行平均亮度不低于画面中位数的 72%」即可稳定排除。
+     */
+    let medSum = 0, medCnt = 0;
+    for (let y = 0; y < h; y += 4) {
+      const base = y * w;
+      for (let x = 0; x < w; x += 4) { medSum += lum[base + x]; medCnt++; }
+    }
+    const frameMean = medCnt ? medSum / medCnt : 120;
+    const minBoardRow = Math.max(60, frameMean * 0.72);
+    function rowBrightness(yy) {
+      const yr = Math.round(yy);
+      if (yr < 0 || yr >= h) return 0;
+      const base = yr * w;
+      let s2 = 0, n2 = 0;
+      for (let x = xs[0]; x <= xs[8]; x += 4) { s2 += lum[base + Math.round(x)]; n2++; }
+      return n2 ? s2 / n2 : 0;
+    }
+
     const dy0 = dx * 0.955;
     const cands = [];
     for (let ti = -3; ti <= 3; ti++) {
@@ -1599,24 +1625,26 @@ class BoardRecognizer {
         }
         if (seq.length < 6) continue;
         for (let off = 0; off <= 1; off++) {
-          const y0 = seq[0] - off * dy;
-          const y9 = y0 + 9 * dy;
-          if (y0 < 0 || y9 > h + 5) continue;
-          cands.push({ dy: dy, y0: y0, y9: y9, len: seq.length,
-                       centerDist: Math.abs((y0 + y9) / 2 - h / 2) });
+          const cy0 = seq[0] - off * dy;
+          const cy9 = cy0 + 9 * dy;
+          if (cy0 < 0 || cy9 > h + 5) continue;
+          /* 亮度硬约束：y9 必须是棋盘木面，不能是画面外的暗区 */
+          if (rowBrightness(cy9) < minBoardRow) continue;
+          /* 上边界也得在合理位置 */
+          const frac = cy0 / h;
+          if (frac < 0.15 || frac > 0.42) continue;
+          cands.push({ dy: dy, y0: cy0, y9: cy9, len: seq.length,
+                       centerDist: Math.abs((cy0 + cy9) / 2 - h / 2) });
         }
       }
     }
     if (!cands.length) return null;
-
-    /* 选解：序列越长越可信；同样长时取**棋盘中心最接近画面中心**的
-       （游戏 UI 都把棋盘垂直摆中间，这条能稳定排除"多推一格"的错解）。 */
     cands.sort(function (a, b) {
       if (b.len !== a.len) return b.len - a.len;
       return a.centerDist - b.centerDist;
     });
     const pick = cands[0];
-    const y0 = pick.y0, y9 = pick.y9;
+    const y0 = pick.y0, y9 = pick.y9, dyP = pick.dy;
 
     const bw = xs[8] - xs[0], bh = y9 - y0;
     if (bw < w * 0.35 || bh < h * 0.25) return null;
@@ -1625,7 +1653,7 @@ class BoardRecognizer {
 
     return {
       corners: [[xs[0], y0], [xs[8], y0], [xs[8], y9], [xs[0], y9]],
-      dx: dx, dy: pick.dy, xs: xs, y0: y0,
+      dx: dx, dy: dyP, xs: xs, y0: y0,
       vHits: vs.hits, hHits: pick.len
     };
   }
