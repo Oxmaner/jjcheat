@@ -89,10 +89,28 @@ static NSString *JJContainerEnginePath(void) {
     return cached;
 }
 
+/** engine.js 内容指纹：长度 + FNV-1a 64。用来判断「内嵌副本是否换了版本」。
+    300KB 全量算一遍 < 1ms，只在启动时算一次。 */
+static NSString *JJScriptFingerprint(NSData *d) {
+    if (!d.length) return @"0-0";
+    const uint8_t *p = (const uint8_t *)d.bytes;
+    NSUInteger n = d.length;
+    uint64_t h = 1469598103934665603ULL;
+    for (NSUInteger i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+    return [NSString stringWithFormat:@"%lu-%016llx", (unsigned long)n, h];
+}
+
 /* 把内嵌副本落到 App 容器：
    - 文件不存在 → 首次释放；
-   - 文件存在但缺 kJJEngineFeatureMark → 旧包残留，自动覆盖升级；
-   - 文件存在且是新版 → 保持不动（尊重用户热改的参数）。 */
+   - 文件存在但**内容与内嵌副本不一致** → 覆盖升级；
+   - 文件存在且内容一致 → 保持不动。
+
+   ★ 2.1.90：把判据从「有没有 featureMark」改成「内容是否一致」。
+   旧判据的坑（真机实测代价极大）：featureMark 从 2.1.58 起一直是同一个字符串，
+   于是装上新 dylib 后，容器里那份**旧 engine.js 因为"有标记"被判定为新版而保留**，
+   新逻辑整整五个版本都没被执行过 —— 表现就是"改了代码毫无反应"。
+   现在改成按字节比较（300KB 的 memcmp，不到 1ms），任何 JS 改动都会自动同步；
+   featureMark 检查保留作双保险，防止半截/损坏的文件被当成新版。 */
 - (BOOL)seedEngineIntoContainer {
     NSString *dst = JJContainerEnginePath();
     if (!dst.length) return NO;
@@ -107,16 +125,34 @@ static NSString *JJContainerEnginePath(void) {
         needWrite = YES;
         reason = @"首次释放到容器";
     } else {
-        NSString *old = [NSString stringWithContentsOfFile:dst encoding:NSUTF8StringEncoding error:nil];
-        if (old.length == 0 || [old rangeOfString:kJJEngineFeatureMark].location == NSNotFound) {
+        /* 用「内嵌副本指纹」而不是「内容比对」来判断要不要覆盖 —— 这样既能在
+           装新包时自动升级，又不会把用户/开发者的热改文件冲掉：
+             - 指纹文件缺失（老版本升上来）        → 覆盖一次，补上指纹
+             - 指纹 != 当前内嵌副本指纹（换了版本）→ 覆盖
+             - 指纹相同（同一个 dylib）            → 保留容器文件（尊重热改） */
+        NSString *fpPath = [dst stringByAppendingString:@".fp"];
+        NSString *curFp = JJScriptFingerprint(embedded);
+        NSString *oldFp = [NSString stringWithContentsOfFile:fpPath
+                                                    encoding:NSUTF8StringEncoding error:nil];
+        if (oldFp.length == 0) {
             needWrite = YES;
-            reason = @"旧版残留自动升级";
+            reason = @"无指纹记录，初始化内嵌副本";
+        } else if (![oldFp isEqualToString:curFp]) {
+            needWrite = YES;
+            reason = @"内嵌副本已换版本，覆盖升级";
+        } else {
+            return YES;                       // 同一内嵌版本：保留容器现状（可能是热改）
         }
     }
     if (!needWrite) return YES;
 
     NSError *err = nil;
     BOOL ok = [embedded writeToFile:dst options:NSDataWritingAtomic error:&err];
+    if (ok) {
+        NSString *fpPath = [dst stringByAppendingString:@".fp"];
+        [JJScriptFingerprint(embedded) writeToFile:fpPath atomically:YES
+                                          encoding:NSUTF8StringEncoding error:nil];
+    }
     NSLog(@"[JJCheat] engine.js %@: %@ ok=%d %lu 字节 %@",
           reason, dst, ok, (unsigned long)embedded.length,
           ok ? @"" : (err.localizedDescription ?: @""));

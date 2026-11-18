@@ -92,7 +92,17 @@ function makeFixture(src, blackBottom) {
     lastConf: [],
     sampleAll: () => Array.from({ length: 90 },
       () => ({ warmR: 0.4, inkR: 0.2, redInkR: 0, darkInkR: 0.2 })),
-    classify: () => classifyResult(blackBottom ? flip(engCodes) : engCodes),
+    classify: () => {
+      const r = classifyResult(blackBottom ? flip(engCodes) : engCodes);
+      /* 2.1.90：可注入「上一步落点标记」，用来测标记反推。
+         S.markerSq 是屏幕坐标格号；rings 只在该格给高分（模拟游戏画的圈）。 */
+      if (S.markerSq >= 0) {
+        const rg = new Float32Array(90);
+        rg[S.markerSq] = 0.62;
+        r.rings = rg;
+      }
+      return r;
+    },
     learnBackground: () => {},
     classifyByColor: () => ({ grid: (() => {
       const g = new Int8Array(90);
@@ -250,6 +260,30 @@ function main() {
     if (r.waitingOpponent) throw new Error('等对方时盘面在变，连续2帧必须翻轮次');
     if (!r.needSearch) throw new Error('翻回我方后应派发搜索');
   });
+
+  /* S8：**只靠「上一步落点标记」反推**（2.1.90，移植 XiangqiCoach 思路）。
+     构造最坏情况：对方黑卒 27→36，落点 36 读数丢失（读成空）、起点也读空，
+     差分只剩 1 格、配不出走法 —— 旧逻辑会永久卡死。
+     但游戏在落点画了高亮圈：rings[36]=0.62。
+     期望：用标记反推起点 27 → 推进一步 → 立刻翻轮次并派发搜索。 */
+  const S4 = makeFixture(src, false);
+  S4.learnOpening(false);
+  const m1 = S4.S0.slice(); m1[54] = 0; m1[45] = 7;
+  S4.frame('S8 我方走子', m1, r => {
+    if (!r.waitingOpponent) throw new Error('我方走完应轮到对方');
+  });
+  const m2 = m1.slice(); m2[27] = 0;          // 黑卒离开 27
+  /* 36 故意不写子：模拟落点被高亮圈盖住、读数丢失 */
+  S4.S.markerSq = 36;                          // 落点标记
+  S4.frame('S9 对方走子·仅靠落点标记反推', m2, r => {
+    if (r.waitingOpponent) throw new Error('有落点标记就该立刻认出对方已走');
+    if (!r.needSearch) throw new Error('反推成功后应立刻派发搜索');
+  });
+  /* 标记格已在锚盘里（这一步早推过了）→ 不能重复推进 */
+  S4.frame('S10 同一标记不重复推进', m2, r => {
+    if (r.waitingOpponent) throw new Error('不该退回等待');
+  });
+  S4.S.markerSq = -1;
   /* ===== R. 2.1.84：轮次判定自愈（不靠 movePly 奇偶） =====
      真机症状：对方已经走子，浮窗还显示「等待对方走子」；我方走完箭头不消失。
      根因：轮次由 session.movePly % 2 推出，只要某一步漏识别、movePly 不再增长，

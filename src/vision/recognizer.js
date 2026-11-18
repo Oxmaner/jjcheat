@@ -1361,6 +1361,45 @@ class BoardRecognizer {
   }
 
   /**
+   * ★ 2.1.90：检测「上一步标记」外环 —— 移植 XiangqiCoach 的核心思路。
+   *
+   * JJ 象棋会在**最后一步的落点**（部分皮肤连起点一起）画一个高亮圈。
+   * 这个圈正好落在半径 0.36~0.52 cell 处，而主采样只覆盖 ±0.34 cell，
+   * 所以过去一直"看不见"它，只能当干扰去滤。其实它是全画面里**最有用的信号**：
+   * 圈画在哪一格，就说明哪一格刚刚落子 —— 落点、走子方、轮次全都能直接得到，
+   * 不必再靠"差分配对 + 规则校验"去猜，也就不会因为某一格读错而永久卡死。
+   *
+   * 只认「高饱和红 / 亮金」两种典型标记色：木色盘面（低饱和暖色）和
+   * 棋子底色都够不上这两个判据。实测有圈 ≈ 0.6，空位/普通棋子 < 0.1。
+   *
+   * 返回该格外环的高亮像素占比（0~1）。
+   */
+  sampleRing(pixels, w, h, cx, cy, cell, gain) {
+    const r0 = cell * 0.36, r1 = cell * 0.52;
+    let hit = 0, n = 0;
+    for (let i = 0; i < 24; i++) {
+      const a = i * Math.PI / 12;
+      const ca = Math.cos(a), sa = Math.sin(a);
+      for (let k = 0; k < 3; k++) {
+        const rr = r0 + (r1 - r0) * k / 2;
+        const x = Math.round(cx + ca * rr), y = Math.round(cy + sa * rr);
+        if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) continue;
+        const p = (y * w + x) * 4;
+        let R = pixels[p], G = pixels[p + 1], B = pixels[p + 2];
+        if (gain !== 1) {
+          R = R * gain > 255 ? 255 : (R * gain) | 0;
+          G = G * gain > 255 ? 255 : (G * gain) | 0;
+          B = B * gain > 255 ? 255 : (B * gain) | 0;
+        }
+        n++;
+        if ((R > 140 && (R - G) > 55 && (R - B) > 45) ||
+            (R > 200 && G > 170 && B < 150 && (R - B) > 70)) hit++;
+      }
+    }
+    return n ? hit / n : 0;
+  }
+
+  /**
    * 估计这一帧的亮度增益，把真机抓屏拉到模板的水平。
    *
    * 参考值 150：真实截图（模板来源）里棋盘区域的整体亮度约 150。
@@ -1411,6 +1450,14 @@ class BoardRecognizer {
       out[sq] = this.sampleCell(pixels, w, h, pts[sq * 2], pts[sq * 2 + 1], radius, wantPatch, gain);
     }
     this.lastStats = { pts, cell, radius, gain };
+
+    /* 2.1.90：顺手把每格的「上一步标记」外环占比算出来。
+       90 格 × 24 角度 × 3 半径 = 6480 次采样，比模板匹配便宜得多。 */
+    const rings = new Float32Array(90);
+    for (let rq = 0; rq < 90; rq++) {
+      rings[rq] = this.sampleRing(pixels, w, h, pts[rq * 2], pts[rq * 2 + 1], cell, gain);
+    }
+    this.lastRings = rings;
     // 浮窗（画中画）会一起被截进截图里，盖住的那几格读出来一定是浮窗自己的画面，
     // 所以整格作废（保留上一帧的值），而不是拿去识别。
     this.pipRect = findPipRect(pixels, w, h, pts);
@@ -2120,7 +2167,8 @@ class BoardRecognizer {
     // 把每格的置信度和候选留下来，给 App 的「识别留证」页用
     this.lastConf = Array.prototype.slice.call(conf);
     this.lastRanked = rankedCodes.map(function (a) { return a ? a.slice(0, 3) : []; });
-    return { grid, conf, codes, tplFail, repaired: repaired, hidden: hidden, hiddenCount: hiddenCount };
+    return { grid, conf, codes, tplFail, repaired: repaired, hidden: hidden,
+             hiddenCount: hiddenCount, rings: this.lastRings };
   }
 
   /**

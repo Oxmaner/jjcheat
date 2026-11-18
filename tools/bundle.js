@@ -992,6 +992,78 @@ var JJEngine = {
 
     if (anchor) {
       stepInfo = analyzeStepDiff(anchor, engCodes);
+
+      /* ★ 2.1.90：用「上一步标记」直接反推走法 —— 移植 XiangqiCoach 的思路
+       *
+       * 差分配对要求「起点读空 + 落点读对兵种」两件事同时成立，任何一半被
+       * 高亮圈/落子动画干扰就配不出来，锚盘便卡在旧局面（真机 p0 卡死的成因）。
+       *
+       * 换个方向：游戏会在最后一步的**落点**画高亮圈，这个圈在主采样窗之外
+       * （半径 0.36~0.52 cell），过去一直没被利用。现在把它当主信号：
+       *   圈在哪格 → 落点已知；在锚盘里反查唯一能合法走到该格的起点 → 走法已知。
+       * 兵种直接取锚盘起点格（起点那格没被动过，读数是准的），因此不依赖落点读数。
+       *
+       * 只在「等待对方走子」时启用：此时上层按设计不画建议箭头（from/to = -1），
+       * 画面上的圈必然是游戏自己画的，不会把自己的箭头误当标记。
+       */
+      if (!stepInfo.move && !reseat && cls.rings) {
+        {
+          var mkT = -1, mkScore = 0;
+          for (var mi = 0; mi < 90; mi++) {
+            var rs = cls.rings[mi] || 0;
+            if (rs > 0.35 && rs > mkScore) { mkScore = rs; mkT = mi; }
+          }
+          /* 防重复推进：游戏会把「最后一步」的标记一直留着，锚盘推过一次后
+             下一帧还会看到同一个圈。落点读数可能丢失，所以不能靠「子是否一致」判断，
+             改用「标记格 + 当时的锚盘」做指纹：同一格且锚盘没再变过 → 已经处理过。 */
+          if (mkT >= 0) {
+            var anchorFenNow = codesToBoardFen(anchor);
+            if (session.markerDoneSq === mkT && session.markerDoneFen === anchorFenNow) mkT = -1;
+          }
+          if (mkT >= 0 && (anchor[mkT] || 0) !== 0 &&
+              (anchor[mkT] || 0) === (engCodes[mkT] || 0)) mkT = -1;
+          if (mkT >= 0) {
+            /* 在锚盘里反查能走到 mkT 的起点。优先「该格现在已空」（棋子确实走了），
+               否则退而求其次只看合法性 —— 但仍要求候选唯一，歧义就放弃。 */
+            var cands = [], candsEmpty = [];
+            for (var fi = 0; fi < 90; fi++) {
+              if (fi === mkT) continue;
+              var fp = anchor[fi] || 0;
+              if (!fp) continue;
+              if (!stepIsRuleLegal(anchor, fi, mkT)) continue;
+              cands.push(fi);
+              if ((engCodes[fi] || 0) === 0) candsEmpty.push(fi);
+            }
+            var pickF = candsEmpty.length === 1 ? candsEmpty[0]
+                      : (cands.length === 1 ? cands[0] : -1);
+            if (pickF >= 0) {
+              var mkPiece = anchor[pickF];
+              var mkCap = anchor[mkT] || 0;
+              var mkNext = anchor.slice();
+              mkNext[pickF] = 0;
+              mkNext[mkT] = mkPiece;
+              if (codesLegal(mkNext) && codesPositionPlausible(mkNext)) {
+                session.prevAnchorFen = session.anchorFen;
+                anchor = mkNext;
+                session.anchorCodes = anchor;
+                session.anchorFen = codesToBoardFen(anchor);
+                session.lastMoveText = C.sqToUcci(pickF) + C.sqToUcci(mkT);
+                session.movePly = (session.movePly || 0) + 1;
+                session.plyGuessed = 0;
+                session.ruleFail = 0;
+                session.lastMoverSide = (mkPiece <= 7) ? 'red' : 'black';
+                session.markerHit = (session.markerHit || 0) + 1;
+                session.markerDoneSq = mkT;
+                session.markerDoneFen = codesToBoardFen(anchor);   // 推进后的锚盘
+                stepInfo = {
+                  changed: stepInfo.changed, noise: [],
+                  move: { from: pickF, to: mkT, piece: mkPiece, captured: mkCap }
+                };
+              }
+            }
+          }
+        }
+      }
       var reseat = false;
 
       /* ★ 2.1.85：补一步 —— 高亮圈盖住落点导致「配不出走法」时的兜底
@@ -1093,9 +1165,19 @@ var JJEngine = {
                所以连续 N 次规则不通过，就认为「错的是锚盘不是棋」，
                直接以当前识别为准重锚（前提是它自己是一盘合法棋）。 */
             session.ruleFail = (session.ruleFail || 0) + 1;
+            /* 2.1.89：**在校验失败时就把走子方记下来**。
+               真机现象：我方炮八平五已经落子（中路确实是炮），插件却始终 p0
+               —— 因为它配出了这一步、但拿锚盘做规则校验没过，于是锚盘不推进，
+               连「我方走过了」都没记住，next 帧继续建议同一步（而游戏判非法）。
+               这里用配出的 move.piece 颜色推断走子方（锚盘可能错，但
+               「这一格上有枚红子走了」这个观察本身是对的）。 */
+            var failMover = stepInfo.move
+              ? ((stepInfo.move.piece <= 7) ? 'red' : 'black') : null;
             stepInfo = { changed: stepInfo.changed, move: null, noise: stepInfo.noise };
             anchorRejected = 1;
-            if (session.ruleFail >= 5 &&
+            /* 阈值 5 → 2：走子只有 2 格差异，够不到 JJ_RESEAT_MIN_DIFF(8) 的
+               重锚门槛，等 5 帧往往已经被后续噪声打断、永远凑不齐。 */
+            if (session.ruleFail >= 2 &&
                 codesLegal(engCodes) && codesPositionPlausible(engCodes)) {
               anchor = Array.prototype.slice.call(engCodes);
               session.anchorCodes = anchor;
@@ -1106,10 +1188,15 @@ var JJEngine = {
               session.lastDispatchedFen = '';
               session.ruleFail = 0;
               session.reseatDone = 1;
-              // 重锚后轮次无从得知，假设轮到我方，plyGuessed 供日志追溯
-              session.movePly = session.flipped ? 1 : 0;
+              /* 重锚后轮次：能推断出走子方就用它（下一步轮到另一方），
+                 推不出才退回「假设轮到我方」。 */
+              session.lastMoverSide = failMover;
+              if (failMover) {
+                session.movePly = (session.movePly || 0) + 1;
+              } else {
+                session.movePly = session.flipped ? 1 : 0;
+              }
               session.plyGuessed = 1;
-              session.lastMoverSide = null;   // 2.1.84：规则连败重锚，走子方记录作废
             }
           }
         }
