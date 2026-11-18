@@ -1290,6 +1290,14 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
         self.lastSearchFen = nil;
         self.engineGen++;
         [self presentMergedResult];
+    } else if (moved && !fen.length) {
+        /* 2.1.84：识别到走子、但本帧没有新的可搜索 FEN（例如刚走完、
+           盘面还在稳定过程中）——立即作废旧结论，避免「我方走完箭头还挂着」。
+           旧逻辑这里只打日志不清 engineResult，旧箭头会一直被端出来。 */
+        self.engineResult = nil;
+        self.lastSearchFen = nil;
+        self.engineGen++;
+        [self presentMergedResult];
     } else if (fen.length) {
         if ([fen isEqualToString:self.lastSearchFen] && self.engineResult) {
             [self presentMergedResult];   // 同一局面：直接端出缓存结论

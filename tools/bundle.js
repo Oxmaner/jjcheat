@@ -179,6 +179,11 @@ var session = {
   // 我方执黑时开局 ply=0 归对方先走，此时不出建议（用户明确要求）。
   movePly: 0,
   plyGuessed: 0,           // 中途进对局时轮次只能假设，日志可追溯
+  /* 2.1.84：最近一次**实际识别到**的走子方（'red' | 'black' | null）。
+     代替「靠 movePly 奇偶猜轮次」——后者只要漏识别一步就永久卡在
+     「等待对方走子」，而且我方走完箭头也不消失。这里用真实走子方
+     直接推出轮次：谁走的子，下一步就轮到另一方。漏步也能自愈。 */
+  lastMoverSide: null,
   newGame: 0               // 本帧识别到「回到标准开局」并已重锚
 };
 
@@ -239,6 +244,7 @@ var JJEngine = {
       session.lastRawFen = '';
       session.movePly = 0;
       session.plyGuessed = 0;
+      session.lastMoverSide = null;    // 2.1.84：换局后走子方记录作废
       session.newGame = 0;
     }
     return session.tracker.fen;
@@ -460,6 +466,7 @@ var JJEngine = {
       // 学习成功 = 一局新棋从标准开局开始，红方先走
       session.movePly = 0;
       session.plyGuessed = 0;
+      session.lastMoverSide = null;    // 2.1.84：新局开局，还没有任何走子记录
       // stableCodes 是屏幕坐标，供「低置信度沿用上一帧」用，也给正确基线
       session.stableCodes = flipped
         ? Array.prototype.slice.call(flipCodes(anchorEng))
@@ -922,6 +929,7 @@ var JJEngine = {
       session.anchorFlipped = !!session.flipped;
       session.movePly = 0;
       session.plyGuessed = 0;
+      session.lastMoverSide = null;    // 2.1.84：新局重锚，清空走子方记录
       session.lastBoardFen = session.anchorFen;
       session.lastRawFen = session.anchorFen;
       session.lastFen = '';
@@ -948,6 +956,7 @@ var JJEngine = {
            让用户立刻能拿到建议；plyGuessed=1 供日志追溯。 */
         session.movePly = session.flipped ? 1 : 0;
         session.plyGuessed = 1;
+        session.lastMoverSide = null;    // 2.1.84：中途进局，未知走子方
       }
     } else if (session.anchorFlipped !== !!session.flipped) {
       // 画面朝向变了：旧锚盘坐标失效，按当前盘面重建。
@@ -966,6 +975,7 @@ var JJEngine = {
         session.reseatCount = 0;
         session.movePly = session.flipped ? 1 : 0;
         session.plyGuessed = 1;
+        session.lastMoverSide = null;    // 2.1.84：朝向变了重锚，走子方记录作废
       } else {
         anchorRejected = 1;
       }
@@ -1005,6 +1015,7 @@ var JJEngine = {
             countCodesDiff(session.openingAnchor, engCodes) <= 4;
           session.movePly = backToOpening ? 0 : (session.flipped ? 1 : 0);
           session.plyGuessed = backToOpening ? 0 : 1;
+          session.lastMoverSide = null;   // 2.1.84：重锚后走子方记录作废
         } else {
           anchorRejected = 1;
         }
@@ -1040,6 +1051,9 @@ var JJEngine = {
             session.movePly = (session.movePly || 0) + 1;
             session.plyGuessed = 0;
             session.ruleFail = 0;
+            /* 2.1.84：记下这一步是谁走的（编码 1~7 红、8~14 黑）。
+               轮次判定改用它，不再依赖 movePly 奇偶，漏步可自愈。 */
+            session.lastMoverSide = (stepInfo.move.piece <= 7) ? 'red' : 'black';
           } else {
             /* 2.1.77：规则校验连败逃逸。
                2.1.76 加了 stepIsRuleLegal 之后有个隐患：如果锚盘本身记错了
@@ -1066,6 +1080,7 @@ var JJEngine = {
               // 重锚后轮次无从得知，假设轮到我方，plyGuessed 供日志追溯
               session.movePly = session.flipped ? 1 : 0;
               session.plyGuessed = 1;
+              session.lastMoverSide = null;   // 2.1.84：规则连败重锚，走子方记录作废
             }
           }
         }
@@ -1089,12 +1104,31 @@ var JJEngine = {
 
     /* 【2.0.0 红先黑后】JJ 象棋规则：由执红棋的一方先走，双方轮流走一步。
        旧版把 FEN 的走子方写死成「永远我方」，于是我执黑时开局第一手明明
-       归对方，插件却照样给我出着法。现在按 movePly 奇偶推真实轮次；
-       轮到对方就完全不调引擎、不画箭头，顺带省掉一半的搜索开销。 */
-    var turnChar = (session.movePly % 2 === 0) ? 'w' : 'b';
+       归对方，插件却照样给我出着法。现在按真实轮次推；
+       轮到对方就完全不调引擎、不画箭头，顺带省掉一半的搜索开销。
+
+       【2.1.84 轮次判定改自愈】旧版用 session.movePly % 2 猜轮次，前提是
+       「每一步都必须被准确识别并推进 movePly」。真机上只要漏识别一步
+       （差分格数超阈值 / 规则校验失败 / 浮窗挡住一格），movePly 就不再增长，
+       轮次永久卡死 → 表现为「对方已经走子，浮窗还显示等待对方走子」，
+       以及「我方走完，箭头一直挂着不消失」。
+       现在优先用 lastMoverSide（最近一次真实识别到的走子方）直接推轮次：
+       谁刚走完，下一步就轮到另一方。漏识别也能在下一步自愈。
+       只有在完全没有走子记录时（开局 / 刚重锚），才退回 movePly 兜底。 */
     var myTurnChar = mySideDetected === 'red' ? 'w' : 'b';
+    var turnChar;
+    var lastMoverChar = session.lastMoverSide === 'red' ? 'w'
+                      : (session.lastMoverSide === 'black' ? 'b' : '');
+    if (lastMoverChar) {
+      /* 谁刚走完，下一步就轮到另一方 —— 直接翻面，不依赖 movePly 计数。 */
+      turnChar = (lastMoverChar === 'w') ? 'b' : 'w';
+    } else {
+      turnChar = (session.movePly % 2 === 0) ? 'w' : 'b';   // 无记录时兜底
+    }
     var waitingOpponent = (turnChar !== myTurnChar);
-    var prevTurnChar = ((session.movePly - 1) % 2 === 0) ? 'w' : 'b';
+    /* prevTurnChar = 「刚才那一步」的走子方，给中文记谱用。
+       有真实记录就照它，否则沿用旧的 movePly-1 推导。 */
+    var prevTurnChar = lastMoverChar || (((session.movePly - 1) % 2 === 0) ? 'w' : 'b');
 
     // 1) 尝试推进一步棋
     // ★ 画面稳定性检测

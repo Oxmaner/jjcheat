@@ -203,6 +203,40 @@ function main() {
     if (!r.needSearch) throw new Error('新局应立刻派发搜索');
   });
 
+  /* ===== R. 2.1.84：轮次判定自愈（不靠 movePly 奇偶） =====
+     真机症状：对方已经走子，浮窗还显示「等待对方走子」；我方走完箭头不消失。
+     根因：轮次由 session.movePly % 2 推出，只要某一步漏识别、movePly 不再增长，
+           轮次就永久卡死。现在优先用 lastMoverSide（真实走子方）推轮次。
+     这里直接构造「movePly 与实际走子方矛盾」的状态，验证不再被 ply 带偏。 */
+  console.log('');
+  console.log('========== R. 轮次判定自愈（2.1.84）==========');
+  const R = makeFixture(src, false);   // 执红
+  R.learnOpening(false);
+  R.frame('R1 执红开局轮到我', R.S0.slice(), r => {
+    if (r.waitingOpponent) throw new Error('开局应轮到我方');
+  });
+  const rst1 = R.S0.slice(); rst1[54] = 0; rst1[45] = 7;    // 我方红兵进一
+  R.frame('R2 我方走子→轮到对方', rst1, r => {
+    if (!r.waitingOpponent) throw new Error('我方走完应轮到对方');
+    if (R.S.lastMoverSide !== 'red') throw new Error('lastMoverSide 应记 red');
+  });
+  /* 关键构造：人为把 movePly 改回偶数（模拟「漏识别导致 ply 计数停滞」），
+     但 lastMoverSide 仍记录对方刚走过。旧逻辑会因为 ply 偶数判成「轮到我」，
+     新逻辑必须仍判「轮到我」——因为对方确实走完了。 */
+  const rst2 = rst1.slice(); rst2[27] = 0; rst2[36] = 14;    // 对方黑卒进一
+  R.S.movePly = 1;    // 人为制造「ply 停滞」，模拟漏识别
+  R.frame('R3 对方走子（ply 被人为停滞）', rst2, r => {
+    if (r.waitingOpponent) throw new Error('对方已走完，不该还判等待对方');
+    if (!r.needSearch) throw new Error('对方走完应立刻派发搜索');
+    if (R.S.lastMoverSide !== 'black') throw new Error('lastMoverSide 应记 black');
+  });
+  /* 再验证：ply 停滞后我方走子，仍能正确翻到「等对方」 */
+  const rst3 = rst2.slice(); rst3[56] = 0; rst3[47] = 7;     // 我方另一路红兵进一
+  R.S.movePly = 2;    // 再次人为制造 ply 与实际不符
+  R.frame('R4 我方走子（ply 再次错位）', rst3, r => {
+    if (!r.waitingOpponent) throw new Error('我方走完应轮到对方（ply 错位也要对）');
+  });
+
   console.log('');
   console.log('========== B. 执黑：必须等对方（红）先走 ==========');
   const B = makeFixture(src, true);
