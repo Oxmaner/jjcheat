@@ -231,6 +231,25 @@ function main() {
     if (r.waitingOpponent) throw new Error('连续2帧起点空 → 必须认出对方已走');
     if (!r.needSearch) throw new Error('认出对方走后应立刻派发搜索');
   });
+
+  /* S5/S6：起点格**没被读成空**（走子动画/高亮残留），只有落点格有变化。
+     此时 emptyCnt==0，靠「等对方时盘面确实在变」的通用兜底认出来。
+     真机 2.1.87 诊断就是这个形态：d2 但锚盘永不推进。 */
+  const S3 = makeFixture(src, false);
+  S3.learnOpening(false);
+  const u1 = S3.S0.slice(); u1[54] = 0; u1[45] = 7;
+  S3.frame('S5 我方走子', u1, r => {
+    if (!r.waitingOpponent) throw new Error('我方走完应轮到对方');
+  });
+  /* 对方黑卒从 27 进到 36，但 27 仍残留"有子"读数，只有 36 出现变化 */
+  const u2 = u1.slice(); u2[36] = 13;
+  S3.frame('S6 对方走子·起点残留（第1帧）', u2, r => {
+    if (!r.waitingOpponent) throw new Error('第1帧不该抢跑');
+  });
+  S3.frame('S7 对方走子·起点残留（第2帧应自愈）', u2, r => {
+    if (r.waitingOpponent) throw new Error('等对方时盘面在变，连续2帧必须翻轮次');
+    if (!r.needSearch) throw new Error('翻回我方后应派发搜索');
+  });
   /* ===== R. 2.1.84：轮次判定自愈（不靠 movePly 奇偶） =====
      真机症状：对方已经走子，浮窗还显示「等待对方走子」；我方走完箭头不消失。
      根因：轮次由 session.movePly % 2 推出，只要某一步漏识别、movePly 不再增长，

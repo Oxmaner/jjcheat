@@ -423,22 +423,16 @@ static NSString *JJFormatNodes(NSInteger nodes) {
     } else if (pending) {
         [sub appendString:@" · 正在搜索"];
     }
-    /* 2.1.87 诊断（临时）：第二行**整行换成识别出的盘面 FEN**，用来和眼睛看到的对比。
-       d=变化格数 mv=最近走子方 st=是否配出走法 i=兜底命中。 */
+    /* 2.1.88 诊断：第二行末尾附上「ply / 变化格数 / 锚盘拒绝数」三个小字。
+       真机没有 log 命令，这几个数能直接看出轮次有没有推进、锚盘有没有卡住。
+       正常盘面下它们很安静，不影响阅读。 */
     {
-        NSString *board = result[@"dbgBoard"] ?: @"";
-        NSRange sp = [board rangeOfString:@" "];
-        if (sp.location != NSNotFound) board = [board substringToIndex:sp.location];
-        id d = result[@"diffChanged"], mv = result[@"dbgMover"],
-           st = result[@"dbgStep"], inf = result[@"dbgInferred"];
-        if (board.length || d != nil) {
-            self.lineSub.text = [NSString stringWithFormat:@"%@  d%@ %@ st%@ i%@",
-                                 board.length ? board : @"(空)", d ?: @"-",
-                                 mv ?: @"-", st ?: @"-", inf ?: @"-"];
-        } else {
-            self.lineSub.text = sub;
+        id ply = result[@"ply"], d = result[@"diffChanged"], rej = result[@"anchorRejected"];
+        if (ply != nil) {
+            [sub appendFormat:@" │ p%@ d%@ r%@", ply ?: @"-", d ?: @"-", rej ?: @"-"];
         }
     }
+    self.lineSub.text = sub;
 
     if (self.topPanel.hidden) [self layoutTopPanel];   // 首次显示时保险再摆一次
     self.topPanel.hidden = NO;
