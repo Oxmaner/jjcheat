@@ -1077,14 +1077,38 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
      * 网格于是永远停在旧坐标。真机实测证据：插件网格 x=32~394，而棋盘实际
      * x=28~399 —— 窄了 9px，两头各偏 4~5px，边缘棋子必然读错。
      */
-    NSArray *gridC = info[@"gridCorners"];
-    if (gridC.count == 4) {
-        BOOL adoptedG = [[JJCalibrator shared] adoptRefinedCorners:gridC];
-        if (adoptedG && self.autoCalibrating) {
-            [[JJCalibrator shared] saveAutoCalibratedCorners:gridC width:w height:h];
+    /* ★★ 2.1.98 崩溃修复：JS 的 null 过桥后是 **NSNull**，不是 nil。
+     *
+     * 原来写成 `NSArray *gridC = info[@"gridCorners"]; if (gridC.count == 4)`，
+     * detectGrid 失败时 JS 返回 null → NSNull → 调 -count 触发
+     * unrecognized selector → NSInvalidArgumentException 逃出 dispatch block
+     * → _objc_terminate → std::terminate → abort。
+     * 真机崩溃日志实测（15:18:17）：
+     *   objc_exception_throw → +[NSObject _copyDescription] → ___forwarding___
+     *   → JJCheat.dylib +452160 → _dispatch_call_block_and_release
+     * 教训：**任何从 JS 过桥来的值都必须先判类型和 isfinite**。 */
+    id gcRaw = info[@"gridCorners"];
+    if ([gcRaw isKindOfClass:[NSArray class]]) {
+        NSArray *gridC = (NSArray *)gcRaw;
+        BOOL gcOk = (gridC.count == 4);
+        if (gcOk) {
+            for (id pt in gridC) {
+                if (![pt isKindOfClass:[NSArray class]] || [(NSArray *)pt count] < 2) { gcOk = NO; break; }
+                double gx = [[(NSArray *)pt objectAtIndex:0] doubleValue];
+                double gy = [[(NSArray *)pt objectAtIndex:1] doubleValue];
+                if (!isfinite(gx) || !isfinite(gy)) { gcOk = NO; break; }
+            }
         }
-        NSLog(@"[JJCheat] 几何标定：%@ 四角=%@",
-              adoptedG ? @"已采纳" : @"被体检拒绝", gridC);
+        if (gcOk) {
+            BOOL adoptedG = [[JJCalibrator shared] adoptRefinedCorners:gridC];
+            if (adoptedG && self.autoCalibrating) {
+                [[JJCalibrator shared] saveAutoCalibratedCorners:gridC width:w height:h];
+            }
+            NSLog(@"[JJCheat] 几何标定：%@ 四角=%@",
+                  adoptedG ? @"已采纳" : @"被体检拒绝", gridC);
+        } else {
+            NSLog(@"[JJCheat] 几何标定：坐标不合法，忽略 %@", gridC);
+        }
     }
 
     if (!info || [info[@"templateCount"] integerValue] <= 0) {

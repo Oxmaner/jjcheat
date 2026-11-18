@@ -84,6 +84,10 @@ static double JJAbsD(double v) { return v < 0 ? -v : v; }
         NSArray *xy = c[i];
         if (![xy isKindOfClass:[NSArray class]] || xy.count < 2) return NO;
         p[i] = CGPointMake([xy[0] doubleValue], [xy[1] doubleValue]);
+        /* 2.1.98：NaN/Inf 会让下面所有比较都返回 false，等于"体检全过"，
+           随后 gridPointsFromCorners 算出 90 个 NaN 点，CoreGraphics 直接崩。
+           这里必须先把非有限值拦死。 */
+        if (!isfinite(p[i].x) || !isfinite(p[i].y)) return NO;
     }
     double topW = JJAbsD(p[1].x - p[0].x), botW = JJAbsD(p[2].x - p[3].x);
     double leftH = JJAbsD(p[3].y - p[0].y), rightH = JJAbsD(p[2].y - p[1].y);
