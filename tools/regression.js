@@ -203,6 +203,34 @@ function main() {
     if (!r.needSearch) throw new Error('新局应立刻派发搜索');
   });
 
+  /* ===== S. 2.1.85：落子高亮圈盖住落点，仍要能识别出走子并翻轮次 =====
+     真机症状：对方落子后浮窗一直「等待对方走子」，要等好几秒甚至手动碰屏幕才更新。
+     根因：JJ 象棋给刚落子的棋子画白色高亮圈，把目标格盖住 → 该格识别成空/
+           错兵种 → analyzeStepDiff 配不出完整走法 → 锚盘不推进 → 本帧结果被
+           旧锚盘覆盖丢弃 → 盘面永远停在旧状态，轮次永远「等待对方」。
+     修法：用「起点格从有子变空」（不受圈影响）反推走子，兵种从起点取。 */
+  console.log('');
+  console.log('========== S. 落点被高亮圈盖住（2.1.85）==========');
+  const S = makeFixture(src, false);   // 执红
+  S.learnOpening(false);
+  S.frame('S1 开局轮到我', S.S0.slice(), r => {
+    if (r.waitingOpponent) throw new Error('开局应轮到我');
+  });
+  /* 我方红兵进一（正常识别）→ 应翻到等对方 */
+  const sStep1 = S.S0.slice(); sStep1[54] = 0; sStep1[45] = 7;
+  S.frame('S2 我方走子→等对方', sStep1, r => {
+    if (!r.waitingOpponent) throw new Error('我方走完应轮到对方');
+  });
+  /* 对方黑卒进一，但**落点被高亮圈读成空**（27 空、36 也读空）→ 只剩起点变空 */
+  const sStep2 = sStep1.slice(); sStep2[27] = 0;   // 36 故意留空：模拟圈盖住读不到
+  S.frame('S3 对方走子·落点读成空（第1帧）', sStep2, r => {
+    /* 第1帧只累积计数，不要求立刻翻 */
+    if (!r.waitingOpponent) throw new Error('第1帧不该抢跑翻轮次');
+  });
+  S.frame('S4 对方走子·落点读成空（第2帧确认）', sStep2, r => {
+    if (r.waitingOpponent) throw new Error('连续2帧起点空 → 必须认出对方已走');
+    if (!r.needSearch) throw new Error('认出对方走后应立刻派发搜索');
+  });
   /* ===== R. 2.1.84：轮次判定自愈（不靠 movePly 奇偶） =====
      真机症状：对方已经走子，浮窗还显示「等待对方走子」；我方走完箭头不消失。
      根因：轮次由 session.movePly % 2 推出，只要某一步漏识别、movePly 不再增长，

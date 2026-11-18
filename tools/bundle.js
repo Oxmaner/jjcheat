@@ -184,6 +184,13 @@ var session = {
      「等待对方走子」，而且我方走完箭头也不消失。这里用真实走子方
      直接推出轮次：谁走的子，下一步就轮到另一方。漏步也能自愈。 */
   lastMoverSide: null,
+  /* 2.1.85：高亮圈兜底相关状态。
+     hiddenDstFrom/Streak：落点被高亮圈盖住读成空时，用连续 2 帧确认「起点确实空了」；
+     highlightLostPiece：已经翻过轮次但落点坐标未知的那颗棋子兵种，供后续帧补回。 */
+  hiddenDstFrom: -1,
+  hiddenDstStreak: 0,
+  highlightLostPiece: 0,
+  highlightInferred: 0,
   newGame: 0               // 本帧识别到「回到标准开局」并已重锚
 };
 
@@ -984,6 +991,89 @@ var JJEngine = {
     if (anchor) {
       stepInfo = analyzeStepDiff(anchor, engCodes);
       var reseat = false;
+
+      /* ★ 2.1.85：补一步 —— 高亮圈盖住落点导致「配不出走法」时的兜底
+       *
+       * 真机症状：对方已经落子，浮窗还显示「等待对方走子」，要等好几秒甚至
+       * 直到用户手动碰一下屏幕才更新。
+       *
+       * 根因：JJ 象棋会给**刚落子的棋子**画一个白色高亮圈/光晕。那个圈正好盖住
+       * 目标格，模板匹配于是把该格读成空或读成别的兵种：
+       *   - analyzeStepDiff 要求 cur[to] === piece，读错了就配不出这一步 → move=null；
+       *   - 锚盘因此不推进，本帧识别结果又被旧锚盘整帧覆盖丢弃；
+       *   - 盘面永远停在旧状态 → 轮次永远是「等待对方」，引擎也不再搜。
+       *
+       * 关键洞察：「起点格从有子变成空」这一半**不受高亮圈影响**（圈画在新位置）。
+       * 所以只要恰好一个格子变空，就必定是某枚棋子刚离开了那里；再配合
+       * 恰好一个格子的差异作为落点，就能把这一步重建出来 —— 兵种直接从
+       * 起点格取（那是没被圈盖住的原位置，识别是准的），落点只需知道坐标。
+       * 最后仍用 stepIsRuleLegal + codesLegal 双重把关，噪声不会被误当走子。
+       */
+      if (!stepInfo.move && !reseat && stepInfo.changed >= 1 && stepInfo.changed <= 4) {
+        var fromSq = -1, emptyCnt = 0;
+        for (var ei = 0; ei < 90; ei++) {
+          if ((anchor[ei] || 0) !== 0 && (engCodes[ei] || 0) === 0) { emptyCnt++; fromSq = ei; }
+        }
+        if (emptyCnt === 1) {
+          var toSq = -1, otherCnt = 0;
+          for (var oj = 0; oj < 90; oj++) {
+            if (oj === fromSq) continue;
+            if ((anchor[oj] || 0) !== (engCodes[oj] || 0)) { otherCnt++; toSq = oj; }
+          }
+          if (otherCnt === 1 && toSq >= 0) {
+            var movedPiece = anchor[fromSq];
+            var capturedPiece = anchor[toSq] || 0;
+            /* 不能吃己方棋子（与 analyzeStepDiff 同判据） */
+            var okCapture = !capturedPiece ||
+                            ((capturedPiece <= 7) !== (movedPiece <= 7));
+            if (okCapture && stepIsRuleLegal(anchor, fromSq, toSq)) {
+              stepInfo = {
+                changed: stepInfo.changed,
+                noise: [],
+                move: { from: fromSq, to: toSq, piece: movedPiece, captured: capturedPiece }
+              };
+              session.highlightInferred = (session.highlightInferred || 0) + 1;
+              session.hiddenDstFrom = -1;
+              session.hiddenDstStreak = 0;
+            }
+          } else {
+            /* 落点读不出来：高亮圈把它整格读成空，或读成超编兵种被配额修复丢掉，
+               或读数抖动导致 otherCnt 多于 1。共同点都是**配不出合法一步**，
+               但「恰好一枚棋子离开了某格」这个事实是清楚的（那一半不被圈遮住）。
+               此时落点坐标不可知，轮次却必须翻，否则永远卡在「等待对方」。
+               用连续 2 帧一致来排除单帧噪声（噪声下一帧就恢复，真走子不会）。 */
+            if (session.hiddenDstFrom === fromSq) {
+              session.hiddenDstStreak = (session.hiddenDstStreak || 0) + 1;
+            } else {
+              session.hiddenDstFrom = fromSq;
+              session.hiddenDstStreak = 1;
+            }
+            if (session.hiddenDstStreak >= 2) {
+              var leftPiece = anchor[fromSq];
+              session.lastMoverSide = (leftPiece <= 7) ? 'red' : 'black';
+              session.movePly = (session.movePly || 0) + 1;
+              session.plyGuessed = 1;      // 落点未知，轮次是推的，日志可追溯
+              session.ruleFail = 0;
+              /* 锚盘只清掉起点；落点留空，等后续帧识别出来再补
+                 （下面有「补回丢失棋子」逻辑，见 anchor 覆盖之前）。 */
+              var naHidden = anchor.slice();
+              naHidden[fromSq] = 0;
+              anchor = naHidden;
+              session.anchorCodes = anchor;
+              session.anchorFen = codesToBoardFen(anchor);
+              session.prevAnchorFen = '';
+              session.lastBoardFen = session.anchorFen;
+              session.lastResult = null;
+              session.lastDispatchedFen = '';
+              session.highlightLostPiece = leftPiece;   // 供后续帧补回
+              session.highlightInferred = (session.highlightInferred || 0) + 1;
+              session.hiddenDstFrom = -1;
+              session.hiddenDstStreak = 0;
+            }
+          }
+        }
+      }
+
       if (!stepInfo.move && stepInfo.changed >= JJ_RESEAT_MIN_DIFF) {
         // 2.0.0：只有「大变化」才可能是换局 / 中途进对局。
         // 1.1.44 只要 changed>0 就进换局候选，真机首帧 diff=4 的模板噪声
@@ -1084,7 +1174,39 @@ var JJEngine = {
             }
           }
         }
-        // 用锚盘（可能已推进一步）覆盖本帧 codes/grid，噪声格一律不落地
+        /* 2.1.85：补回上一帧因高亮圈读不到落点而「消失」的那颗棋子。
+         条件：锚盘里该兵种比当前帧多一个，且当前帧恰好多出一个同兵种的格，
+         拼起来是一盘合法棋 —— 才算找回来，避免把噪声格当落点。 */
+      if (session.highlightLostPiece) {
+        var lp = session.highlightLostPiece;
+        var lostCnt = 0, curCnt = 0, candSq = -1, candCnt = 0;
+        for (var li = 0; li < 90; li++) {
+          if ((anchor[li] || 0) === lp) lostCnt++;
+          if ((engCodes[li] || 0) === lp) curCnt++;
+        }
+        if (curCnt > lostCnt) {
+          for (var lj = 0; lj < 90; lj++) {
+            if ((engCodes[lj] || 0) === lp && (anchor[lj] || 0) !== lp) {
+              candCnt++; candSq = lj;
+            }
+          }
+        }
+        if (candCnt === 1 && candSq >= 0) {
+          var trial = anchor.slice();
+          trial[candSq] = lp;
+          if (codesLegal(trial) && codesPositionPlausible(trial)) {
+            anchor = trial;
+            session.anchorCodes = anchor;
+            session.anchorFen = codesToBoardFen(anchor);
+            session.lastBoardFen = '';
+            session.lastResult = null;
+            session.lastDispatchedFen = '';
+          }
+        }
+        session.highlightLostPiece = 0;   // 只尝试一次，避免长期挂着乱补
+      }
+
+      // 用锚盘（可能已推进一步）覆盖本帧 codes/grid，噪声格一律不落地
         var screenCodes = session.flipped ? flipCodes(anchor) : anchor;
         for (var bc = 0; bc < 90; bc++) {
           cls.codes[bc] = screenCodes[bc];
