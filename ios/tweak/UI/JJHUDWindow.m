@@ -90,13 +90,17 @@
     CGContextRestoreGState(ctx);
 }
 
+/* 2.1.91：**只描边、不填充**，线宽 2。
+   原因：游戏会在「最后走的那颗棋子」外面画一圈**白色高亮光圈**，
+   那是识别侧判断「对方刚走了哪一步」的主要依据（见 recognizer.sampleRing）。
+   原来这里画 r=20 的半透明填充圆，正好把那圈白光糊住 —— 等于自己把
+   最关键的信息盖掉了，识别侧只能看到"没有标记"，于是永远等不到对方走子。
+   描边圆不挡中心、也不挡外圈，双方都够用。 */
 - (void)drawRingAt:(CGPoint)p radius:(CGFloat)r color:(UIColor *)color {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     CGContextSetStrokeColorWithColor(ctx, color.CGColor);
-    CGContextSetLineWidth(ctx, 3.0);
+    CGContextSetLineWidth(ctx, 2.0);
     CGContextStrokeEllipseInRect(ctx, CGRectMake(p.x - r, p.y - r, r * 2, r * 2));
-    CGContextSetFillColorWithColor(ctx, [color colorWithAlphaComponent:0.18].CGColor);
-    CGContextFillEllipseInRect(ctx, CGRectMake(p.x - r, p.y - r, r * 2, r * 2));
 }
 
 - (void)drawRect:(CGRect)rect {

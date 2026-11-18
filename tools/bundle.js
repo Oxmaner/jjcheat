@@ -193,6 +193,9 @@ var session = {
   highlightInferred: 0,
   /* 2.1.88：通用兜底「等对方时盘面在变」的连续帧计数。 */
   genChgStreak: 0,
+  flipCooldown: 0,          // 2.1.91：对称翻转冷却帧数，防连续误翻
+  frameSeq: 0,              // 2.1.93：帧序号，给标记去重当指纹（不能用 ply）
+  markerDoneSeq: 0,
   newGame: 0               // 本帧识别到「回到标准开局」并已重锚
 };
 
@@ -595,6 +598,25 @@ var JJEngine = {
     var base = (baseCorners && baseCorners.length === 4) ? baseCorners : null;
     if (base) JJEngine.setCorners(base);
 
+    /* ★ 2.1.96：**先做真正的自动标定** —— 直接从像素反解棋盘网格。
+     *
+     * 原来这条链路的顺序是「学模板 → alignGridToOpening（只认标准开局）」，
+     * 中局时对齐直接放弃，网格沿用上次手点的四角（±30px 误差），于是永远歪。
+     *
+     * 现在先用检测器从画面上把 9 竖 × 10 横的网格量出来（不依赖局面），
+     * 成功就以它为准 —— 手点四角只作为"检测失败时的兜底"。
+     */
+    var gridDet = null;
+    try {
+      if (session.recognizer && session.recognizer.detectGrid) {
+        gridDet = session.recognizer.detectGrid(pixels, w, h);
+      }
+    } catch (eGd) { gridDet = null; }
+    if (gridDet && gridDet.corners) {
+      base = gridDet.corners.map(function (p) { return [p[0], p[1]]; });
+      JJEngine.setCorners(base);
+    }
+
     /* ★ 2.1.58 开局匹配滤波对齐：先用「已知开局 32 个位置」对整帧像素反解真实网格，
        再进入 refineGrid / learnBoard。
        根因（真机 2.1.57 日志实锤）：手动四角天生 ±30px 手指误差，采样窗中心
@@ -617,6 +639,9 @@ var JJEngine = {
     }
     /** 把对齐诊断挂到返回值上（fast 路径与主路径共用） */
     function alignFields(o) {
+      o.gridDetected = gridDet ? 1 : 0;
+      o.gridDx = gridDet ? Math.round(gridDet.dx * 10) / 10 : -1;
+      o.gridDy = gridDet ? Math.round(gridDet.dy * 10) / 10 : -1;
       o.alignAccepted = alignR ? (alignR.accepted ? 1 : 0) : -1;
       o.alignAlready = (alignR && alignR.already) ? 1 : 0;
       o.alignOccHit = alignR ? alignR.occHit : -1;
@@ -911,6 +936,11 @@ var JJEngine = {
     // 落地 codes 永远是一盘真棋，盘面不变时引擎命中缓存、一次都不重算。
     var engCodes = session.flipped ? flipCodes(cls.codes) : cls.codes;
     var stepInfo = { changed: 0, move: null, noise: [] };
+    session.turnUpdated = 0;   // 2.1.91：本帧轮次是否已更新（保证一帧只翻一次）
+    /* 2.1.93：帧序号。**不能拿 ply 当「标记是否已处理」的指纹** ——
+       推进本身会改 ply，下一帧指纹立刻对不上，于是又推一次、再改 ply……
+       死循环，真机实测 ply 一路涨到 25。用单调递增的帧号才可靠。 */
+    session.frameSeq = (session.frameSeq || 0) + 1;
     var anchorRejected = 0;
     var anchor = session.anchorCodes;
     session.newGame = 0;
@@ -993,73 +1023,119 @@ var JJEngine = {
     if (anchor) {
       stepInfo = analyzeStepDiff(anchor, engCodes);
 
-      /* ★ 2.1.90：用「上一步标记」直接反推走法 —— 移植 XiangqiCoach 的思路
+      /* ★ 2.1.92：用游戏自己画的「上一步标记」直接定位走法
        *
-       * 差分配对要求「起点读空 + 落点读对兵种」两件事同时成立，任何一半被
-       * 高亮圈/落子动画干扰就配不出来，锚盘便卡在旧局面（真机 p0 卡死的成因）。
+       * 差分配对要求「起点读空 + 落点读对兵种」同时成立，任何一半被高亮圈
+       * 或落子动画干扰就配不出来，锚盘便卡在旧局面（真机 p0 卡死的成因）。
        *
-       * 换个方向：游戏会在最后一步的**落点**画高亮圈，这个圈在主采样窗之外
-       * （半径 0.36~0.52 cell），过去一直没被利用。现在把它当主信号：
-       *   圈在哪格 → 落点已知；在锚盘里反查唯一能合法走到该格的起点 → 走法已知。
-       * 兵种直接取锚盘起点格（起点那格没被动过，读数是准的），因此不依赖落点读数。
+       * 而游戏其实把上一步完整标出来了：
+       *   起点那格（此时已空）中心有一个**小白点**  → from
+       *   落点那格（有子）外围有一圈**白色光环**    → to
+       * 两个都拿到就是一条完整走法，无需任何反推。兵种取锚盘起点格
+       * （那格没被动过，读数是准的），所以完全不依赖落点读数。
        *
-       * 只在「等待对方走子」时启用：此时上层按设计不画建议箭头（from/to = -1），
-       * 画面上的圈必然是游戏自己画的，不会把自己的箭头误当标记。
+       * 阈值来自真机实测（白色像素**个数**，不是占比）：
+       *   白圈：有标记 22、普通棋子 2~9        → 取 15
+       *   白点：起点 53、普通空位 0            → 取 10（中心按 9×9 抽样，约为 17×17 的 1/4）
+       * 只有白圈、没有白点时，退回「在锚盘里反查唯一合法起点」。
        */
       if (!stepInfo.move && !reseat && cls.rings) {
-        {
-          var mkT = -1, mkScore = 0;
-          for (var mi = 0; mi < 90; mi++) {
-            var rs = cls.rings[mi] || 0;
-            if (rs > 0.35 && rs > mkScore) { mkScore = rs; mkT = mi; }
+        var mkT = -1, mkScore = 0;
+        for (var mi = 0; mi < 90; mi++) {
+          var rs = cls.rings[mi] || 0;
+          if (rs > mkScore) { mkScore = rs; mkT = mi; }
+        }
+        if (mkScore < 0.06) mkT = -1;   // 环提升平均差，真机实测有圈 0.084 / 普通格 ≤0.039
+
+        /* 防重复：同一个标记、ply 没再动过，说明这步早已推进过 */
+        /* 同一个白圈在 30 帧（≈4.5s）内只处理一次。
+           游戏会一直把这个标记留着，而落点读数又常常丢失，
+           所以不能用「子是否一致」判断，只能靠时间窗 + 格子。 */
+        if (mkT >= 0 && session.markerDoneSq === mkT &&
+            (session.frameSeq - (session.markerDoneSeq || 0)) < 30) mkT = -1;
+        if (mkT >= 0 && (anchor[mkT] || 0) !== 0 &&
+            (anchor[mkT] || 0) === (engCodes[mkT] || 0)) mkT = -1;
+
+        /* 起点白点：只在「现在已空、而锚盘里还有子」的格里找 —— 那正是棋子离开的地方。
+           有子格里棋子面本身就偏亮，所以不参与比较。 */
+        var mkF = -1, mkC = 0;
+        if (mkT >= 0 && cls.centers) {
+          for (var ci = 0; ci < 90; ci++) {
+            if (ci === mkT) continue;
+            if ((engCodes[ci] || 0) !== 0) continue;
+            if ((anchor[ci] || 0) === 0) continue;
+            var cs = cls.centers[ci] || 0;
+            if (cs > mkC) { mkC = cs; mkF = ci; }
           }
-          /* 防重复推进：游戏会把「最后一步」的标记一直留着，锚盘推过一次后
-             下一帧还会看到同一个圈。落点读数可能丢失，所以不能靠「子是否一致」判断，
-             改用「标记格 + 当时的锚盘」做指纹：同一格且锚盘没再变过 → 已经处理过。 */
-          if (mkT >= 0) {
-            var anchorFenNow = codesToBoardFen(anchor);
-            if (session.markerDoneSq === mkT && session.markerDoneFen === anchorFenNow) mkT = -1;
+          if (mkC < 10) mkF = -1;
+        }
+
+        /* ① 白点 + 白圈齐全 → 直接就是这一步 */
+        if (mkT >= 0 && mkF >= 0 && stepIsRuleLegal(anchor, mkF, mkT)) {
+          var pf = anchor[mkF];
+          var cap0 = anchor[mkT] || 0;
+          var nx0 = anchor.slice();
+          nx0[mkF] = 0;
+          nx0[mkT] = pf;
+          if (codesLegal(nx0) && codesPositionPlausible(nx0)) {
+            session.prevAnchorFen = session.anchorFen;
+            anchor = nx0;
+            session.anchorCodes = anchor;
+            session.anchorFen = codesToBoardFen(anchor);
+            session.lastMoveText = C.sqToUcci(mkF) + C.sqToUcci(mkT);
+            session.movePly = (session.movePly || 0) + 1;
+            session.plyGuessed = 0;
+            session.ruleFail = 0;
+            session.lastMoverSide = (pf <= 7) ? 'red' : 'black';
+            session.markerHit = (session.markerHit || 0) + 1;
+            session.markerBoth = (session.markerBoth || 0) + 1;
+            session.markerDoneSq = mkT;
+            session.markerDoneSeq = session.frameSeq;
+            session.turnUpdated = 1;
+            stepInfo = {
+              changed: stepInfo.changed, noise: [],
+              move: { from: mkF, to: mkT, piece: pf, captured: cap0 }
+            };
           }
-          if (mkT >= 0 && (anchor[mkT] || 0) !== 0 &&
-              (anchor[mkT] || 0) === (engCodes[mkT] || 0)) mkT = -1;
-          if (mkT >= 0) {
-            /* 在锚盘里反查能走到 mkT 的起点。优先「该格现在已空」（棋子确实走了），
-               否则退而求其次只看合法性 —— 但仍要求候选唯一，歧义就放弃。 */
-            var cands = [], candsEmpty = [];
-            for (var fi = 0; fi < 90; fi++) {
-              if (fi === mkT) continue;
-              var fp = anchor[fi] || 0;
-              if (!fp) continue;
-              if (!stepIsRuleLegal(anchor, fi, mkT)) continue;
-              cands.push(fi);
-              if ((engCodes[fi] || 0) === 0) candsEmpty.push(fi);
-            }
-            var pickF = candsEmpty.length === 1 ? candsEmpty[0]
-                      : (cands.length === 1 ? cands[0] : -1);
-            if (pickF >= 0) {
-              var mkPiece = anchor[pickF];
-              var mkCap = anchor[mkT] || 0;
-              var mkNext = anchor.slice();
-              mkNext[pickF] = 0;
-              mkNext[mkT] = mkPiece;
-              if (codesLegal(mkNext) && codesPositionPlausible(mkNext)) {
-                session.prevAnchorFen = session.anchorFen;
-                anchor = mkNext;
-                session.anchorCodes = anchor;
-                session.anchorFen = codesToBoardFen(anchor);
-                session.lastMoveText = C.sqToUcci(pickF) + C.sqToUcci(mkT);
-                session.movePly = (session.movePly || 0) + 1;
-                session.plyGuessed = 0;
-                session.ruleFail = 0;
-                session.lastMoverSide = (mkPiece <= 7) ? 'red' : 'black';
-                session.markerHit = (session.markerHit || 0) + 1;
-                session.markerDoneSq = mkT;
-                session.markerDoneFen = codesToBoardFen(anchor);   // 推进后的锚盘
-                stepInfo = {
-                  changed: stepInfo.changed, noise: [],
-                  move: { from: pickF, to: mkT, piece: mkPiece, captured: mkCap }
-                };
-              }
+        }
+
+        /* ② 只有白圈 → 在锚盘里反查唯一能走到该格的起点 */
+        if (!stepInfo.move && mkT >= 0) {
+          var cands = [], candsEmpty = [];
+          for (var fi = 0; fi < 90; fi++) {
+            if (fi === mkT) continue;
+            var fp0 = anchor[fi] || 0;
+            if (!fp0) continue;
+            if (!stepIsRuleLegal(anchor, fi, mkT)) continue;
+            cands.push(fi);
+            if ((engCodes[fi] || 0) === 0) candsEmpty.push(fi);
+          }
+          var pickF = candsEmpty.length === 1 ? candsEmpty[0]
+                    : (cands.length === 1 ? cands[0] : -1);
+          if (pickF >= 0) {
+            var mkPiece = anchor[pickF];
+            var mkCap = anchor[mkT] || 0;
+            var mkNext = anchor.slice();
+            mkNext[pickF] = 0;
+            mkNext[mkT] = mkPiece;
+            if (codesLegal(mkNext) && codesPositionPlausible(mkNext)) {
+              session.prevAnchorFen = session.anchorFen;
+              anchor = mkNext;
+              session.anchorCodes = anchor;
+              session.anchorFen = codesToBoardFen(anchor);
+              session.lastMoveText = C.sqToUcci(pickF) + C.sqToUcci(mkT);
+              session.movePly = (session.movePly || 0) + 1;
+              session.plyGuessed = 0;
+              session.ruleFail = 0;
+              session.lastMoverSide = (mkPiece <= 7) ? 'red' : 'black';
+              session.markerHit = (session.markerHit || 0) + 1;
+              session.markerDoneSq = mkT;
+              session.markerDoneSeq = session.frameSeq;
+              session.turnUpdated = 1;
+              stepInfo = {
+                changed: stepInfo.changed, noise: [],
+                move: { from: pickF, to: mkT, piece: mkPiece, captured: mkCap }
+              };
             }
           }
         }
@@ -1152,6 +1228,8 @@ var JJEngine = {
             session.movePly = (session.movePly || 0) + 1;
             session.plyGuessed = 0;
             session.ruleFail = 0;
+            session.turnUpdated = 1;
+            session.flipCooldown = 0;   // 识别成功时清冷却（正常走子不该被限流）
             /* 2.1.84：记下这一步是谁走的（编码 1~7 红、8~14 黑）。
                轮次判定改用它，不再依赖 movePly 奇偶，漏步可自愈。 */
             session.lastMoverSide = (stepInfo.move.piece <= 7) ? 'red' : 'black';
@@ -1191,6 +1269,7 @@ var JJEngine = {
               /* 重锚后轮次：能推断出走子方就用它（下一步轮到另一方），
                  推不出才退回「假设轮到我方」。 */
               session.lastMoverSide = failMover;
+              session.turnUpdated = 1;
               if (failMover) {
                 session.movePly = (session.movePly || 0) + 1;
               } else {
@@ -1229,41 +1308,10 @@ var JJEngine = {
               session.hiddenDstStreak = 0;
               stepResolved = true;
             }
-          } else {
-            /* 落点读不出来：高亮圈把它整格读成空，或读成超编兵种被配额修复丢掉，
-               或读数抖动导致 otherCnt 多于 1。共同点都是**配不出合法一步**，
-               但「恰好一枚棋子离开了某格」这个事实是清楚的（那一半不被圈遮住）。
-               此时落点坐标不可知，轮次却必须翻，否则永远卡在「等待对方」。
-               用连续 2 帧一致来排除单帧噪声（噪声下一帧就恢复，真走子不会）。 */
-            if (session.hiddenDstFrom === fromSq) {
-              session.hiddenDstStreak = (session.hiddenDstStreak || 0) + 1;
-            } else {
-              session.hiddenDstFrom = fromSq;
-              session.hiddenDstStreak = 1;
-            }
-            if (session.hiddenDstStreak >= 2) {
-              var leftPiece = anchor[fromSq];
-              session.lastMoverSide = (leftPiece <= 7) ? 'red' : 'black';
-              session.movePly = (session.movePly || 0) + 1;
-              session.plyGuessed = 1;      // 落点未知，轮次是推的，日志可追溯
-              session.ruleFail = 0;
-              /* 锚盘只清掉起点；落点留空，等后续帧识别出来再补
-                 （下面有「补回丢失棋子」逻辑，见 anchor 覆盖之前）。 */
-              var naHidden = anchor.slice();
-              naHidden[fromSq] = 0;
-              anchor = naHidden;
-              session.anchorCodes = anchor;
-              session.anchorFen = codesToBoardFen(anchor);
-              session.prevAnchorFen = '';
-              session.lastBoardFen = session.anchorFen;
-              session.lastResult = null;
-              session.lastDispatchedFen = '';
-              session.highlightLostPiece = leftPiece;   // 供后续帧补回
-              session.highlightInferred = (session.highlightInferred || 0) + 1;
-              session.hiddenDstFrom = -1;
-              session.hiddenDstStreak = 0;
-            }
           }
+          /* 落点读不出来时，这里不再单独翻轮次 ——
+             2.1.91 的「对称轮次翻转」已经统一兜住这种情况，
+             两边都做会导致同一帧 ply 被加两次（回归 S4 实测 ply 1→3）。 */
         }
 
         /* ★ 2.1.88：通用兜底 —— 上面 emptyCnt==1 覆盖不到的情况
@@ -1278,23 +1326,81 @@ var JJEngine = {
          * 用连续 2 帧一致排除单帧噪声后直接翻轮次。
          * 落点与兵种都留待后续帧识别补全，绝不把猜测写进锚盘。
          */
-        if (!stepResolved) {
-          var mySideNow = session.flipped ? 'black' : 'red';
-          var waitingOppNow = (session.lastMoverSide === mySideNow);
-          if (waitingOppNow) {
-            session.genChgStreak = (session.genChgStreak || 0) + 1;
-            if (session.genChgStreak >= 2) {
-              session.lastMoverSide = session.flipped ? 'red' : 'black';
-              session.movePly = (session.movePly || 0) + 1;
-              session.plyGuessed = 1;          // 轮次是推的，日志可追溯
-              session.ruleFail = 0;
-              session.highlightInferred = (session.highlightInferred || 0) + 1;
-              session.genChgStreak = 0;
-              session.lastResult = null;       // 丢掉旧建议，逼它按新轮次重算
-              session.lastDispatchedFen = '';
-            }
-          } else {
+        /* ★ 2.1.91：**对称轮次翻转** —— 不猜「谁走的」，只认「盘面变了」
+         *
+         * 前面的方案都卡在同一件事上：得先判断出"这步是谁走的"，判错就整盘乱。
+         * 但象棋是严格的双方交替，所以轮次其实只取决于**盘面变了几次**：
+         *     正在等对方 + 盘面变了 → 对方走了 → 轮到我方
+         *     轮到我方   + 盘面变了 → 我方走了 → 等对方
+         * 两边对称，谁走的根本不用管，也就不会因为认错子/认错颜色而卡死。
+         *
+         * 用连续 2 帧一致排除单帧噪声（噪声下一帧就恢复，真走子不会）。
+         * 走法与落点都不写进锚盘 —— 宁可这一帧盘面落后半拍，
+         * 也不能把猜测固化成锚盘（那会让后面每一步都错）。
+         */
+        /* 只有「看得出方向」的变化才算走子：
+             - 某格**从有子变空**（棋子离开了）     → emptyN
+             - 某格**从空变有子 / 兵种变了**（棋子来了）→ newN
+           单纯「锚盘有子、这一帧读不到」不算 —— 那是落点被高亮圈盖住的读数丢失，
+           把它当走子会在标记反推成功之后又翻一次（回归 S10 实测 ply 2→3）。
+           同理，刚被标记反推处理过的那一格也要排除。 */
+        var emptyN = 0, newN = 0;
+        for (var qi = 0; qi < 90; qi++) {
+          var av = anchor[qi] || 0, cv = engCodes[qi] || 0;
+          if (av && !cv) { if (qi !== session.markerDoneSq) emptyN++; }
+          else if (!av && cv) newN++;
+          else if (av && cv && av !== cv) newN++;
+        }
+        /* 冷却：翻转后若干帧内不再翻转。
+           落子动画 / 浮窗重绘会让盘面连续几帧都在变，没有冷却时会被当成
+           「走了一步、又走一步、又走一步」（真机实测 ply 0→3）。 */
+        if (session.flipCooldown > 0) session.flipCooldown--;
+
+        var mySideNowX = session.flipped ? 'black' : 'red';
+        var waitingOppX = (session.lastMoverSide === mySideNowX);
+        /* 我方回合要求「完整一步」（既有子离开、也有子到来），
+           这样纯读数抖动不会把我方的走子重复算成两步。 */
+        var dirOk = waitingOppX ? ((emptyN + newN) > 0)
+                                : (emptyN >= 1 && newN >= 1);
+
+        if (!stepResolved && session.lastMoverSide && !session.turnUpdated &&
+            session.flipCooldown <= 0 && dirOk) {
+          var mySideNow = mySideNowX;
+          var waitingOppNow = waitingOppX;
+          session.genChgStreak = (session.genChgStreak || 0) + 1;
+          if (session.genChgStreak >= 2) {
+            /* 翻转：等对方 → 记对方走；轮到我方 → 记我方走 */
+            session.lastMoverSide = waitingOppNow
+              ? (session.flipped ? 'red' : 'black')   // 对方
+              : mySideNow;                            // 我方
+            session.movePly = (session.movePly || 0) + 1;
+            session.turnUpdated = 1;
+            session.plyGuessed = 1;          // 轮次是推的，日志可追溯
+            session.ruleFail = 0;
+            session.highlightInferred = (session.highlightInferred || 0) + 1;
             session.genChgStreak = 0;
+            session.flipCooldown = 10;       // ~1.5s 冷却，避免连续误翻
+
+            /* ★ 2.1.94：翻轮次的**同时必须让盘面跟上**。
+               只翻轮次、不动锚盘的话，引擎会在一个早已不存在的局面上算棋，
+               真机上就表现为「给的建议指向一颗根本不在那个位置的棋子」
+               （用户看到的「马二进三，可马不在这儿」）。
+               条件：当前识别盘面合法、且与上一帧完全一致（说明已经稳定，
+               不是落子动画的中间态），才用它重锚。 */
+            var syncOk = codesLegal(engCodes) && codesPositionPlausible(engCodes);
+            if (syncOk && session.prevEngCodes &&
+                countCodesDiff(session.prevEngCodes, engCodes) === 0) {
+              anchor = Array.prototype.slice.call(engCodes);
+              session.anchorCodes = anchor;
+              session.anchorFen = codesToBoardFen(anchor);
+              session.prevAnchorFen = '';
+              session.lastBoardFen = session.anchorFen;
+              session.anchorSynced = (session.anchorSynced || 0) + 1;
+            }
+            session.prevEngCodes = Array.prototype.slice.call(engCodes);
+
+            session.lastResult = null;       // 丢掉旧建议，逼它按新轮次重算
+            session.lastDispatchedFen = '';
           }
         } else {
           session.genChgStreak = 0;

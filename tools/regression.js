@@ -97,9 +97,13 @@ function makeFixture(src, blackBottom) {
       /* 2.1.90：可注入「上一步落点标记」，用来测标记反推。
          S.markerSq 是屏幕坐标格号；rings 只在该格给高分（模拟游戏画的圈）。 */
       if (S.markerSq >= 0) {
+        /* 2.1.92：rings / centers 都是「白色像素个数」，阈值 15 / 10 */
         const rg = new Float32Array(90);
-        rg[S.markerSq] = 0.62;
+        rg[S.markerSq] = 0.09;                  // 落点白圈：环提升平均差
+        const ct = new Float32Array(90);
+        if (S.markerFromSq >= 0) ct[S.markerFromSq] = 20;   // 起点白点
         r.rings = rg;
+        r.centers = ct;
       }
       return r;
     },
@@ -274,16 +278,17 @@ function main() {
   });
   const m2 = m1.slice(); m2[27] = 0;          // 黑卒离开 27
   /* 36 故意不写子：模拟落点被高亮圈盖住、读数丢失 */
-  S4.S.markerSq = 36;                          // 落点标记
-  S4.frame('S9 对方走子·仅靠落点标记反推', m2, r => {
-    if (r.waitingOpponent) throw new Error('有落点标记就该立刻认出对方已走');
-    if (!r.needSearch) throw new Error('反推成功后应立刻派发搜索');
+  S4.S.markerFromSq = 27;                      // 起点白点（27 已空、锚盘里还有黑卒）
+  S4.S.markerSq = 36;                          // 落点白圈
+  S4.frame('S9 对方走子·白点+白圈直接定位', m2, r => {
+    if (r.waitingOpponent) throw new Error('有白点+白圈就该立刻认出对方已走');
+    if (!r.needSearch) throw new Error('定位成功后应立刻派发搜索');
   });
-  /* 标记格已在锚盘里（这一步早推过了）→ 不能重复推进 */
   S4.frame('S10 同一标记不重复推进', m2, r => {
     if (r.waitingOpponent) throw new Error('不该退回等待');
   });
   S4.S.markerSq = -1;
+  S4.S.markerFromSq = -1;
   /* ===== R. 2.1.84：轮次判定自愈（不靠 movePly 奇偶） =====
      真机症状：对方已经走子，浮窗还显示「等待对方走子」；我方走完箭头不消失。
      根因：轮次由 session.movePly % 2 推出，只要某一步漏识别、movePly 不再增长，

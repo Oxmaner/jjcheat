@@ -96,7 +96,7 @@
 #define JJ_HUD_TOP_HEIGHT       54.0
 
 /* 箭头线宽（point） */
-#define JJ_ARROW_WIDTH          7.0
+#define JJ_ARROW_WIDTH          4.0
 
 /* 建议走法箭头颜色 */
 /* 2.1.90：建议箭头/网格改用**青蓝色**。
@@ -104,9 +104,9 @@
    「高饱和红 / 亮金」找游戏自己画的落子高亮圈。原来的箭头是纯红 (255,51,51)，
    正好落进那个判据 —— 自己的箭头会被当成"游戏刚在这里落子"，直接带偏轮次。
    换到青蓝色后两边彻底分开：红/金 = 游戏的标记，青蓝 = 我们的建议。 */
-#define JJ_COLOR_ARROW          [UIColor colorWithRed:0.10 green:0.72 blue:1.00 alpha:0.92]
-#define JJ_COLOR_ARROW_HEAD     [UIColor colorWithRed:0.05 green:0.62 blue:1.00 alpha:0.98]
-#define JJ_COLOR_BOARD_LINE     [UIColor colorWithRed:0.25 green:0.78 blue:1.00 alpha:0.55]
+#define JJ_COLOR_ARROW          [UIColor colorWithRed:0.10 green:0.72 blue:1.00 alpha:0.28]
+#define JJ_COLOR_ARROW_HEAD     [UIColor colorWithRed:0.05 green:0.62 blue:1.00 alpha:0.38]
+#define JJ_COLOR_BOARD_LINE     [UIColor colorWithRed:0.25 green:0.78 blue:1.00 alpha:0.42]
 #define JJ_COLOR_PANEL_BG       [UIColor colorWithRed:0.04 green:0.05 blue:0.08 alpha:0.86]
 #define JJ_COLOR_TEXT_MAIN      [UIColor colorWithRed:1.00 green:0.95 blue:0.55 alpha:1.0]
 #define JJ_COLOR_TEXT_SUB       [UIColor colorWithRed:0.72 green:0.86 blue:1.00 alpha:1.0]

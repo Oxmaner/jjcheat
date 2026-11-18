@@ -1375,14 +1375,73 @@ class BoardRecognizer {
    * 返回该格外环的高亮像素占比（0~1）。
    */
   sampleRing(pixels, w, h, cx, cy, cell, gain) {
-    const r0 = cell * 0.36, r1 = cell * 0.52;
-    let hit = 0, n = 0;
+    /* ★ 2.1.95：改用「环提升对比」，参考 XiangqiCoach 的 LastMoveRecognizer。
+     *
+     * 它不数"白色像素"，而是比较**环带（0.44~0.53 cell）与圈外（0.60~0.70）的中性色**：
+     * 有白圈时环上明显更"白"，没圈时两者差不多。这样对整体亮度/色温不敏感 ——
+     * 真机抓帧要过 H.264，白圈会被压缩削弱，绝对白色阈值（L>200）在真机上根本抓不到。
+     *
+     * 中性色 = min(R,G,B)/max(R,G,B)，衡量"灰白程度"而不是亮度，
+     * 木色盘面（暖色、饱和度不低）和红黑字都不会被误判。
+     *
+     * 返回 24 个方向平均的「环上 - 环外」中性色差（-1~1）。
+     * 真机实测：有白圈 0.084、普通格最高 0.039、负值居多 —— 取 0.06 作阈值。
+     */
+    let total = 0;
     for (let i = 0; i < 24; i++) {
       const a = i * Math.PI / 12;
       const ca = Math.cos(a), sa = Math.sin(a);
-      for (let k = 0; k < 3; k++) {
-        const rr = r0 + (r1 - r0) * k / 2;
-        const x = Math.round(cx + ca * rr), y = Math.round(cy + sa * rr);
+      let pIn = 0, pOut = 0;
+      for (let k = 0; k < 4; k++) {
+        let rr = cell * (0.44 + 0.03 * k);
+        let x = Math.round(cx + ca * rr), y = Math.round(cy + sa * rr);
+        if (x >= 1 && y >= 1 && x < w - 1 && y < h - 1) {
+          const q = (y * w + x) * 4;
+          let R = pixels[q], G = pixels[q + 1], B = pixels[q + 2];
+          if (gain !== 1) {
+            R = R * gain > 255 ? 255 : (R * gain) | 0;
+            G = G * gain > 255 ? 255 : (G * gain) | 0;
+            B = B * gain > 255 ? 255 : (B * gain) | 0;
+          }
+          const mx = Math.max(R, G, B);
+          const nv = mx ? (Math.min(R, G, B) / mx) : 0;
+          if (nv > pIn) pIn = nv;
+        }
+        rr = cell * (0.60 + 0.0333 * k);
+        x = Math.round(cx + ca * rr); y = Math.round(cy + sa * rr);
+        if (x >= 1 && y >= 1 && x < w - 1 && y < h - 1) {
+          const q = (y * w + x) * 4;
+          let R = pixels[q], G = pixels[q + 1], B = pixels[q + 2];
+          if (gain !== 1) {
+            R = R * gain > 255 ? 255 : (R * gain) | 0;
+            G = G * gain > 255 ? 255 : (G * gain) | 0;
+            B = B * gain > 255 ? 255 : (B * gain) | 0;
+          }
+          const mx = Math.max(R, G, B);
+          const nv = mx ? (Math.min(R, G, B) / mx) : 0;
+          if (nv > pOut) pOut = nv;
+        }
+      }
+      total += (pIn - pOut);
+    }
+    return total / 24;
+  }
+
+  /**
+   * ★ 2.1.92：检测「起点白点」。
+   *
+   * 游戏除了在落点画白圈，还会在**起点那一格（此时已空）的中心**点一个小白点。
+   * 两者凑齐就是一条完整的「上一步」：白点 = from，白圈 = to —— 不用反推。
+   * 空格中心本来是木色（不白），所以这个判据在空位上格外干净：
+   * 实测起点 53、普通空位 0、有子格 9~43（有子格会因为棋子面偏亮而虚高，但那些格有子，直接跳过）。
+   *
+   * 返回中心区白色像素个数。
+   */
+  sampleCenterWhite(pixels, w, h, cx, cy, gain) {
+    let cnt = 0;
+    for (let dy = -8; dy <= 8; dy += 2) {
+      for (let dx = -8; dx <= 8; dx += 2) {
+        const x = cx + dx, y = cy + dy;
         if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) continue;
         const p = (y * w + x) * 4;
         let R = pixels[p], G = pixels[p + 1], B = pixels[p + 2];
@@ -1391,12 +1450,315 @@ class BoardRecognizer {
           G = G * gain > 255 ? 255 : (G * gain) | 0;
           B = B * gain > 255 ? 255 : (B * gain) | 0;
         }
-        n++;
-        if ((R > 140 && (R - G) > 55 && (R - B) > 45) ||
-            (R > 200 && G > 170 && B < 150 && (R - B) > 70)) hit++;
+        const L = 0.299 * R + 0.587 * G + 0.114 * B;
+        const sat = Math.max(R, G, B) - Math.min(R, G, B);
+        if (L > 200 && sat < 60) cnt++;
       }
     }
-    return n ? hit / n : 0;
+    return cnt;
+  }
+
+  /**
+   * ★ 2.1.96：**真正的自动标定** —— 直接从画面反解棋盘网格。
+   *
+   * 为什么需要：原来的「自动标定」其实是「学模板」，网格沿用上一次手动点的四角，
+   * 而手点天生有 ±30px 误差；唯一能纠错的 alignGridToOpening 又只认标准开局
+   * （代码注释原话：「凑不出这套分布（中局/大厅）就什么都不改」）。
+   * 于是中局看到的网格永远是歪的，识别也跟着歪。
+   *
+   * 本方法完全不依赖局面，任何画面（中局/残局/开局）都能用：
+   *
+   *   1. 暗线二值化 → 按列求和得到「列投影」，棋盘竖线处必然是尖峰
+   *   2. 对投影做**自相关**求周期 dx —— 比"找最强的几条线"稳得多，
+   *      因为棋子遮挡只会削低个别峰，不会破坏整体周期性
+   *   3. 枚举相位，让 9 条理论线尽量落在真实峰上 → 竖线 x 坐标
+   *   4. 横线被棋子压得更厉害，改用**竖线当探针**：在每条竖线两侧 ±4~5px 取暗像素，
+   *      横线经过时这些位置必然发暗，逐行统计即得干净的横向信号
+   *   5. 对横向信号再做一次自相关（周期约束在 dx 附近 —— 象棋单格近似正方形）
+   *      → 10 条横线 y 坐标
+   *   6. 四角 = 四条边界线的交点
+   *
+   * 真机实测（428×926 截图）：竖线间距 46.0、横线 44.0，四角与肉眼测量的
+   * 棋盘边框吻合到 ±1~2px，远优于手标的 ±30px。
+   *
+   * @returns {{corners:number[][], dx:number, dy:number}|null}
+   *          corners = [[左上],[右上],[右下],[左下]]，与 JJGridPt 的双线性插值约定一致
+   */
+  detectGrid(pixels, w, h) {
+    if (!w || !h || w < 120 || h < 160) return null;
+
+    /* ---------- 0. 预计算亮度图（后面要做多次邻域比较，先算一次省很多） ---------- */
+    const N = w * h;
+    const lum = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const q = i * 4;
+      lum[i] = 0.299 * pixels[q] + 0.587 * pixels[q + 1] + 0.114 * pixels[q + 2];
+    }
+
+    /* ---------- 1. 竖线：用「局部暗谷」而不是绝对亮度 ----------
+     *
+     * 这一步是整件事的关键。原先用「亮度 < 130 算暗」：
+     *   - 对局画面棋盘底色 L≈170，线 L≈100 → 能用
+     *   - 沙盘画面整体偏暗，棋盘底色 L≈120 → 底色也被算成"暗"，全糊成一片
+     * 改成「比左右各 4px 都暗 12 以上」后，判据只关心**局部凹陷**，
+     * 与整体曝光无关。两张风格迥异的截图因此得到**完全相同**的 9 条竖线
+     * （28/75/121/168/214/260/306/352/399），这是后面所有计算的基础。
+     */
+    /* ★ 所有像素量都必须按分辨率缩放。
+       算法最初是在 428×926 的截图上调的（邻域 ±4px、暗谷阈值 12），
+       而真机是 1284×2778 —— 宽度 3 倍。若直接用绝对值：
+         - 邻域只有 3px，采到的是线条内部而不是两侧盘面，凹陷测不出来
+         - 阈值 12 相对 8bit 亮度也太小，木纹噪声全被当成线
+       实测真机上会直接返回 null。统一按「基准宽 428」等比缩放。 */
+    const S = w / 428;
+    const NB = Math.max(2, Math.round(4 * S));      // 邻域半径
+    const DTH = 12 * S;                             // 暗谷深度阈值
+
+    const colProj = new Float32Array(w);
+    for (let x = NB; x < w - NB; x++) {
+      let c = 0;
+      for (let y = 0; y < h; y++) {
+        const base = y * w;
+        const v = lum[base + x];
+        if (v < lum[base + x - NB] - DTH && v < lum[base + x + NB] - DTH) c++;
+      }
+      colProj[x] = c;
+    }
+    let cmax = 0;
+    for (let x = 0; x < w; x++) if (colProj[x] > cmax) cmax = colProj[x];
+    if (cmax <= 0) return null;
+    const colN = new Float32Array(w);
+    for (let x = 0; x < w; x++) colN[x] = colProj[x] / cmax;
+
+    /* 9 条竖线：周期 8%~14% 屏宽、总宽 82%~98%、首线在左边缘 3%~12% 处 */
+    const vs = this._gridVote(colN, 9,
+      w * 0.08, w * 0.14,
+      w * 0.82, w * 0.98,
+      w * 0.03, w * 0.12, 0.55);
+    if (!vs) return null;
+    const dx = vs.d, xs = [];
+    for (let k = 0; k < 9; k++) xs.push(vs.x0 + k * dx);
+
+    /* ---------- 2. 横线探针：在竖线两侧 ±4~5px 取局部暗谷 ----------
+     * 横线被 32 个棋子压得七零八落，整行投影不可靠；
+     * 但棋子是圆的，压不到**所有**竖线旁边，所以在已知竖线位置取样信噪比高得多。
+     */
+    const probe = new Float32Array(h);
+    const offs = [-Math.round(5 * S), -NB, NB, Math.round(5 * S)];
+    for (let y = NB; y < h - NB; y++) {
+      const base = y * w;
+      let c = 0;
+      for (let k = 0; k < 9; k++) {
+        const cx = Math.round(xs[k]);
+        for (let oi = 0; oi < 4; oi++) {
+          const x = cx + offs[oi];
+          if (x < NB || x >= w - NB) continue;
+          const v = lum[base + x];
+          if (v < lum[(y - NB) * w + x] - DTH && v < lum[(y + NB) * w + x] - DTH) c++;
+        }
+      }
+      probe[y] = c;
+    }
+    let pmax = 0;
+    for (let y = 0; y < h; y++) if (probe[y] > pmax) pmax = probe[y];
+    if (pmax <= 0) return null;
+
+    /* ---------- 3. 横线：找「最长的连续等距峰序列」再外推到 10 条 ----------
+     * 为什么不直接投票选 10 条：棋盘上下各有一圈**外框线**，它同样强、同样等距，
+     * 投票会把外框当成第 1 条或第 11 条，整体偏一格（实测偏 46px，正好一格）。
+     * 改为「先锁定中间那串确定的线，再往外推」，并把 seq[0] 可能落在第 1 条
+     * 或第 2 条两种情形都试一遍。
+     */
+    const peaks = [];
+    for (let y = 2; y < h - 2; y++) {
+      if (probe[y] >= pmax * 0.45 && probe[y] >= probe[y - 1] && probe[y] >= probe[y + 1]) peaks.push(y);
+    }
+    const mg = [];
+    for (let i = 0; i < peaks.length; i++) {
+      const p = peaks[i];
+      if (mg.length && p - mg[mg.length - 1] <= 5) {
+        if (probe[p] > probe[mg[mg.length - 1]]) mg[mg.length - 1] = p;
+      } else mg.push(p);
+    }
+    if (mg.length < 4) return null;
+
+    /* 象棋单格近似正方形：dy ≈ 0.955 * dx（两幅真机截图实测 44/46） */
+    const dy0 = dx * 0.955;
+    const cands = [];
+    for (let ti = -3; ti <= 3; ti++) {
+      const dy = dy0 * (1 + ti * 0.02);
+      for (let i = 0; i < mg.length; i++) {
+        const seq = [];
+        for (let k = 0; k < 10; k++) {
+          const t = mg[i] + k * dy;
+          let bestP = -1, bestV = -1;
+          for (let j = 0; j < mg.length; j++) {
+            if (Math.abs(mg[j] - t) <= 2.5 && probe[mg[j]] > bestV) { bestV = probe[mg[j]]; bestP = mg[j]; }
+          }
+          if (bestP >= 0) seq.push(bestP); else break;
+        }
+        if (seq.length < 6) continue;
+        for (let off = 0; off <= 1; off++) {
+          const y0 = seq[0] - off * dy;
+          const y9 = y0 + 9 * dy;
+          if (y0 < 0 || y9 > h + 5) continue;
+          cands.push({ dy: dy, y0: y0, y9: y9, len: seq.length,
+                       centerDist: Math.abs((y0 + y9) / 2 - h / 2) });
+        }
+      }
+    }
+    if (!cands.length) return null;
+
+    /* 选解：序列越长越可信；同样长时取**棋盘中心最接近画面中心**的
+       （游戏 UI 都把棋盘垂直摆中间，这条能稳定排除"多推一格"的错解）。 */
+    cands.sort(function (a, b) {
+      if (b.len !== a.len) return b.len - a.len;
+      return a.centerDist - b.centerDist;
+    });
+    const pick = cands[0];
+    const y0 = pick.y0, y9 = pick.y9;
+
+    const bw = xs[8] - xs[0], bh = y9 - y0;
+    if (bw < w * 0.35 || bh < h * 0.25) return null;
+    const ratio = bw / bh;
+    if (ratio < 0.78 || ratio > 1.12) return null;
+
+    return {
+      corners: [[xs[0], y0], [xs[8], y0], [xs[8], y9], [xs[0], y9]],
+      dx: dx, dy: pick.dy, xs: xs, y0: y0,
+      vHits: vs.hits, hHits: pick.len
+    };
+  }
+
+  /**
+   * 网格投票：在投影里找「count 条等距线」的最优位置。
+   *
+   * 为什么不用自相关：自相关擅长连续周期信号，而棋盘线是**离散的几条尖峰**，
+   * 加上棋子遮挡和 HUD 边缘，自相关会在真实周期的一半/两倍处给出更大的峰
+   * （实测真实周期 46，最大值却落在 38）。直接枚举 (周期, 起点) 并统计
+   * 「有几条线真的压在峰上」，判据更直接也更稳。
+   *
+   * @returns {{d:number,x0:number,hits:number,score:number}|null}
+   */
+  _gridVote(proj, count, dLo, dHi, spanLo, spanHi, startLo, startHi, hitTh) {
+    const n = proj.length;
+    let best = null;
+    const step = 0.25, posStep = 0.5;
+    for (let d = dLo; d <= dHi; d += step) {
+      const span = (count - 1) * d;
+      if (span < spanLo || span > spanHi) continue;
+      for (let x0 = startLo; x0 <= startHi; x0 += posStep) {
+        let hits = 0, score = 0, devSum = 0, devN = 0;
+        for (let k = 0; k < count; k++) {
+          const xk = x0 + k * d;
+          if (xk < -1 || xk > n) continue;
+          const lo = Math.max(0, Math.round(xk) - 2);
+          const hi = Math.min(n, Math.round(xk) + 3);
+          let v = 0, at = -1;
+          for (let i = lo; i < hi; i++) { if (proj[i] > v) { v = proj[i]; at = i; } }
+          if (v >= (hitTh || 0.72)) hits++;
+          score += v;
+          if (at >= 0) { devSum += Math.abs(at - xk); devN++; }
+        }
+        if (hits < count - 2) continue;            // 至少 7/9 或 8/10 压在峰上
+        /* ★ 等距偏差：线的理论位置必须真的压在峰中心上。
+           只看"命中数 + 强度"分不出真假 —— 棋盘线之外还有木纹、棋子边缘等暗线，
+           它们的总强度甚至更高（实测错误解 x0=64 得 8.44，真解只有 7.5）。
+           但假线的峰位置是散的，平均偏差压不下去，真解的峰几乎正对理论位置。 */
+        const avgDev = devN ? devSum / devN : 99;
+        if (avgDev > 1.1) continue;
+        if (best === null || hits > best.hits ||
+            (hits === best.hits && avgDev < best.avgDev - 0.05) ||
+            (hits === best.hits && Math.abs(avgDev - best.avgDev) <= 0.05 && score > best.score)) {
+          best = { d: d, x0: x0, hits: hits, score: score, avgDev: avgDev };
+        }
+      }
+    }
+    return best;
+  }
+
+  /**
+   * 自相关候选周期：返回 [lo,hi] 内自相关的**前几个局部峰**（从大到小）。
+   *
+   * 为什么要多个而不是一个：自相关在「真实周期的一半/两倍」以及
+   * 「格距 + 棋子间距」的混合周期处也会出现峰。真机实测真实周期 46，
+   * 但最大值落在 38 —— 只取一个必然选错。交给上层用"等距吻合度"仲裁。
+   */
+  _autocorrPeaks(seq, lo, hi, topN) {
+    const n = seq.length;
+    if (n < 40) return [];
+    if (hi >= n - 2) hi = n - 3;
+    if (lo < 2 || lo > hi) return [];
+    let m = 0;
+    for (let i = 0; i < n; i++) m += seq[i];
+    m /= n;
+    const vals = [];
+    for (let k = lo; k <= hi; k++) {
+      let s = 0;
+      for (let i = 0; i + k < n; i++) s += (seq[i] - m) * (seq[i + k] - m);
+      vals.push({ k: k, v: s / (n - k) });
+    }
+    const peaks = [];
+    for (let i = 1; i < vals.length - 1; i++) {
+      if (vals[i].v >= vals[i - 1].v && vals[i].v >= vals[i + 1].v) peaks.push(vals[i]);
+    }
+    peaks.sort((a, b) => b.v - a.v);
+    return peaks.slice(0, topN || 3).map(p => p.k);
+  }
+
+  /** 自相关求周期：返回 [lo,hi] 内让自相关最大的滞后量 */
+  _autocorrPeriod(seq, lo, hi) {
+    const n = seq.length;
+    if (n < 40 || hi >= n) hi = Math.min(hi, n - 5);
+    if (lo < 2 || lo > hi) return 0;
+    let m = 0;
+    for (let i = 0; i < n; i++) m += seq[i];
+    m /= n;
+    let bestK = 0, bestV = -Infinity;
+    for (let k = lo; k <= hi; k++) {
+      let s = 0;
+      for (let i = 0; i + k < n; i++) s += (seq[i] - m) * (seq[i + k] - m);
+      s /= (n - k);
+      if (s > bestV) { bestV = s; bestK = k; }
+    }
+    return bestK;
+  }
+
+  /** 给定周期，找最佳相位，使 count 条线尽量落在投影峰上 */
+  _phaseFit(seq, d, count, span) {
+    const n = seq.length;
+    if (!d || !count) return null;
+    let mx = 0;
+    for (let i = 0; i < n; i++) if (seq[i] > mx) mx = seq[i];
+    if (mx <= 0) return null;
+    let best = null;
+    /* start 的候选只取投影里较强的位置，避免全量枚举 */
+    const cand = [];
+    for (let i = 1; i < n - 1; i++) {
+      if (seq[i] >= mx * 0.45 && seq[i] >= seq[i - 1] && seq[i] >= seq[i + 1]) cand.push(i);
+    }
+    const starts = cand.slice(0, 60);
+    for (let ci = 0; ci < starts.length; ci++) {
+      for (let k0 = 0; k0 < 3; k0++) {
+        const y0 = starts[ci] - k0 * d;
+        if (y0 < -d * 0.5 || y0 + (count - 1) * d > n - 1 + d * 0.5) continue;
+        let sc = 0, hitn = 0;
+        for (let k = 0; k < count; k++) {
+          const yi = Math.round(y0 + k * d);
+          const v = (yi >= 0 && yi < n) ? seq[yi] / mx : 0;
+          sc += v;
+          if (v >= 0.5) hitn++;
+        }
+        /* 先看命中条数（抗遮挡），再看总得分 */
+        if (best === null || hitn > best.hitn || (hitn === best.hitn && sc > best.sc)) {
+          best = { sc: sc, y0: y0, d: d, hitn: hitn };
+        }
+      }
+    }
+    if (!best || best.hitn < count - 4) return null;
+    const out = [];
+    for (let k = 0; k < count; k++) out.push(best.y0 + k * best.d);
+    return out;
   }
 
   /**
@@ -1454,10 +1816,14 @@ class BoardRecognizer {
     /* 2.1.90：顺手把每格的「上一步标记」外环占比算出来。
        90 格 × 24 角度 × 3 半径 = 6480 次采样，比模板匹配便宜得多。 */
     const rings = new Float32Array(90);
+    const centers = new Float32Array(90);
     for (let rq = 0; rq < 90; rq++) {
-      rings[rq] = this.sampleRing(pixels, w, h, pts[rq * 2], pts[rq * 2 + 1], cell, gain);
+      const px = pts[rq * 2], py = pts[rq * 2 + 1];
+      rings[rq] = this.sampleRing(pixels, w, h, px, py, cell, gain);
+      centers[rq] = this.sampleCenterWhite(pixels, w, h, px, py, gain);
     }
     this.lastRings = rings;
+    this.lastCenters = centers;
     // 浮窗（画中画）会一起被截进截图里，盖住的那几格读出来一定是浮窗自己的画面，
     // 所以整格作废（保留上一帧的值），而不是拿去识别。
     this.pipRect = findPipRect(pixels, w, h, pts);
@@ -2168,7 +2534,7 @@ class BoardRecognizer {
     this.lastConf = Array.prototype.slice.call(conf);
     this.lastRanked = rankedCodes.map(function (a) { return a ? a.slice(0, 3) : []; });
     return { grid, conf, codes, tplFail, repaired: repaired, hidden: hidden,
-             hiddenCount: hiddenCount, rings: this.lastRings };
+             hiddenCount: hiddenCount, rings: this.lastRings, centers: this.lastCenters };
   }
 
   /**
