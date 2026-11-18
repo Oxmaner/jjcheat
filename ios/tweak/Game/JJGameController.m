@@ -73,6 +73,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 @property (nonatomic, assign) NSTimeInterval lastProcessTime;
 @property (nonatomic, assign) NSTimeInterval processNotBefore;
 @property (nonatomic, assign) BOOL autoCalibrating;
+/* 2.1.99：几何标定是否已尝试（每个标定周期只做一次） */
+@property (nonatomic, assign) BOOL gridDetectTried;
 /* 重标定必须学成才采纳，失败回滚 */
 @property (nonatomic, assign) BOOL calibrationPending;
 @property (nonatomic, assign) NSTimeInterval lastHeartbeatTs;
@@ -799,6 +801,7 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     self.lastFingerprint = nil;
     self.processNotBefore = 0;
     self.autoCalibrating = YES;
+    self.gridDetectTried = NO;
     self.calibrationPending = YES;
     self.state = JJGameStateWaitingBoard;
     [self startTimer];
@@ -1025,6 +1028,43 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     /* ---- 学习阶段：整段异步，主线程不等 ---- */
     if (!self.learnedBoard) {
         if (now - self.lastLearnAttempt < JJ_LEARN_RETRY_GAP) return;
+
+        /* ★ 2.1.99：**先走独立的几何标定通道**，不等模板学习。
+         *
+         * 几何检测（找 9 竖 10 横反解四角）和模板学习（认 90 格兵种）是两件事，
+         * 但原来捆在一条链上：learnBoard 失败 → finalCorners 回退 → 网格永不更新。
+         * 真机实锤：同一份抓帧离线跑 learnAndRefine 是 verifyDiff=0，
+         * 而真机 HUD 报「学习未完成」，网格停在旧的 32~394（棋盘实际 28~399）。
+         *
+         * 现在拆成独立调用：拿到四角直接采纳 + 落盘，学习成不成都不影响网格。 */
+        if (!self.gridDetectTried) {
+            self.gridDetectTried = YES;
+            self.busy = YES;
+            __weak typeof(self) wsG = self;
+            [[JJVisionBridge shared] detectGridWithPixels:rgba
+                                                    width:w
+                                                   height:h
+                                                 callback:^(NSDictionary *gi, NSError *eG) {
+                __strong typeof(wsG) selfG = wsG;
+                if (!selfG) return;
+                selfG.busy = NO;
+                id csRaw = gi[@"corners"];
+                BOOL okG = ([csRaw isKindOfClass:[NSArray class]] && [(NSArray *)csRaw count] == 4);
+                if (okG) {
+                    NSArray *cs = (NSArray *)csRaw;
+                    BOOL adopted = [[JJCalibrator shared] adoptRefinedCorners:cs];
+                    if (adopted) {
+                        [[JJCalibrator shared] saveAutoCalibratedCorners:cs width:w height:h];
+                        [[JJHUDWindow shared] showStatus:@"几何标定完成 · 网格已对齐"];
+                    }
+                    NSLog(@"[JJCheat] 几何标定 %@ 四角=%@", adopted ? @"已采纳" : @"被体检拒绝", cs);
+                } else {
+                    NSLog(@"[JJCheat] 几何标定失败（未拿到四角），继续走模板学习");
+                }
+            }];
+            return;
+        }
+
         self.lastLearnAttempt = now;
         self.busy = YES;
         self.tickCount++;

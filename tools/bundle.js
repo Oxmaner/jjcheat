@@ -208,6 +208,36 @@ var JJEngine = {
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
+  /**
+   * ★ 2.1.99：**独立的棋盘网格检测接口** —— 不经过 learnBoard。
+   *
+   * 为什么必须拆出来：几何检测（找 9 竖 10 横）和模板学习（认 90 格兵种）
+   * 是两件独立的事，但原来捆在 learnAndRefine 一条链里 —— 学习失败就整条丢。
+   * 真机上的表现就是：detectGrid 明明能算对（离线同一份抓帧 verifyDiff=0），
+   * 但 OC 侧拿到的仍是旧四角，网格永远不更新。
+   *
+   * 现在 OC 可以直接调这个接口：拿到四角就采纳 + 落盘，
+   * 与学习成败彻底解耦。
+   *
+   * @returns {Array} [[左上],[右上],[右下],[左下]]；失败返回 []
+   */
+  detectBoardGrid: function (pixels, w, h) {
+    try {
+      if (!REC || !REC.BoardRecognizer) return [];
+      /* detectGrid 只用 w/h，不依赖 corners；给个占位四角即可 */
+      var rec = new REC.BoardRecognizer({
+        corners: [[0, 0], [w, 0], [w, h], [0, h]],
+        enableLowConfRefine: false
+      });
+      if (typeof rec.detectGrid !== 'function') return [];
+      var g = rec.detectGrid(pixels, w, h);
+      if (!g || !g.corners || g.corners.length !== 4) return [];
+      return g.corners;
+    } catch (e) {
+      return [];
+    }
+  },
+
   setCorners: function (corners) {
     session.corners = corners;
     if (!session.recognizer) {
