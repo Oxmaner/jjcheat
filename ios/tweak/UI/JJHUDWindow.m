@@ -373,7 +373,13 @@ static NSString *JJFormatNodes(NSInteger nodes) {
      *
      * 网格是「几何状态」，与「分析结果」的去重无关，必须每次都同步。
      */
-    self.hudView.gridPts = points;
+    /* 网格坐标变了就要**立刻重绘** —— 末尾那句 setNeedsDisplay 同样在这个
+       early-return 之下，只提前赋值而不重绘的话，画面依旧看不到网格。
+       只在真的变化时重绘，避免每帧无谓刷新。 */
+    if (![self.hudView.gridPts isEqualToArray:(points ?: @[])]) {
+        self.hudView.gridPts = points;
+        [self.hudView setNeedsDisplay];
+    }
 
     if ([key isEqualToString:self.lastResultKey] && !self.topPanel.hidden) return;
     self.lastResultKey = key;
