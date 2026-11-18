@@ -423,18 +423,22 @@ static NSString *JJFormatNodes(NSInteger nodes) {
     } else if (pending) {
         [sub appendString:@" · 正在搜索"];
     }
-    /* 2.1.85 诊断（临时）：d=变化格数 mv=最近走子方 st=本帧是否配出走法 inf=兜底命中次数
-       真机没有 log 命令，靠这一行定位「对方走子不认」到底卡在哪一环。 */
+    /* 2.1.87 诊断（临时）：第二行**整行换成识别出的盘面 FEN**，用来和眼睛看到的对比。
+       d=变化格数 mv=最近走子方 st=是否配出走法 i=兜底命中。 */
     {
+        NSString *board = result[@"dbgBoard"] ?: @"";
+        NSRange sp = [board rangeOfString:@" "];
+        if (sp.location != NSNotFound) board = [board substringToIndex:sp.location];
         id d = result[@"diffChanged"], mv = result[@"dbgMover"],
-           st = result[@"dbgStep"], inf = result[@"dbgInferred"],
-           sk = result[@"skipReason"];
-        if (d != nil || mv != nil) {
-            [sub appendFormat:@" │ d%@ mv%@ st%f inf%@ %@",
-             d ?: @"-", mv ?: @"-", [st doubleValue], inf ?: @"-", sk ?: @""];
+           st = result[@"dbgStep"], inf = result[@"dbgInferred"];
+        if (board.length || d != nil) {
+            self.lineSub.text = [NSString stringWithFormat:@"%@  d%@ %@ st%@ i%@",
+                                 board.length ? board : @"(空)", d ?: @"-",
+                                 mv ?: @"-", st ?: @"-", inf ?: @"-"];
+        } else {
+            self.lineSub.text = sub;
         }
     }
-    self.lineSub.text = sub;
 
     if (self.topPanel.hidden) [self layoutTopPanel];   // 首次显示时保险再摆一次
     self.topPanel.hidden = NO;

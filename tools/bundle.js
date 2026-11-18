@@ -1009,7 +1009,7 @@ var JJEngine = {
        * 起点格取（那是没被圈盖住的原位置，识别是准的），落点只需知道坐标。
        * 最后仍用 stepIsRuleLegal + codesLegal 双重把关，噪声不会被误当走子。
        */
-      if (!stepInfo.move && !reseat && stepInfo.changed >= 1 && stepInfo.changed <= 4) {
+      if (!stepInfo.move && !reseat && stepInfo.changed >= 1 && stepInfo.changed <= 8) {
         var fromSq = -1, emptyCnt = 0;
         for (var ei = 0; ei < 90; ei++) {
           if ((anchor[ei] || 0) !== 0 && (engCodes[ei] || 0) === 0) { emptyCnt++; fromSq = ei; }
@@ -1451,6 +1451,10 @@ var JJEngine = {
     out.dbgMover = session.lastMoverSide || '-';
     out.dbgInferred = session.highlightInferred || 0;
     out.dbgStep = stepInfo.move ? 1 : 0;
+    /* 2.1.87 诊断：把识别出的「屏幕原样盘面」透给 HUD。
+       真机没有 log 命令，只有把 FEN 摆在眼前才能确认「插件看到的盘面」
+       到底和眼睛看到的一致不一致 —— 这是判断「认错子」还是「没跟上」的唯一办法。 */
+    out.dbgBoard = session.lastRawFen || session.lastBoardFen || '';
     out.anchorFen = session.anchorFen || '';
     out.flipped = session.flipped ? 1 : 0;
     out.unsureCount = session.lowConfCount || 0;
