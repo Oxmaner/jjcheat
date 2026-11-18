@@ -1067,6 +1067,26 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
 #pragma mark - 学习结果
 
 - (void)handleLearnResult:(NSDictionary *)info rgba:(NSData *)rgba width:(int)w height:(int)h {
+    /* ★ 2.1.97：**几何检测的网格先采纳，不等模板学习**。
+     *
+     * learnBoard 干的是「学 90 格模板」，必须有标准开局的 32 个棋子才成功；
+     * 空棋盘、中局、残局都必然失败。而 detectGrid 是纯几何反解（找 9 竖 10 横），
+     * **空棋盘恰恰是最准的场景**（没有任何棋子遮挡线条）。
+     *
+     * 过去两者捆在一条链路上，几何算得再准，也会因为"模板没学成"被整条否决，
+     * 网格于是永远停在旧坐标。真机实测证据：插件网格 x=32~394，而棋盘实际
+     * x=28~399 —— 窄了 9px，两头各偏 4~5px，边缘棋子必然读错。
+     */
+    NSArray *gridC = info[@"gridCorners"];
+    if (gridC.count == 4) {
+        BOOL adoptedG = [[JJCalibrator shared] adoptRefinedCorners:gridC];
+        if (adoptedG && self.autoCalibrating) {
+            [[JJCalibrator shared] saveAutoCalibratedCorners:gridC width:w height:h];
+        }
+        NSLog(@"[JJCheat] 几何标定：%@ 四角=%@",
+              adoptedG ? @"已采纳" : @"被体检拒绝", gridC);
+    }
+
     if (!info || [info[@"templateCount"] integerValue] <= 0) {
         /* 每 5 次留一条：旧 engine.js 接口缺失时 info 恒 nil，不能静默 */
         self.learnFailCount++;

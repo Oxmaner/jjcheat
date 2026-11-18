@@ -705,6 +705,7 @@ var JJEngine = {
         fast.refineCorners = refined;
         fast.finalCorners = refined;
         fast.refineError = err;
+        fast.gridCorners = gridDet ? gridDet.corners : null;
         return alignFields(fast);
       }
     }
@@ -713,7 +714,10 @@ var JJEngine = {
     try { rBase = JJEngine.learnBoard(pixels, w, h); dBase = rBase.verifyDiff; }
     catch (e4) {
       return { verifyDiff: 999, ok: 0, templateCount: 0,
-               finalCorners: base || session.corners || [], refineError: String(e4 && e4.message || e4) };
+               finalCorners: base || session.corners || [],
+               gridCorners: gridDet ? gridDet.corners : null,
+               gridDetected: gridDet ? 1 : 0,
+               refineError: String(e4 && e4.message || e4) };
     }
 
     var accepted = (rRef && dRef < dBase) ? 1 : 0;
@@ -730,6 +734,13 @@ var JJEngine = {
     out.diffAfter = accepted ? dRef : dBase;
     out.refineCorners = refined || null;
     out.finalCorners = accepted ? refined : (base || session.corners || []);
+    /* ★ 2.1.97：把几何检测的结果单独带出去。
+       learnBoard 是"学 90 格模板"，需要开局 32 子才成功；空棋盘/中局必然失败。
+       但 detectGrid 是纯几何反解，**空棋盘恰恰最准**。过去两者捆在一起，
+       几何算对了也因为"模板没学成"被整条否决，网格于是永远停在旧坐标
+       （真机实测：网格 32~394 而棋盘 28~399，窄了 9px）。
+       现在让 OC 侧即使学习失败也能采纳 gridCorners。 */
+    out.gridCorners = gridDet ? gridDet.corners : null;
     out.refineError = err;
     return alignFields(out);
   },
