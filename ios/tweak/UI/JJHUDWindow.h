@@ -48,6 +48,9 @@ typedef NS_ENUM(NSInteger, JJHUDMode) {
 /** 进入四点标定；完成后回调（屏幕 point 坐标四角） */
 - (void)beginCalibrationWithCompletion:(void (^)(NSArray<NSValue *> *corners))completion;
 
+/** 2.1.105：只刷新网格并重绘 —— 标定完成后立刻让用户看到网格，不必等学习成功 */
+- (void)applyGridPoints:(NSArray<NSArray<NSNumber *> *> *)pts;
+
 /** 隐藏 / 显示整层 */
 - (void)setHUDHidden:(BOOL)hidden;
 

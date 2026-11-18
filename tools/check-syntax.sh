@@ -151,7 +151,6 @@ if [ -f "$CTRL" ]; then
         return 1
     }
     check_case JJMenuActionPlugin          setPluginEnabled
-    check_case JJMenuActionAutoCalibrate   autoCalibrate
     check_case JJMenuActionManualCalibrate manualCalibrate
     check_case JJMenuActionHUD             toggleHUD
     check_case JJMenuActionResetBoard      resetToStartPosition

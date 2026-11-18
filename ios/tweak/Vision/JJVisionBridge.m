@@ -271,38 +271,6 @@ static NSString *JJScriptFingerprint(NSData *d) {
     });
 }
 
-- (void)detectGridWithPixels:(NSData *)rgba
-                       width:(int)w
-                      height:(int)h
-                    callback:(JJVisionResultBlock)callback {
-    if (![self loadEngine]) {
-        if (callback) dispatch_async(dispatch_get_main_queue(), ^{ callback(nil, nil); });
-        return;
-    }
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(self.engineQueue, ^{
-        __strong typeof(weakSelf) self2 = weakSelf;
-        NSDictionary *out = nil;
-        if (self2 && self2.ctx) {
-            JSContext *ctx = self2.ctx;
-            JSValue *arrVal = [self2 makePixelArray:rgba width:w height:h];
-            if (arrVal) {
-                JSValue *fn = ctx[@"JJEngine"][@"detectBoardGrid"];
-                if (fn && !fn.isUndefined) {
-                    JSValue *res = [fn callWithArguments:@[arrVal, @(w), @(h)]];
-                    /* JSValue 没有 isArray：直接 toArray，非数组/空会返回 nil */
-                    NSArray *cs = (res && !res.isUndefined && !res.isNull) ? [res toArray] : nil;
-                    if (cs && cs.count == 4) out = @{ @"corners": cs };
-                    NSLog(@"[JJCheat] 几何检测: %@ corners=%@", out ? @"成功" : @"失败", cs ?: @"-");
-                } else {
-                    NSLog(@"[JJCheat] JS 接口缺失: JJEngine.detectBoardGrid");
-                }
-            }
-        }
-        if (callback) dispatch_async(dispatch_get_main_queue(), ^{ callback(out, nil); });
-    });
-}
-
 - (void)learnAndRefineWithPixels:(NSData *)rgba
                            width:(int)w
                           height:(int)h

@@ -44,20 +44,6 @@ typedef void (^JJVisionResultBlock)(NSDictionary * _Nullable result, NSError * _
                           height:(int)h
                      baseCorners:(nullable NSArray<NSArray<NSNumber *> *> *)baseCorners
                         callback:(JJVisionResultBlock)callback;
-/**
- * ★ 2.1.99：独立的棋盘网格几何检测 —— **不走 learnBoard**。
- *
- * 找 9 条竖线 + 10 条横线反解四角，与「学 90 格模板」完全解耦。
- * 空棋盘/中局/残局都能用（这些场景 learnBoard 必然失败），
- * 而空棋盘反而是几何检测最准的时候（没有棋子遮挡线条）。
- *
- * callback 在主线程回调，result 为 @{@"corners": @[[nsnumber,nsnumber],...]}，
- * 检测失败时 result 为 nil。
- */
-- (void)detectGridWithPixels:(NSData *)rgba
-                       width:(int)w
-                      height:(int)h
-                    callback:(JJVisionResultBlock)callback;
 
 /** 识别一帧（异步，回调主线程）。2.1.0 起不再传入思考时间。 */
 - (void)processPixels:(NSData *)rgba

@@ -208,36 +208,6 @@ var JJEngine = {
   C: C,
 
   /** 初始化 / 更新四点标定  corners = [[x,y],[x,y],[x,y],[x,y]] */
-  /**
-   * ★ 2.1.99：**独立的棋盘网格检测接口** —— 不经过 learnBoard。
-   *
-   * 为什么必须拆出来：几何检测（找 9 竖 10 横）和模板学习（认 90 格兵种）
-   * 是两件独立的事，但原来捆在 learnAndRefine 一条链里 —— 学习失败就整条丢。
-   * 真机上的表现就是：detectGrid 明明能算对（离线同一份抓帧 verifyDiff=0），
-   * 但 OC 侧拿到的仍是旧四角，网格永远不更新。
-   *
-   * 现在 OC 可以直接调这个接口：拿到四角就采纳 + 落盘，
-   * 与学习成败彻底解耦。
-   *
-   * @returns {Array} [[左上],[右上],[右下],[左下]]；失败返回 []
-   */
-  detectBoardGrid: function (pixels, w, h) {
-    try {
-      if (!REC || !REC.BoardRecognizer) return [];
-      /* detectGrid 只用 w/h，不依赖 corners；给个占位四角即可 */
-      var rec = new REC.BoardRecognizer({
-        corners: [[0, 0], [w, 0], [w, h], [0, h]],
-        enableLowConfRefine: false
-      });
-      if (typeof rec.detectGrid !== 'function') return [];
-      var g = rec.detectGrid(pixels, w, h);
-      if (!g || !g.corners || g.corners.length !== 4) return [];
-      return g.corners;
-    } catch (e) {
-      return [];
-    }
-  },
-
   setCorners: function (corners) {
     session.corners = corners;
     if (!session.recognizer) {
@@ -628,24 +598,7 @@ var JJEngine = {
     var base = (baseCorners && baseCorners.length === 4) ? baseCorners : null;
     if (base) JJEngine.setCorners(base);
 
-    /* ★ 2.1.96：**先做真正的自动标定** —— 直接从像素反解棋盘网格。
-     *
-     * 原来这条链路的顺序是「学模板 → alignGridToOpening（只认标准开局）」，
-     * 中局时对齐直接放弃，网格沿用上次手点的四角（±30px 误差），于是永远歪。
-     *
-     * 现在先用检测器从画面上把 9 竖 × 10 横的网格量出来（不依赖局面），
-     * 成功就以它为准 —— 手点四角只作为"检测失败时的兜底"。
-     */
-    var gridDet = null;
-    try {
-      if (session.recognizer && session.recognizer.detectGrid) {
-        gridDet = session.recognizer.detectGrid(pixels, w, h);
-      }
-    } catch (eGd) { gridDet = null; }
-    if (gridDet && gridDet.corners) {
-      base = gridDet.corners.map(function (p) { return [p[0], p[1]]; });
-      JJEngine.setCorners(base);
-    }
+    /* 2.1.105：自动标定已移除，四角一律来自手动四点标定 */
 
     /* ★ 2.1.58 开局匹配滤波对齐：先用「已知开局 32 个位置」对整帧像素反解真实网格，
        再进入 refineGrid / learnBoard。
@@ -669,9 +622,6 @@ var JJEngine = {
     }
     /** 把对齐诊断挂到返回值上（fast 路径与主路径共用） */
     function alignFields(o) {
-      o.gridDetected = gridDet ? 1 : 0;
-      o.gridDx = gridDet ? Math.round(gridDet.dx * 10) / 10 : -1;
-      o.gridDy = gridDet ? Math.round(gridDet.dy * 10) / 10 : -1;
       o.alignAccepted = alignR ? (alignR.accepted ? 1 : 0) : -1;
       o.alignAlready = (alignR && alignR.already) ? 1 : 0;
       o.alignOccHit = alignR ? alignR.occHit : -1;
@@ -735,7 +685,6 @@ var JJEngine = {
         fast.refineCorners = refined;
         fast.finalCorners = refined;
         fast.refineError = err;
-        fast.gridCorners = gridDet ? gridDet.corners : [];
         return alignFields(fast);
       }
     }
@@ -745,8 +694,6 @@ var JJEngine = {
     catch (e4) {
       return { verifyDiff: 999, ok: 0, templateCount: 0,
                finalCorners: base || session.corners || [],
-               gridCorners: gridDet ? gridDet.corners : [],
-               gridDetected: gridDet ? 1 : 0,
                refineError: String(e4 && e4.message || e4) };
     }
 
@@ -764,13 +711,6 @@ var JJEngine = {
     out.diffAfter = accepted ? dRef : dBase;
     out.refineCorners = refined || null;
     out.finalCorners = accepted ? refined : (base || session.corners || []);
-    /* ★ 2.1.97：把几何检测的结果单独带出去。
-       learnBoard 是"学 90 格模板"，需要开局 32 子才成功；空棋盘/中局必然失败。
-       但 detectGrid 是纯几何反解，**空棋盘恰恰最准**。过去两者捆在一起，
-       几何算对了也因为"模板没学成"被整条否决，网格于是永远停在旧坐标
-       （真机实测：网格 32~394 而棋盘 28~399，窄了 9px）。
-       现在让 OC 侧即使学习失败也能采纳 gridCorners。 */
-    out.gridCorners = gridDet ? gridDet.corners : [];
     out.refineError = err;
     return alignFields(out);
   },

@@ -91,9 +91,18 @@ static double JJAbsD(double v) { return v < 0 ? -v : v; }
     }
     double topW = JJAbsD(p[1].x - p[0].x), botW = JJAbsD(p[2].x - p[3].x);
     double leftH = JJAbsD(p[3].y - p[0].y), rightH = JJAbsD(p[2].y - p[1].y);
-    /* 棋盘在 1284x2778 帧里约 1100x1200；留足余量兼容不同机型 / 缩放 */
-    if (topW < 600 || topW > 1500 || botW < 600 || botW > 1500) return NO;
-    if (leftH < 700 || leftH > 1700 || rightH < 700 || rightH > 1700) return NO;
+    /* ★ 2.1.105：改用**画面比例**判定，不再写死 1284x2778 的绝对像素。
+       原来 topW<600||>1500、leftH<700||>1700 只对 iPhone 14 Pro 成立，
+       换机型（iPad / 小屏 / 分屏）时合理的四角会被判成「不合理」直接拒掉，
+       用户点了半天标不上，只看到「四角无效」。
+       实测正常棋盘约占屏宽 86%、屏高 43%，这里给足余量。 */
+    CGRect nb = [UIScreen mainScreen].nativeBounds;
+    double scrW = nb.size.width > 0 ? nb.size.width : 1284.0;
+    double scrH = nb.size.height > 0 ? nb.size.height : 2778.0;
+    if (topW < scrW * 0.45 || topW > scrW * 1.00) return NO;
+    if (botW < scrW * 0.45 || botW > scrW * 1.00) return NO;
+    if (leftH < scrH * 0.26 || leftH > scrH * 0.72) return NO;
+    if (rightH < scrH * 0.26 || rightH > scrH * 0.72) return NO;
     if (JJAbsD(topW - botW) > 200 || JJAbsD(leftH - rightH) > 260) return NO;
     /* 2.1.56 宽高比闸门：标准棋盘是 8 列 × 9 行，外接框宽高比约 0.889。
        真机在大厅/结算页点自动标定时，检测会把大片木纹背景当成棋盘
@@ -102,8 +111,9 @@ static double JJAbsD(double v) { return v < 0 ? -v : v; }
     double ratio = topW / (leftH > 0 ? leftH : 1);
     if (ratio < 0.889 * 0.85 || ratio > 0.889 * 1.15) return NO;
     /* 顺序必须是 左上 → 右上 → 右下 → 左下 */
-    if (!(p[1].x > p[0].x + 200 && p[3].y > p[0].y + 200 &&
-          p[2].x > p[3].x + 200 && p[2].y > p[1].y + 200)) return NO;
+    double minEdge = scrW * 0.30;
+    if (!(p[1].x > p[0].x + minEdge && p[3].y > p[0].y + minEdge &&
+          p[2].x > p[3].x + minEdge && p[2].y > p[1].y + minEdge)) return NO;
     return YES;
 }
 

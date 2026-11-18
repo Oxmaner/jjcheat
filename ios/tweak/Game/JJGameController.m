@@ -39,7 +39,6 @@ typedef NS_ENUM(NSInteger, JJGameState) {
  */
 typedef NS_ENUM(NSInteger, JJMenuAction) {
     JJMenuActionPlugin = 100,
-    JJMenuActionAutoCalibrate,
     JJMenuActionManualCalibrate,
     JJMenuActionHUD,
     JJMenuActionResetBoard,
@@ -73,8 +72,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 @property (nonatomic, assign) NSTimeInterval lastProcessTime;
 @property (nonatomic, assign) NSTimeInterval processNotBefore;
 @property (nonatomic, assign) BOOL autoCalibrating;
-/* 2.1.99：几何标定是否已尝试（每个标定周期只做一次） */
-@property (nonatomic, assign) BOOL gridDetectTried;
 /* 重标定必须学成才采纳，失败回滚 */
 @property (nonatomic, assign) BOOL calibrationPending;
 @property (nonatomic, assign) NSTimeInterval lastHeartbeatTs;
@@ -95,7 +92,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 
 - (void)showMenu;
 - (void)setPluginEnabled:(BOOL)on;
-- (void)autoCalibrate;
 - (void)manualCalibrate;
 - (void)toggleHUD;
 - (void)showEngineStatus;
@@ -219,8 +215,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
             case JJMenuActionPlugin:
                 [self2 setPluginEnabled:!self2.enabled];
                 break;
-            case JJMenuActionAutoCalibrate:
-                [self2 autoCalibrate];
                 break;
             case JJMenuActionManualCalibrate:
                 [self2 manualCalibrate];
@@ -293,8 +287,11 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     e0.on = self.enabled;
     [arr addObject:e0];
 
-    JJMenuEntry *e1 = [JJMenuEntry title:@"自动标定" symbol:@"viewfinder.circle"];
-    e1.action = JJMenuActionAutoCalibrate;
+    /* 2.1.105：自动标定已整体移除（在你的棋盘皮肤上首尾横线被木框遮住，
+       任何"自动找线"都不可靠）。原位置改为只读的插件版本号。 */
+    JJMenuEntry *e1 = [JJMenuEntry title:@"版本" symbol:@"info.circle"];
+    e1.value = JJ_CHEAT_VERSION;
+    e1.action = 0;              // 0 = 无动作，只展示
     [arr addObject:e1];
 
     JJMenuEntry *e2 = [JJMenuEntry title:@"手动标定" symbol:@"hand.tap"];
@@ -786,31 +783,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 
 #pragma mark - 标定动作
 
-- (void)autoCalibrate {
-    if (!self.enabled) {
-        [[JJHUDWindow shared] showStatus:JJCopyNeedPluginOn];
-        [self.ballWindow toast:JJCopyNeedPluginOn];
-        return;
-    }
-    if (!self.activated) [self activate];
-    [[JJCalibrator shared] snapshot];
-    [[JJCalibrator shared] clearRefined];
-    self.learnedBoard = NO;
-    self.learnFailCount = 0;
-    self.lastLearnAttempt = 0;
-    self.lastFrameSerial = 0;
-    self.lastFingerprint = nil;
-    self.processNotBefore = 0;
-    self.autoCalibrating = YES;
-    self.gridDetectTried = NO;
-    self.calibrationPending = YES;
-    self.state = JJGameStateWaitingBoard;
-    [self startTimer];
-    [[JJHUDWindow shared] showStatus:@"自动标定中…请停在【开局】棋盘画面"];
-    [self.ballWindow toast:JJCopyCalibAutoRunning];
-    NSLog(@"[JJCheat] 自动标定棋盘：备份旧标定，重新学习（不清空 JS 锚盘）");
-}
-
 - (void)manualCalibrate {
     if (!self.enabled) {
         [[JJHUDWindow shared] showStatus:JJCopyNeedPluginOn];
@@ -863,6 +835,11 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     self.learnFailCount = 0;
     self.calibrationPending = YES;
     self.state = JJGameStateWaitingBoard;
+
+    /* 2.1.105：标定一完成就**立刻把网格画出来**，让用户当场确认四角准不准，
+       不必等模板学习（学习失败时原来什么都不会显示）。 */
+    [[JJCalibrator shared] ensureGridPts];
+    [[JJHUDWindow shared] applyGridPoints:[JJCalibrator shared].gridPts];
     self.processNotBefore = 0;
     [self startTimer];
     [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
@@ -1030,42 +1007,6 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     if (!self.learnedBoard) {
         if (now - self.lastLearnAttempt < JJ_LEARN_RETRY_GAP) return;
 
-        /* ★ 2.1.99：**先走独立的几何标定通道**，不等模板学习。
-         *
-         * 几何检测（找 9 竖 10 横反解四角）和模板学习（认 90 格兵种）是两件事，
-         * 但原来捆在一条链上：learnBoard 失败 → finalCorners 回退 → 网格永不更新。
-         * 真机实锤：同一份抓帧离线跑 learnAndRefine 是 verifyDiff=0，
-         * 而真机 HUD 报「学习未完成」，网格停在旧的 32~394（棋盘实际 28~399）。
-         *
-         * 现在拆成独立调用：拿到四角直接采纳 + 落盘，学习成不成都不影响网格。 */
-        if (!self.gridDetectTried) {
-            self.gridDetectTried = YES;
-            self.busy = YES;
-            __weak typeof(self) wsG = self;
-            [[JJVisionBridge shared] detectGridWithPixels:rgba
-                                                    width:w
-                                                   height:h
-                                                 callback:^(NSDictionary *gi, NSError *eG) {
-                __strong typeof(wsG) selfG = wsG;
-                if (!selfG) return;
-                selfG.busy = NO;
-                id csRaw = gi[@"corners"];
-                BOOL okG = ([csRaw isKindOfClass:[NSArray class]] && [(NSArray *)csRaw count] == 4);
-                if (okG) {
-                    NSArray *cs = (NSArray *)csRaw;
-                    BOOL adopted = [[JJCalibrator shared] adoptRefinedCorners:cs];
-                    if (adopted) {
-                        [[JJCalibrator shared] saveAutoCalibratedCorners:cs width:w height:h];
-                        [[JJHUDWindow shared] showStatus:@"几何标定完成 · 网格已对齐"];
-                    }
-                    NSLog(@"[JJCheat] 几何标定 %@ 四角=%@", adopted ? @"已采纳" : @"被体检拒绝", cs);
-                } else {
-                    NSLog(@"[JJCheat] 几何标定失败（未拿到四角），继续走模板学习");
-                }
-            }];
-            return;
-        }
-
         self.lastLearnAttempt = now;
         self.busy = YES;
         self.tickCount++;
@@ -1118,40 +1059,6 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
      * 网格于是永远停在旧坐标。真机实测证据：插件网格 x=32~394，而棋盘实际
      * x=28~399 —— 窄了 9px，两头各偏 4~5px，边缘棋子必然读错。
      */
-    /* ★★ 2.1.98 崩溃修复：JS 的 null 过桥后是 **NSNull**，不是 nil。
-     *
-     * 原来写成 `NSArray *gridC = info[@"gridCorners"]; if (gridC.count == 4)`，
-     * detectGrid 失败时 JS 返回 null → NSNull → 调 -count 触发
-     * unrecognized selector → NSInvalidArgumentException 逃出 dispatch block
-     * → _objc_terminate → std::terminate → abort。
-     * 真机崩溃日志实测（15:18:17）：
-     *   objc_exception_throw → +[NSObject _copyDescription] → ___forwarding___
-     *   → JJCheat.dylib +452160 → _dispatch_call_block_and_release
-     * 教训：**任何从 JS 过桥来的值都必须先判类型和 isfinite**。 */
-    id gcRaw = info[@"gridCorners"];
-    if ([gcRaw isKindOfClass:[NSArray class]]) {
-        NSArray *gridC = (NSArray *)gcRaw;
-        BOOL gcOk = (gridC.count == 4);
-        if (gcOk) {
-            for (id pt in gridC) {
-                if (![pt isKindOfClass:[NSArray class]] || [(NSArray *)pt count] < 2) { gcOk = NO; break; }
-                double gx = [[(NSArray *)pt objectAtIndex:0] doubleValue];
-                double gy = [[(NSArray *)pt objectAtIndex:1] doubleValue];
-                if (!isfinite(gx) || !isfinite(gy)) { gcOk = NO; break; }
-            }
-        }
-        if (gcOk) {
-            BOOL adoptedG = [[JJCalibrator shared] adoptRefinedCorners:gridC];
-            if (adoptedG && self.autoCalibrating) {
-                [[JJCalibrator shared] saveAutoCalibratedCorners:gridC width:w height:h];
-            }
-            NSLog(@"[JJCheat] 几何标定：%@ 四角=%@",
-                  adoptedG ? @"已采纳" : @"被体检拒绝", gridC);
-        } else {
-            NSLog(@"[JJCheat] 几何标定：坐标不合法，忽略 %@", gridC);
-        }
-    }
-
     if (!info || [info[@"templateCount"] integerValue] <= 0) {
         /* 每 5 次留一条：旧 engine.js 接口缺失时 info 恒 nil，不能静默 */
         self.learnFailCount++;
@@ -1185,7 +1092,7 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
         [dg appendFormat:@"accepted=%d verifyDiff=%@ ok=%@ templateCount=%@\n",
             accepted, info[@"verifyDiff"] ?: @"-", info[@"ok"] ?: @"-", info[@"templateCount"] ?: @"-"];
         [dg appendFormat:@"finalCorners=%@\n", [JJCalibrator shared].finalCorners ?: @"nil"];
-        [dg appendFormat:@"gridDetectTried=%d autoCalibrating=%d\n", self.gridDetectTried, self.autoCalibrating];
+        [dg appendFormat:@"autoCalibrating=%d\n", self.autoCalibrating];
         [dg appendFormat:@"cell=%@ radius=%@ gain=%@ meanL=%@ gridAspect=%@\n",
             info[@"cell"] ?: @"-", info[@"radius"] ?: @"-", info[@"gain"] ?: @"-",
             info[@"meanL"] ?: @"-", info[@"gridAspect"] ?: @"-"];
