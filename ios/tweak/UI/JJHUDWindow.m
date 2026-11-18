@@ -363,10 +363,20 @@ static NSString *JJFormatNodes(NSInteger nodes) {
                      result[@"waitingOpponent"] ?: @"", result[@"ply"] ?: @"",
                      result[@"skipAnalyze"] ?: @"", result[@"engineState"] ?: @"",
                      result[@"enginePending"] ?: @""];
+    /* ★★ 2.1.100：网格坐标必须在「结果去重」之前更新。
+     *
+     * 原来这两行在上面那个 early-return 之后，而 key 只由分数/PV/深度这类
+     * **结果字段**拼成，不含网格坐标。后果：自动标定完成后 gridPts 变了，
+     * 但下一帧 result 内容没变 → key 相同 → 提前 return → gridPts 永远传不进去
+     * → 网格画不出来。真机现象就是 HUD 明明提示"几何标定完成・网格已对齐"，
+     * 屏幕上却一根网格线都没有（用像素扫描确认：除菜单图标外 0 个青色像素）。
+     *
+     * 网格是「几何状态」，与「分析结果」的去重无关，必须每次都同步。
+     */
+    self.hudView.gridPts = points;
+
     if ([key isEqualToString:self.lastResultKey] && !self.topPanel.hidden) return;
     self.lastResultKey = key;
-
-    self.hudView.gridPts = points;
 
     /* JJ 象棋红方先行。我方执黑时开局第一手归对方，
        轮到对方就不画箭头、不显示建议，避免「乱指挥」。 */
