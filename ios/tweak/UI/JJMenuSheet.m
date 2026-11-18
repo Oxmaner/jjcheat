@@ -273,10 +273,18 @@ static const CGFloat kJJStepValueW  = 52.0;
         id back = self.rowViews[i];
         if (back != [NSNull null]) ((UIView *)back).frame = rowFrame;
 
+        /* 行内控件都是**面板的直接子视图**（没有每行一个容器），
+           所以坐标必须加上本行的 y 偏移。2.1.82 首版这里写的是行内局部坐标
+           （y=0），结果所有行的文字/按钮全叠在面板顶部 —— 真机上表现为
+           「面板只看得见一两行，其余被压住」。辅助功能树里所有元素的中心点
+           都等于同一个 y，就是这个 bug 的特征。 */
+        CGFloat rowTop = rowFrame.origin.y;
+
         id ivObj = self.iconViews[i];
         CGFloat textX = 10.0;
         if (ivObj != [NSNull null]) {
-            ((UIImageView *)ivObj).frame = CGRectMake(textX, (rh - 18.0) / 2, 18, 18);
+            ((UIImageView *)ivObj).frame =
+                CGRectMake(textX, rowTop + (rh - 18.0) / 2, 18, 18);
             textX += 24.0;
         }
 
@@ -287,17 +295,18 @@ static const CGFloat kJJStepValueW  = 52.0;
             CGFloat right = innerW - 10.0;
             UIButton *plus  = (UIButton *)self.plusButtons[i];
             UIButton *minus = (UIButton *)self.minusButtons[i];
-            plus.frame  = CGRectMake(right - kJJStepBtnW, (rh - 30.0) / 2, kJJStepBtnW, 30);
+            plus.frame  = CGRectMake(right - kJJStepBtnW, rowTop + (rh - 30.0) / 2,
+                                     kJJStepBtnW, 30);
             minus.frame = CGRectMake(right - kJJStepBtnW - kJJStepValueW - kJJStepBtnW - 4,
-                                     (rh - 30.0) / 2, kJJStepBtnW, 30);
+                                     rowTop + (rh - 30.0) / 2, kJJStepBtnW, 30);
             val.frame = CGRectMake(right - kJJStepBtnW - kJJStepValueW - 2,
-                                   (rh - 30.0) / 2, kJJStepValueW, 30);
-            title.frame = CGRectMake(textX, 0,
+                                   rowTop + (rh - 30.0) / 2, kJJStepValueW, 30);
+            title.frame = CGRectMake(textX, rowTop,
                                      MAX(40, minus.frame.origin.x - textX - 6), rh);
         } else {
             CGFloat valW = MIN(120.0, innerW * 0.46);
-            val.frame = CGRectMake(innerW - 10.0 - valW, 0, valW, rh);
-            title.frame = CGRectMake(textX, 0,
+            val.frame = CGRectMake(innerW - 10.0 - valW, rowTop, valW, rh);
+            title.frame = CGRectMake(textX, rowTop,
                                      MAX(40, val.frame.origin.x - textX - 6), rh);
         }
         y += rh + kJJSheetRowGap;
