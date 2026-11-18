@@ -50,6 +50,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 /** 自动标定采纳后：像素四角 → point 持久化 */
 - (void)saveAutoCalibratedCorners:(NSArray *)fc width:(int)w height:(int)h;
+- (void)ensureGridPts;
 
 /** 记住「当前是好标定」，供重标定失败时回滚 */
 - (void)snapshot;

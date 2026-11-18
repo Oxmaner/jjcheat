@@ -1487,12 +1487,41 @@ class BoardRecognizer {
   detectGrid(pixels, w, h) {
     if (!w || !h || w < 120 || h < 160) return null;
 
-    /* ---------- 0. 预计算亮度图（后面要做多次邻域比较，先算一次省很多） ---------- */
-    const N = w * h;
-    const lum = new Float32Array(N);
+    /* ★★ 2.1.104：先降采样，再检测。
+     *
+     * 真机症状：detectBoardGrid 一直返回空数组，而同一份抓帧离线完全正常。
+     * 差别在内存：真机 1284x2778 建 Float32Array(N) 就是 **14MB**，
+     * 加上原始像素 14MB，而 Unity 本身已经吃掉大量内存 ——
+     * JSCore 分配失败会抛异常，被 try-catch 静默吞成 []，日志只留一句「失败」。
+     *
+     * 改为：宽 > 700 时按 2 的幂降采样（1284→642，面积 1/4），
+     * 亮度表用 Uint8（0~255 足够，内存再降 4 倍）。
+     * 两者合起来内存降 16 倍，检测也快 4 倍；坐标最后乘回 scale 不影响精度。
+     */
+    let sc = 1;
+    while (w / sc > 700) sc *= 2;
+    const sw = Math.floor(w / sc), sh = Math.floor(h / sc);
+    let src = pixels, curW = w, curH = h;
+    if (sc > 1) {
+      const small = new Uint8ClampedArray(sw * sh * 4);
+      for (let y = 0; y < sh; y++) {
+        const srow = (y * sc) * w;
+        for (let x = 0; x < sw; x++) {
+          const s = (srow + x * sc) * 4, d = (y * sw + x) * 4;
+          small[d] = pixels[s]; small[d + 1] = pixels[s + 1];
+          small[d + 2] = pixels[s + 2]; small[d + 3] = 255;
+        }
+      }
+      src = small; curW = sw; curH = sh;
+    }
+    const GW = curW, GH = curH;
+
+    /* ---------- 0. 亮度表（Uint8，0~255 足够） ---------- */
+    const N = GW * GH;
+    const lum = new Uint8Array(N);
     for (let i = 0; i < N; i++) {
       const q = i * 4;
-      lum[i] = 0.299 * pixels[q] + 0.587 * pixels[q + 1] + 0.114 * pixels[q + 2];
+      lum[i] = (0.299 * src[q] + 0.587 * src[q + 1] + 0.114 * src[q + 2]) | 0;
     }
 
     /* ---------- 1. 竖线：用「局部暗谷」而不是绝对亮度 ----------
@@ -1510,15 +1539,15 @@ class BoardRecognizer {
          - 邻域只有 3px，采到的是线条内部而不是两侧盘面，凹陷测不出来
          - 阈值 12 相对 8bit 亮度也太小，木纹噪声全被当成线
        实测真机上会直接返回 null。统一按「基准宽 428」等比缩放。 */
-    const S = w / 428;
+    const S = GW / 428;
     const NB = Math.max(2, Math.round(4 * S));      // 邻域半径
     const DTH = 12 * S;                             // 暗谷深度阈值
 
-    const colProj = new Float32Array(w);
-    for (let x = NB; x < w - NB; x++) {
+    const colProj = new Float32Array(GW);
+    for (let x = NB; x < GW - NB; x++) {
       let c = 0;
       for (let y = 0; y < h; y++) {
-        const base = y * w;
+        const base = y * GW;
         const v = lum[base + x];
         if (v < lum[base + x - NB] - DTH && v < lum[base + x + NB] - DTH) c++;
       }
@@ -1527,14 +1556,14 @@ class BoardRecognizer {
     let cmax = 0;
     for (let x = 0; x < w; x++) if (colProj[x] > cmax) cmax = colProj[x];
     if (cmax <= 0) return null;
-    const colN = new Float32Array(w);
+    const colN = new Float32Array(GW);
     for (let x = 0; x < w; x++) colN[x] = colProj[x] / cmax;
 
     /* 9 条竖线：周期 8%~14% 屏宽、总宽 82%~98%、首线在左边缘 3%~12% 处 */
     const vs = this._gridVote(colN, 9,
-      w * 0.08, w * 0.14,
-      w * 0.82, w * 0.98,
-      w * 0.03, w * 0.12, 0.55);
+      GW * 0.08, GW * 0.14,
+      GW * 0.82, GW * 0.98,
+      GW * 0.03, GW * 0.12, 0.55);
     if (!vs) return null;
     const dx = vs.d, xs = [];
     for (let k = 0; k < 9; k++) xs.push(vs.x0 + k * dx);
@@ -1543,24 +1572,24 @@ class BoardRecognizer {
      * 横线被 32 个棋子压得七零八落，整行投影不可靠；
      * 但棋子是圆的，压不到**所有**竖线旁边，所以在已知竖线位置取样信噪比高得多。
      */
-    const probe = new Float32Array(h);
+    const probe = new Float32Array(GH);
     const offs = [-Math.round(5 * S), -NB, NB, Math.round(5 * S)];
-    for (let y = NB; y < h - NB; y++) {
-      const base = y * w;
+    for (let y = NB; y < GH - NB; y++) {
+      const base = y * GW;
       let c = 0;
       for (let k = 0; k < 9; k++) {
         const cx = Math.round(xs[k]);
         for (let oi = 0; oi < 4; oi++) {
           const x = cx + offs[oi];
-          if (x < NB || x >= w - NB) continue;
+          if (x < NB || x >= GW - NB) continue;
           const v = lum[base + x];
-          if (v < lum[(y - NB) * w + x] - DTH && v < lum[(y + NB) * w + x] - DTH) c++;
+          if (v < lum[(y - NB) * GW + x] - DTH && v < lum[(y + NB) * GW + x] - DTH) c++;
         }
       }
       probe[y] = c;
     }
     let pmax = 0;
-    for (let y = 0; y < h; y++) if (probe[y] > pmax) pmax = probe[y];
+    for (let y = 0; y < GH; y++) if (probe[y] > pmax) pmax = probe[y];
     if (pmax <= 0) return null;
 
     /* ---------- 3. 横线：找「最长的连续等距峰序列」再外推到 10 条 ----------
@@ -1594,16 +1623,16 @@ class BoardRecognizer {
      * 整幅画面 2 倍差距，用「y9 行平均亮度不低于画面中位数的 72%」即可稳定排除。
      */
     let medSum = 0, medCnt = 0;
-    for (let y = 0; y < h; y += 4) {
-      const base = y * w;
-      for (let x = 0; x < w; x += 4) { medSum += lum[base + x]; medCnt++; }
+    for (let y = 0; y < GH; y += 4) {
+      const base = y * GW;
+      for (let x = 0; x < GW; x += 4) { medSum += lum[base + x]; medCnt++; }
     }
     const frameMean = medCnt ? medSum / medCnt : 120;
     const minBoardRow = Math.max(60, frameMean * 0.72);
     function rowBrightness(yy) {
       const yr = Math.round(yy);
-      if (yr < 0 || yr >= h) return 0;
-      const base = yr * w;
+      if (yr < 0 || yr >= GH) return 0;
+      const base = yr * GW;
       let s2 = 0, n2 = 0;
       for (let x = xs[0]; x <= xs[8]; x += 4) { s2 += lum[base + Math.round(x)]; n2++; }
       return n2 ? s2 / n2 : 0;
@@ -1627,14 +1656,14 @@ class BoardRecognizer {
         for (let off = 0; off <= 1; off++) {
           const cy0 = seq[0] - off * dy;
           const cy9 = cy0 + 9 * dy;
-          if (cy0 < 0 || cy9 > h + 5) continue;
+          if (cy0 < 0 || cy9 > GH + 5) continue;
           /* 亮度硬约束：y9 必须是棋盘木面，不能是画面外的暗区 */
           if (rowBrightness(cy9) < minBoardRow) continue;
           /* 上边界也得在合理位置 */
-          const frac = cy0 / h;
+          const frac = cy0 / GH;
           if (frac < 0.15 || frac > 0.42) continue;
           cands.push({ dy: dy, y0: cy0, y9: cy9, len: seq.length,
-                       centerDist: Math.abs((cy0 + cy9) / 2 - h / 2) });
+                       centerDist: Math.abs((cy0 + cy9) / 2 - GH / 2) });
         }
       }
     }
@@ -1647,13 +1676,15 @@ class BoardRecognizer {
     const y0 = pick.y0, y9 = pick.y9, dyP = pick.dy;
 
     const bw = xs[8] - xs[0], bh = y9 - y0;
-    if (bw < w * 0.35 || bh < h * 0.25) return null;
+    if (bw < GW * 0.35 || bh < GH * 0.25) return null;
     const ratio = bw / bh;
     if (ratio < 0.78 || ratio > 1.12) return null;
 
+    /* 坐标乘回原分辨率 */
+    const k = sc;
     return {
-      corners: [[xs[0], y0], [xs[8], y0], [xs[8], y9], [xs[0], y9]],
-      dx: dx, dy: dyP, xs: xs, y0: y0,
+      corners: [[xs[0] * k, y0 * k], [xs[8] * k, y0 * k], [xs[8] * k, y9 * k], [xs[0] * k, y9 * k]],
+      dx: dx * k, dy: dyP * k, xs: xs.map(function (v) { return v * k; }), y0: y0 * k,
       vHits: vs.hits, hHits: pick.len
     };
   }

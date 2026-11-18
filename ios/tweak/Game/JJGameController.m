@@ -269,6 +269,7 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
         disp[@"enginePending"] = @1;
         disp[@"engineState"] = @"思考中";
         disp[@"sideToMove"] = rec[@"sideToMove"] ?: @"red";
+        [[JJCalibrator shared] ensureGridPts];   // 2.1.104 兜底重建，防 gridPts 为空
         [[JJHUDWindow shared] showResult:disp
                               gridPoints:[JJCalibrator shared].gridPts
                                      fen:rec[@"fen"] ?: @""];
@@ -1566,6 +1567,7 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
         }
     }
 
+    [[JJCalibrator shared] ensureGridPts];       // 2.1.104 兜底重建，防 gridPts 为空
     [[JJHUDWindow shared] showResult:disp
                           gridPoints:[JJCalibrator shared].gridPts
                                  fen:rec[@"fen"] ?: @""];

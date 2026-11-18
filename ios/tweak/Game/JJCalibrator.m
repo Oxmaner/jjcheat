@@ -210,6 +210,31 @@ static double JJAbsD(double v) { return v < 0 ? -v : v; }
     return YES;
 }
 
+/**
+ * ★ 2.1.104：兜底重建 gridPts。
+ *
+ * 真机日志：几何标定返回空 corners，但随后模板学习 verifyDiff=0 成功 ——
+ * 说明 finalCorners 是好的，可 gridPts 却一直没被填上，于是
+ * HUD 既画不出网格也画不出建议箭头（drawRect 两个条件都是 gridPts.count==90）。
+ *
+ * 这里每次 showResult 之前兜底检查一次：只要 finalCorners 有 4 个点而
+ * gridPts 不足 90，就重算。开销极小（90 次双线性插值），但能彻底消除
+ * 「有建议文字、画面却没箭头」这类症状。
+ */
+- (void)ensureGridPts {
+    if (self.gridPts.count == 90) return;
+    if (self.finalCorners.count != 4) {
+        NSArray *fc = [self cornersForWidth:(int)([UIScreen mainScreen].bounds.size.width * [UIScreen mainScreen].scale)
+                                     height:(int)([UIScreen mainScreen].bounds.size.height * [UIScreen mainScreen].scale)];
+        if (fc.count == 4) self.finalCorners = fc;
+    }
+    if (self.finalCorners.count == 4) {
+        self.gridPts = [self gridPointsFromCorners:self.finalCorners];
+        NSLog(@"[JJCheat] gridPts 兜底重建: %lu 点 (corners=%@)",
+              (unsigned long)self.gridPts.count, self.finalCorners);
+    }
+}
+
 - (void)saveAutoCalibratedCorners:(NSArray *)fc width:(int)w height:(int)h {
     CGSize pt = [UIScreen mainScreen].bounds.size;
     if (pt.width <= 0 || pt.height <= 0 || w <= 0 || h <= 0) return;
