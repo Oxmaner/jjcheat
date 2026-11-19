@@ -309,19 +309,57 @@ ENGINE_CPP_GO_OLD = """void Engine::go(Search::LimitsType& limits) {
     threads.start_thinking(pos, states, limits);
 }"""
 
-ENGINE_CPP_GO_NEW = """void Engine::go(Search::LimitsType& limits) {
+ENGINE_CPP_GO_NEW = """// ---------------------------------------------------------------------------
+// JJCheat 2.0.0r9：**NNUE 校验只做一次**
+//
+// 原生 go() 每次搜索的第一句都是 verify_network()，而它会：
+//   · 重新打开并读取 pikafish.nnue（61MB）
+//   · 重算文件哈希、重建每个 replica 的内存副本
+// 于是"每走一步棋"都要付一次 0.3~0.8 秒的代价，真机表现就是**落子后卡一下**，
+// 日志里每步都刷下面两行：
+//   info string NNUE evaluation using pikafish.nnue (61MiB, ...)
+//   info string Network replica 1: Local memory. Shared memory not supported...
+//
+// 权重在进程生命周期内不会变（唯一会变的情况是 setoption name EvalFile，
+// 那条路会走 load_network()，那里把标志打回 false 重新校验）。
+// 所以成功一次就够，失败仍然每次都试（沿用"失败只跳过本次搜索"的语义）。
+// ---------------------------------------------------------------------------
+static bool jjNetVerified = false;
+
+void Engine::go(Search::LimitsType& limits) {
     assert(limits.perft == 0);
 
-    // JJCheat: 网络没就绪时绝不能 start_thinking（评估会解引用未初始化的权重），
+    // 网络没就绪时绝不能 start_thinking（评估会解引用未初始化的权重），
     // 也绝不能 exit（同进程，宿主 App 会一起死）。只跳过本次搜索。
-    if (!verify_network())
+    if (!jjNetVerified)
     {
-        if (onVerifyNetwork)
-            onVerifyNetwork("JJ: NNUE not ready, search skipped (process kept alive)");
-        return;
+        if (!verify_network())
+        {
+            if (onVerifyNetwork)
+                onVerifyNetwork("JJ: NNUE not ready, search skipped (process kept alive)");
+            return;
+        }
+        jjNetVerified = true;
     }
 
     threads.start_thinking(pos, states, limits);
+}"""
+
+# 换网（setoption name EvalFile）时必须重新校验，否则会拿旧网络的结论去搜新网络
+ENGINE_CPP_LOADNET_OLD = """void Engine::load_network(const std::filesystem::path& file) {
+    network.modify_and_replicate(
+      [this, &file](NN::Network& network_) { network_.load(binaryDirectory, file, networkFile); });
+    threads.clear();
+    threads.ensure_network_replicated();
+}"""
+
+ENGINE_CPP_LOADNET_NEW = """void Engine::load_network(const std::filesystem::path& file) {
+    network.modify_and_replicate(
+      [this, &file](NN::Network& network_) { network_.load(binaryDirectory, file, networkFile); });
+    threads.clear();
+    threads.ensure_network_replicated();
+    // JJCheat: 换了权重文件 → 之前那次校验作废，下次搜索前重新校验一遍。
+    jjNetVerified = false;
 }"""
 
 ENGINE_CPP_PERFT_OLD = """    verify_network();
@@ -563,6 +601,7 @@ def main():
 
     patch(src / "engine.cpp", "engine.cpp", [
         (ENGINE_CPP_GO_OLD, ENGINE_CPP_GO_NEW),
+        (ENGINE_CPP_LOADNET_OLD, ENGINE_CPP_LOADNET_NEW),
         (ENGINE_CPP_PERFT_OLD, ENGINE_CPP_PERFT_NEW),
         (ENGINE_CPP_VERIFY_HEAD_OLD, ENGINE_CPP_VERIFY_HEAD_NEW),
         (ENGINE_CPP_VERIFY_CALL_OLD, ENGINE_CPP_VERIFY_CALL_NEW),

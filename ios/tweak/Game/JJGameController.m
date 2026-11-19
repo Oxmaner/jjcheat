@@ -1182,8 +1182,13 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
         NSLog(@"[JJCheat] 识别值 c=%@ gotFen=%@", info[@"codes36"] ?: @"-",
               info[@"gotFen"] ?: @"-");
         NSLog(@"[JJCheat] 差异格 %@", info[@"mismatch"] ?: @"-");
-        [[JJCalibrator shared] dumpSamplesWithPixels:rgba width:w height:h];
-        [self dumpFrameJPEG:rgba width:w height:h];
+        /* 2.0.0r9：这两步都是纯诊断，默认关。
+           dumpFrameJPEG 是 14MB 的 JPEG 编码 + 写盘，学习连败时会连着卡好几下；
+           dumpSamples 会写一堆 PNG。真要查识别问题再把 JJ_DUMP_LEARN_FAIL 打开。 */
+        if (JJ_DUMP_LEARN_FAIL) {
+            [[JJCalibrator shared] dumpSamplesWithPixels:rgba width:w height:h];
+            [self dumpFrameJPEG:rgba width:w height:h];
+        }
         if (self.calibrationPending && [[JJCalibrator shared] hasSnapshot] &&
             self.learnFailCount >= JJ_CALIB_ROLLBACK_FAILS) {
             [self rollbackCalibration];
@@ -1312,6 +1317,11 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     BOOL moved = [result[@"moveDetected"] boolValue];
     BOOL waiting = [result[@"waitingOpponent"] boolValue];
     BOOL newGame = [result[@"newGame"] boolValue];
+
+    /* 2.0.0r9：抓帧分档。等对方走子时把摘要轮询放宽到 0.35s —— 对手落子那半秒
+       棋盘会变 3~5 次，0.15s 的门会触发 2~3 次「14MB 拷贝 + JS 识别」，
+       真机表现就是「对方一落子画面顿一下」。轮到我方立刻收紧回 0.15s。 */
+    JJMetalSetPeekInterval(waiting ? JJ_PEEK_WAIT_OPPONENT : JJ_PEEK_OUR_TURN);
 
     if (stalled) {
         /* 2.1.77：分级退避。旧值 2.5 秒是一刀切黑洞，对手在此期间落子会被整个漏掉。

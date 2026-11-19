@@ -24,6 +24,9 @@
 //
 
 #import "JJMetalGrabber.h"
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #import "JJConfig.h"
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
@@ -77,6 +80,11 @@ static int gPendingH = 0;
 #define JJ_PEEK_VALUES      (JJ_PEEK_POINTS * 3)
 
 static volatile BOOL gHasCorners = NO;
+/* 2.0.0r9：摘要轮询间隔改成可调（抓帧分档）。
+   等对方走子时降到 0.35s：对手落子那半秒里棋盘会变 3~5 次，0.15s 的门
+   会触发 2~3 次「14MB 拷贝 + 一次 JS 识别」，这就是「对方一落子画面顿一下」。
+   轮到我方立刻回到 0.15s，保证建议出得够快。 */
+static volatile double gPeekInterval = JJ_METAL_PEEK_INTERVAL;
 static os_unfair_lock gCornerLock = OS_UNFAIR_LOCK_INIT;
 static float gCornerX[4] = {0};
 static float gCornerY[4] = {0};
@@ -84,6 +92,12 @@ static float gCornerY[4] = {0};
 /* 以下摘要状态只在读帧队列（串行）访问，不需要额外加锁 */
 static int32_t gLastDigest[JJ_PEEK_VALUES];
 static BOOL gDigestValid = NO;
+
+void JJMetalSetPeekInterval(double seconds) {
+    if (seconds < 0.08) seconds = 0.08;    /* 再密就不划算了：识别排队来不及 */
+    if (seconds > 1.00) seconds = 1.00;
+    gPeekInterval = seconds;
+}
 
 void JJMetalSetBoardCorners(NSArray *corners) {
     BOOL ok = NO;
@@ -298,14 +312,33 @@ static void JJReadSurface(IOSurfaceRef s, int w, int h) {
     }
     IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
 
-    /* IOSurface 是 BGRA，转 RGBA。32 位整字一次交换 R/B：
-       arm64 小端下 BGRA 内存序 B,G,R,A 读成 uint32 = A<<24|R<<16|G<<8|B。 */
+    /* IOSurface 是 BGRA，转 RGBA（换 R/B 两个字节）。
+       2.0.0r9：原来是 350 万次标量位运算，每帧十几毫秒纯烧 CPU。
+       改成 NEON 查表置换：一次 16 字节（4 像素），理论上快 8~10 倍；
+       尾部不足 16 字节的再用标量补齐。 */
+#if defined(__ARM_NEON)
+    {
+        static const uint8_t kSwapRB[16] = {2,1,0,3,  6,5,4,7,  10,9,8,11,  14,13,12,15};
+        const uint8x16_t mask = vld1q_u8(kSwapRB);
+        size_t i = 0;
+        for (; i + 16 <= need; i += 16) {
+            uint8x16_t v = vld1q_u8(dst + i);
+            vst1q_u8(dst + i, vqtbl1q_u8(v, mask));
+        }
+        for (; i + 4 <= need; i += 4) {
+            uint8_t b0 = dst[i], r0 = dst[i + 2];
+            dst[i] = r0;
+            dst[i + 2] = b0;
+        }
+    }
+#else
     uint32_t *p32 = (uint32_t *)dst;
     size_t n32 = need / 4;
     for (size_t i = 0; i < n32; i++) {
         uint32_t v = p32[i];
         p32[i] = (v & 0xFF00FF00u) | ((v & 0x000000FFu) << 16) | ((v & 0x00FF0000u) >> 16);
     }
+#endif
 
     os_unfair_lock_lock(&gLock);
     gFrame = out;
@@ -343,7 +376,7 @@ void JJMetalBeforeNextDrawable(void) {
          无角点  → 退回旧的 JJ_METAL_READ_INTERVAL（1.5s），直接整帧拷。
            未标定阶段（学习棋盘）离不开新鲜帧，这条兜底不能省。 */
     int expected = 0;
-    CFTimeInterval gate = gHasCorners ? JJ_METAL_PEEK_INTERVAL : JJ_METAL_READ_INTERVAL;
+    CFTimeInterval gate = gHasCorners ? gPeekInterval : JJ_METAL_READ_INTERVAL;
     if (atomic_compare_exchange_strong(&gReadBusy, &expected, 1) &&
         (now - gLastReadTs >= gate)) {
         gLastReadTs = now;

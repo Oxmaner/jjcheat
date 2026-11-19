@@ -40,6 +40,10 @@
    摘要没变就整帧丢掉；变了才拷 14MB。延迟降到约 0.15 秒，拷贝次数反而下降。
    采样必须限定棋盘内 —— 整屏采样会被倒计时/落子动画/提示高亮带偏，等于白改。 */
 #define JJ_METAL_PEEK_INTERVAL  0.15
+/* 2.0.0r9 抓帧分档：等对方走子时用宽档（对手落子动画期间少拷 14MB），
+   轮到我方用窄档保证建议出得够快。 */
+#define JJ_PEEK_WAIT_OPPONENT   0.35
+#define JJ_PEEK_OUR_TURN        0.15
 /* 单点差值达到这个值算「这一格明显变了」（B/G/R 三通道差值之和，0~765）。
    取 40：一个棋子出现/消失通常 60~200；木色棋盘轻微亮度漂移只有 2~6。 */
 #define JJ_PEEK_POINT_DELTA     40
@@ -106,7 +110,7 @@
    换到青蓝色后两边彻底分开：红/金 = 游戏的标记，青蓝 = 我们的建议。 */
 #define JJ_COLOR_ARROW          [UIColor colorWithRed:0.10 green:0.72 blue:1.00 alpha:0.28]
 #define JJ_COLOR_ARROW_HEAD     [UIColor colorWithRed:0.05 green:0.62 blue:1.00 alpha:0.38]
-#define JJ_CHEAT_VERSION        @"2.0.0r8"   /* 与 deb control 版本保持一致 */
+#define JJ_CHEAT_VERSION        @"2.0.0r9"   /* 与 deb control 版本保持一致 */
 #define JJ_COLOR_BOARD_LINE     [UIColor colorWithRed:0.25 green:0.78 blue:1.00 alpha:0.42]
 #define JJ_COLOR_PANEL_BG       [UIColor colorWithRed:0.04 green:0.05 blue:0.08 alpha:0.86]
 #define JJ_COLOR_TEXT_MAIN      [UIColor colorWithRed:1.00 green:0.95 blue:0.55 alpha:1.0]
@@ -178,5 +182,8 @@
 #define JJ_PIKA_HASH_MB         48
 /* 引擎状态小圆点刷新间隔（秒） */
 #define JJ_ENGINE_DOT_GAP       2.0
+/* 2.0.0r9：学习失败帧落盘（14MB JPEG 编码 + 写盘，会明显卡一下）。
+   只在排查识别问题时开，默认关。 */
+#define JJ_DUMP_LEARN_FAIL      0
 
 #endif /* JJConfig_h */

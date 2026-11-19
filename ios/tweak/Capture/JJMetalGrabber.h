@@ -69,6 +69,11 @@ BOOL JJMetalCaptureEnabled(void);
  *  角点变化会让旧摘要失效，强制重新出一帧。 */
 void JJMetalSetBoardCorners(NSArray *corners);
 
+/** 2.0.0r9 抓帧分档：调整「摘要轮询」间隔（秒）。
+    等对方走子时调宽（0.35），轮到我方调窄（0.15），
+    目的是在对手落子动画期间少做几次 14MB 拷贝 + JS 识别。 */
+void JJMetalSetPeekInterval(double seconds);
+
 #ifdef __cplusplus
 }
 #endif
