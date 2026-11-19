@@ -33,6 +33,19 @@ NS_ASSUME_NONNULL_BEGIN
 /** 清掉精修四角（重新自动标定前调用），point 四角保留 */
 - (void)clearRefined;
 
+/* ============================================================
+ *  2.0.0r5 内置标定预设（取代人工四点标定）
+ *
+ *  两套预设定义在 JJConfig.h：0=人机对战，1=排位赛/棋力评测/锦标赛。
+ *  两者只差纵向 50pt（排位赛顶部多了对手头像与大盘计时），列方向一致。
+ * ============================================================ */
+/** 应用指定预设（0=人机 1=排位），同时作废已学出的精修四角并持久化选择 */
+- (void)applyPresetScheme:(NSInteger)scheme;
+/** 当前生效的预设编号 */
+- (NSInteger)currentCalibScheme;
+/** 在人机 ↔ 排位之间切换一次（预设自检失败时用） */
+- (void)switchPresetScheme;
+
 /** point 四角 × 抓帧尺寸 → 像素四角；没有 point 四角返回 nil */
 - (nullable NSArray<NSArray<NSNumber *> *> *)cornersForWidth:(int)w height:(int)h;
 

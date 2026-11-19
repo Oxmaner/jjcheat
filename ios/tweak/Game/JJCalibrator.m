@@ -49,20 +49,54 @@ static double JJAbsD(double v) { return v < 0 ? -v : v; }
 - (instancetype)init {
     self = [super init];
     if (self) {
-        /* 恢复持久化的 point 四角（屏幕坐标，抓帧尺寸确定后按比例现算） */
-        NSArray *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:JJ_KEY_CORNERS];
-        if (saved.count == 4) {
-            NSMutableArray *corners = [NSMutableArray arrayWithCapacity:4];
-            for (NSArray *p in saved) {
-                if (![p isKindOfClass:[NSArray class]] || p.count < 2) continue;
-                [corners addObject:@[[NSNumber numberWithDouble:[p[0] doubleValue]],
-                                     [NSNumber numberWithDouble:[p[1] doubleValue]]]];
-            }
-            if (corners.count == 4) _pointCorners = corners;
-        }
+        /* ★ 2.0.0r5：不再从 NSUserDefaults 恢复历史四点标定 —— 一律用内置预设。
+           旧的 JJ_KEY_CORNERS 数据留着不删（回滚/排查用），但不再参与任何计算。 */
         _gridPts = @[];
+        NSInteger saved = [[NSUserDefaults standardUserDefaults] integerForKey:JJ_KEY_CALIB_SCHEME];
+        [self applyPresetScheme:(saved == 1 ? 1 : 0)];
     }
     return self;
+}
+
+#pragma mark - 内置预设（2.0.0r5）
+
+- (void)applyPresetScheme:(NSInteger)scheme {
+    BOOL rank = (scheme == 1);
+    CGFloat L = rank ? JJ_PRESET_RANK_L : JJ_PRESET_AI_L;
+    CGFloat T = rank ? JJ_PRESET_RANK_T : JJ_PRESET_AI_T;
+    CGFloat R = rank ? JJ_PRESET_RANK_R : JJ_PRESET_AI_R;
+    CGFloat B = rank ? JJ_PRESET_RANK_B : JJ_PRESET_AI_B;
+
+    /* 预设量在 428x926 的参考屏上，这里按实际 bounds 等比缩放，
+       换尺寸相近的机型也不用改常量。 */
+    CGSize pt = [UIScreen mainScreen].bounds.size;
+    if (pt.width <= 0 || pt.height <= 0) pt = CGSizeMake(JJ_PRESET_REF_W, JJ_PRESET_REF_H);
+    CGFloat sx = pt.width / JJ_PRESET_REF_W;
+    CGFloat sy = pt.height / JJ_PRESET_REF_H;
+
+    self.pointCorners = @[@[@(L * sx), @(T * sy)],
+                          @[@(R * sx), @(T * sy)],
+                          @[@(R * sx), @(B * sy)],
+                          @[@(L * sx), @(B * sy)]];
+    /* 换预设后，之前按旧网格精修出来的四角必须作废，否则会继续拿旧 gridPts 采样 */
+    self.finalCorners = nil;
+    self.gridPts = @[];
+    self.lastFrameW = 0;
+    self.lastFrameH = 0;
+    self.hasSnapshot = NO;
+
+    [[NSUserDefaults standardUserDefaults] setInteger:(rank ? 1 : 0) forKey:JJ_KEY_CALIB_SCHEME];
+    NSLog(@"[JJCheat] 标定预设=%@ 屏%.0fx%.0f → 四角 px点 (%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f)",
+          rank ? @"排位" : @"人机", pt.width, pt.height,
+          L * sx, T * sy, R * sx, T * sy, R * sx, B * sy, L * sx, B * sy);
+}
+
+- (NSInteger)currentCalibScheme {
+    return [[NSUserDefaults standardUserDefaults] integerForKey:JJ_KEY_CALIB_SCHEME] == 1 ? 1 : 0;
+}
+
+- (void)switchPresetScheme {
+    [self applyPresetScheme:([self currentCalibScheme] == 1 ? 0 : 1)];
 }
 
 - (BOOL)hasCorners {

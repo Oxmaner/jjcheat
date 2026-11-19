@@ -77,6 +77,9 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 /* 重标定必须学成才采纳，失败回滚 */
 @property (nonatomic, assign) BOOL calibrationPending;
 @property (nonatomic, assign) NSTimeInterval lastHeartbeatTs;
+/* 2.0.0r5 预设自检：还剩几次自动切换、本轮观察窗截止时刻 */
+@property (nonatomic, assign) NSInteger presetSwitchLeft;
+@property (nonatomic, assign) NSTimeInterval presetProbeDeadline;
 
 /* ---- 2.1.0 引擎联动 ---- */
 /* 最近一次识别结果（recognition dict），拼装 HUD 用 */
@@ -94,7 +97,10 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 
 - (void)showMenu;
 - (void)setPluginEnabled:(BOOL)on;
-- (void)manualCalibrate;
+/* 2.0.0r5：手动标定入口已下线，长按球改为「重新自检预设」 */
+- (void)reProbePreset;
+- (void)armPresetSelfCheck;
+- (void)tickPresetSelfCheckWithResult:(NSDictionary *)result;
 - (void)toggleHUD;
 - (void)showEngineStatus;
 - (void)applyThinkMs:(NSInteger)v;
@@ -166,15 +172,17 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [[JJHUDWindow shared] attach];
     [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
 
-    /* ★ 2.0.0r1：**不再拿上次的四角直接开始识别**。
+    /* ★ 2.0.0r5：不再强制手动标定四角。
      *
-     * 原来只要 hasCorners 就直接进 WaitingBoard，用的是上次保存（甚至是很久
-     * 以前、换过皮肤/换过机型）的四角。四角一偏，采样全错位，表现就是
-     * 「开了插件但一直识别未收敛」，而且用户完全不知道该去重标。
+     * r1 的做法是「每次开插件都必须手点四角」，本意是防止沿用很久以前的旧四角。
+     * 但实测下来，手动标定是整条链路上唯一要人参与、也最容易点偏的一步：
+     * 2026-11-19 两次「整盘读错 → 轮次错位」，根因都是四角偏了 30~40pt。
      *
-     * 现在改为：**每次开启插件都强制手动标定四角**，标完才学习、才识别。
-     * 旧四角仍保留在快照里，只在「新标定被判无效」时回滚用。 */
-    [self recalibrate];
+     * 现在四角由内置预设给出（JJConfig.h 的 JJ_PRESET_*，真机截图逐像素量出来的），
+     * 人机/排位各一套，启动即可用。这里只把「预设自检」挂上：
+     * 连续 6 秒读不出合法局面 → 自动换另一套预设再试一次，仍不行就在 HUD 上明说。
+     */
+    [self armPresetSelfCheck];
     [self refreshEngineDot];
 }
 
@@ -207,7 +215,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
         __strong typeof(weakSelf) self2 = weakSelf;
         if (!self2 || !self2.enabled) return;
         if (!self2.activated) [self2 activate];
-        [self2 manualCalibrate];
+        /* 2.0.0r5：长按不再进四点标定，改为「换一套预设重新识别」 */
+        [self2 reProbePreset];
     };
     self.ballWindow.onMenuItem = ^(NSInteger action) {
         __strong typeof(weakSelf) self2 = weakSelf;
@@ -219,9 +228,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
             case JJMenuActionPlugin:
                 [self2 setPluginEnabled:!self2.enabled];
                 break;
-                break;
-            case JJMenuActionManualCalibrate:
-                [self2 manualCalibrate];
                 break;
             case JJMenuActionHUD:
                 [self2 toggleHUD];
@@ -298,9 +304,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     e1.action = 0;              // 0 = 无动作，只展示
     [arr addObject:e1];
 
-    JJMenuEntry *e2 = [JJMenuEntry title:@"手动标定" symbol:@"hand.tap"];
-    e2.action = JJMenuActionManualCalibrate;
-    [arr addObject:e2];
+    /* ★ 2.0.0r5：原「手动标定」项已移除 —— 四角改用内置预设（JJ_PRESET_*），
+       开机即用，不需要用户参与。留着长按球做「换预设重试」的兜底。 */
 
     JJMenuEntry *e3 = [JJMenuEntry title:@"HUD" symbol:@"rectangle.topthird.inset.filled"];
     e3.action = JJMenuActionHUD;
@@ -785,7 +790,76 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     }
 }
 
-#pragma mark - 标定动作
+#pragma mark - 预设自检（2.0.0r5）
+
+/* 预设自检：四角现在写死，唯一可能出问题的是「用了错的那套预设」。
+   做法：打开插件后给 6 秒观察窗，期间只要出现过一次 legalNow/codesValid，
+   就认为预设选对了并锁定；6 秒都没读出合法局面 → 换另一套预设重试一次
+   （人机 ↔ 排位，两者只差 50pt 纵向），仍不行就在 HUD 上明说，不再静默。 */
+- (void)armPresetSelfCheck {
+    self.presetSwitchLeft = 1;      /* 只自动切换一次，避免来回抖 */
+    self.presetProbeDeadline = [[NSDate date] timeIntervalSince1970] + 6.0;
+
+    /* 2.0.0r5：原来这些状态是 recalibrate/handleCalibration 里设的。
+       手动标定下线后必须在这里设全，否则 tick 不会跑起来（state 停在 Idle）。 */
+    self.state = JJGameStateWaitingBoard;
+    self.lastFrameSerial = 0;
+    self.lastFingerprint = nil;
+    self.lastLearnAttempt = 0;
+    self.learnFailCount = 0;
+    self.loadedTemplateCount = 0;
+    [self startTimer];
+
+    NSLog(@"[JJCheat] 预设自检开始：当前=%@",
+          [[JJCalibrator shared] currentCalibScheme] == 1 ? @"排位" : @"人机");
+}
+
+- (void)tickPresetSelfCheckWithResult:(NSDictionary *)result {
+    if (self.presetSwitchLeft <= 0) return;
+    BOOL ok = [result[@"legalNow"] boolValue] || [result[@"codesValid"] boolValue];
+    if (ok) {
+        self.presetSwitchLeft = 0;
+        NSLog(@"[JJCheat] 预设自检通过：%@ 这套四角与当前对局匹配",
+              [[JJCalibrator shared] currentCalibScheme] == 1 ? @"排位" : @"人机");
+        return;
+    }
+    if ([[NSDate date] timeIntervalSince1970] < self.presetProbeDeadline) return;
+
+    self.presetSwitchLeft--;
+    NSLog(@"[JJCheat] 预设自检失败：%@ 这套读不出合法局面 → 换另一套重试",
+          [[JJCalibrator shared] currentCalibScheme] == 1 ? @"排位" : @"人机");
+    [[JJCalibrator shared] switchPresetScheme];
+    self.presetProbeDeadline = [[NSDate date] timeIntervalSince1970] + 6.0;
+    self.lastFrameSerial = 0;        /* 强制下一帧重新下发四角 */
+    self.lastFingerprint = nil;
+    self.learnedBoard = NO;
+    self.learnFailCount = 0;
+    self.loadedTemplateCount = 0;
+    self.state = JJGameStateWaitingBoard;
+    [self.ballWindow toast:@"已切换棋盘预设，正在重新识别"];
+}
+
+/* 长按球：手动重新自检（不恢复四点标定）。用于换机型/App 改版后一键重试。 */
+- (void)reProbePreset {
+    if (!self.enabled) {
+        [[JJHUDWindow shared] showStatus:JJCopyNeedPluginOn];
+        [self.ballWindow toast:JJCopyNeedPluginOn];
+        return;
+    }
+    if (!self.activated) [self activate];
+    [[JJCalibrator shared] switchPresetScheme];
+    [self armPresetSelfCheck];
+    self.lastFrameSerial = 0;
+    self.lastFingerprint = nil;
+    self.learnedBoard = NO;
+    self.learnFailCount = 0;
+    self.loadedTemplateCount = 0;
+    self.state = JJGameStateWaitingBoard;
+    [self startTimer];
+    [self.ballWindow toast:@"已切换预设，重新识别中"];
+}
+
+#pragma mark - 手动标定（2.0.0r5 起未接线，保留实现待清理）
 
 - (void)manualCalibrate {
     if (!self.enabled) {
@@ -1318,6 +1392,9 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
 
 - (void)handleProcessResult:(NSDictionary *)result {
     self.lastRecognition = result;
+
+    /* 2.0.0r5：预设自检（读不出合法局面就换另一套预设，只切一次） */
+    [self tickPresetSelfCheckWithResult:result];
 
     BOOL stalled = [result[@"skipAnalyze"] boolValue];
     BOOL moved = [result[@"moveDetected"] boolValue];

@@ -106,7 +106,7 @@
    换到青蓝色后两边彻底分开：红/金 = 游戏的标记，青蓝 = 我们的建议。 */
 #define JJ_COLOR_ARROW          [UIColor colorWithRed:0.10 green:0.72 blue:1.00 alpha:0.28]
 #define JJ_COLOR_ARROW_HEAD     [UIColor colorWithRed:0.05 green:0.62 blue:1.00 alpha:0.38]
-#define JJ_CHEAT_VERSION        @"2.0.0r4"   /* 与 deb control 版本保持一致 */
+#define JJ_CHEAT_VERSION        @"2.0.0r5"   /* 与 deb control 版本保持一致 */
 #define JJ_COLOR_BOARD_LINE     [UIColor colorWithRed:0.25 green:0.78 blue:1.00 alpha:0.42]
 #define JJ_COLOR_PANEL_BG       [UIColor colorWithRed:0.04 green:0.05 blue:0.08 alpha:0.86]
 #define JJ_COLOR_TEXT_MAIN      [UIColor colorWithRed:1.00 green:0.95 blue:0.55 alpha:1.0]
@@ -120,11 +120,43 @@
 #define JJ_KEY_CORNERS          @"JJCheat.corners"
 #define JJ_KEY_ENABLED          @"JJCheat.enabled"
 #define JJ_KEY_CALIBRATED       @"JJCheat.calibrated"
+/* 2.0.0r5：当前生效的内置标定预设（0=人机对战 1=排位赛） */
+#define JJ_KEY_CALIB_SCHEME     @"JJCheat.calibScheme"
 #define JJ_KEY_HUD_VISIBLE      @"JJCheat.hudVisible"
 #define JJ_KEY_THINK_MS         @"JJCheat.thinkMs"
 /* 思考时间的一次性迁移标记：2.0.x 存下来的 200ms 是给 JS 引擎调的值，
    对 Pikafish 太短，首次启动时抬到新默认值，只做一次。 */
 #define JJ_KEY_THINK_MS_V2      @"JJCheat.thinkMsV2"
+
+/* ============================================================
+ *  2.0.0r5 内置标定预设
+ *
+ *  为什么不再让用户点四角：
+ *    手动四点标定是整条链路上唯一需要人参与、也最容易点偏的一步。
+ *    2026-11-19 两次「盘面读错 → 整帧作废 → 轮次错位」，根因都是四角
+ *    偏了 30~40pt（下边点在 660/697，真值 659/707）。
+ *
+ *  坐标怎么来的：
+ *    真机截图逐像素投影，取棋盘最外圈九条竖线、十条横线的首末交点。
+ *    参考分辨率 428x926 point，运行时按实际 bounds 等比缩放。
+ *
+ *  两套只差纵向：
+ *    排位赛顶部多一条对手头像 + 大盘计时，棋盘整体下移约 50pt；
+ *    列方向和列距两块板完全一致（28~400 / 46.3）。
+ * ============================================================ */
+#define JJ_PRESET_REF_W         428.0
+#define JJ_PRESET_REF_H         926.0
+/* 方案 0：人机对战（顶部没有对手计时条） */
+#define JJ_PRESET_AI_L          28.0
+#define JJ_PRESET_AI_T          257.0
+#define JJ_PRESET_AI_R          398.0
+#define JJ_PRESET_AI_B          659.0
+/* 方案 1：排位赛 / 棋力评测 / 锦标赛（顶部有头像与 15:00 大盘计时） */
+#define JJ_PRESET_RANK_L        28.0
+#define JJ_PRESET_RANK_T        307.0
+#define JJ_PRESET_RANK_R        400.0
+#define JJ_PRESET_RANK_B        707.0
+
 
 /* 插件图标：随 deb 落到 jbroot 下，悬浮球优先用它，读不到回退文字「象棋」 */
 #define JJ_LOGO_REL_PATH        @"Library/Application Support/JJCheat/logo.png"
