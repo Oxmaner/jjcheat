@@ -5,7 +5,10 @@
 
 #import "JJPikafishInstaller.h"
 #import "JJConfig.h"
-#import "JJRootPath.h"   /* 2.0.0r2：jbroot 改运行时 dlsym，不再链 libroothide */
+
+#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
+#import <roothide.h>
+#endif
 
 /* 复制指纹：NSUserDefaults 记录「上次复制时源文件的大小」。
    装了新 deb（换了网）→ 大小几乎必变 → 下次启动自动重拷。 */
@@ -70,9 +73,11 @@ static NSString *sResolvedNet = nil;
         [paths addObject:[link stringByAppendingPathComponent:rel]];
     }
 
-    /* 块 2：jbroot()（仅 roothide 环境有；取不到就少一个备选） */
-    NSString *rooted = JJResolveRootPath([@"/" stringByAppendingString:rel]);
-    if (rooted.length) [paths addObject:rooted];
+    /* 块 2：jbroot()（仅 roothide 构建有）。
+       2.0.0r3：直呼，不要 dlsym —— arm64e 下 ptrauth 会崩，详见 JJBallWindow.m。 */
+#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
+    [paths addObject:jbroot([@"/" stringByAppendingString:rel])];
+#endif
 
     /* 块 3 / 4：rootless 与 rootful 字面量 */
     [paths addObject:[@"/var/jb" stringByAppendingPathComponent:rel]];

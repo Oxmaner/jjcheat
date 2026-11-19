@@ -6,7 +6,10 @@
 #import "JJBallWindow.h"
 #import "JJConfig.h"
 #import "JJMenuStyle.h"
-#import "JJRootPath.h"   /* 2.0.0r2：jbroot 改运行时 dlsym，不再链 libroothide */
+
+#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
+#import <roothide.h>
+#endif
 
 static const CGFloat kJJBallSize      = 52.0;
 /** 引擎状态点直径（2.1.0 新增：球右上角小圆点） */
@@ -29,8 +32,15 @@ static const NSInteger kJJMenuCols = 2;
 static UIImage *JJLoadLogoImage(void) {
     NSString *rel = [@"/" stringByAppendingString:JJ_LOGO_REL_PATH];
     NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithCapacity:5];
-    NSString *rooted = JJResolveRootPath(rel);
-    if (rooted.length) [paths addObject:rooted];
+    /* ★ 2.0.0r3：这里**必须**直呼 jbroot，不能改成 dlsym 运行时取符号。
+     * r2 试过 dlsym(RTLD_DEFAULT,"jbroot") 再强转函数指针调用，arm64e 真机
+     * 启动即崩：EXC_BAD_ACCESS / possible pointer authentication failure。
+     * 原因是 arm64e 的间接调用要走 ptrauth 签名，dlsym 拿到的裸指针没签名，
+     * 且 jbroot 的实际 ABI 与强转的类型不一定一致 → 返回垃圾 NSString，
+     * 下一行 pathExtension/extract 就踩死。所以保持原样，用 libroothide。 */
+#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
+    [paths addObject:jbroot(rel)];
+#endif
     [paths addObject:rel];
     [paths addObject:[JJ_ENGINE_PATH_ROOTLESS stringByReplacingOccurrencesOfString:@"engine.js"
                                                                        withString:@"logo.png"]];

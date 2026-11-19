@@ -55,9 +55,12 @@
 static NSString * const kJJEngineFeatureMark = @"pikafishNative2179";
 
 // roothide 适配：jbroot 每次越狱都会换一个随机路径，必须在运行时解析。
-// 2.0.0r2：jbroot 改走 JJRootPath.h 的运行时 dlsym，不再 import <roothide.h>，
-// 也就不再需要链接 libroothide（Dylix 自建包里没有这份 stub 库）。
-#import "JJRootPath.h"
+// 非 roothide 构建（rootful/rootless）不引这个头，避免多出 libroothide 依赖。
+// ★ 2.0.0r3：r2 曾把 jbroot 换成 dlsym 运行时取符号，arm64e 真机启动即崩
+//    （ptrauth 校验失败 → 返回垃圾 NSString）。已回滚，仍走编译期链接。
+#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
+#import <roothide.h>
+#endif
 
 @interface JJVisionBridge () {
     /* ★ 2.0.0r2：dispatch 队列改成 ivar，不用 @property。
@@ -200,9 +203,9 @@ static NSString *JJScriptFingerprint(NSData *d) {
     if (container.length) [candidates addObject:container];
 
     // ② roothide 正统路径：jbroot() -> <jbroot>/Library/Application Support/JJCheat/engine.js
-    //    非 roothide 环境 JJResolveRootPath 返回 nil，直接跳过。
-    NSString *rootedScript = JJResolveRootPath(@"/Library/Application Support/JJCheat/engine.js");
-    if (rootedScript.length) [candidates addObject:rootedScript];
+#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
+    [candidates addObject:jbroot(@"/Library/Application Support/JJCheat/engine.js")];
+#endif
     // ③ rootless（Dopamine 等）的固定 /var/jb
     [candidates addObject:JJ_ENGINE_PATH_ROOTLESS];
     // ④ rootful / 未做路径改写的 jbroot 字面量
