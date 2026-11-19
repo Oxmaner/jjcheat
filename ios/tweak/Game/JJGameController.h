@@ -25,9 +25,6 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)start;
 - (void)stop;
 
-/** 强制重新标定（手动四点） */
-- (void)recalibrate;
-
 /** 重置到标准开局（显式清锚盘） */
 - (void)resetToStartPosition;
 

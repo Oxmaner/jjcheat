@@ -460,7 +460,7 @@ static NSString *JJFormatNodes(NSInteger nodes) {
 
     // ---- 第一行：记谱 + 分值 ----
     if (stalled) {
-        self.lineMain.text = @"识别未收敛 · 点悬浮球【手动标定】";
+        self.lineMain.text = @"识别未收敛 · 请点「重来」回开局";
         self.lineScore.text = @"";
     } else if (waiting) {
         self.lineMain.text = hasMove ? cn : @"等待对方走子（红先黑后）";

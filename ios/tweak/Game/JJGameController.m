@@ -39,6 +39,7 @@ typedef NS_ENUM(NSInteger, JJGameState) {
  */
 typedef NS_ENUM(NSInteger, JJMenuAction) {
     JJMenuActionPlugin = 100,
+    JJMenuActionBoardScheme,      /* 2.0.0r6：人机 / 排位 棋盘切换 */
     JJMenuActionManualCalibrate,
     JJMenuActionHUD,
     JJMenuActionResetBoard,
@@ -77,9 +78,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 /* 重标定必须学成才采纳，失败回滚 */
 @property (nonatomic, assign) BOOL calibrationPending;
 @property (nonatomic, assign) NSTimeInterval lastHeartbeatTs;
-/* 2.0.0r5 预设自检：还剩几次自动切换、本轮观察窗截止时刻 */
-@property (nonatomic, assign) NSInteger presetSwitchLeft;
-@property (nonatomic, assign) NSTimeInterval presetProbeDeadline;
 
 /* ---- 2.1.0 引擎联动 ---- */
 /* 最近一次识别结果（recognition dict），拼装 HUD 用 */
@@ -97,10 +95,10 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 
 - (void)showMenu;
 - (void)setPluginEnabled:(BOOL)on;
-/* 2.0.0r5：手动标定入口已下线，长按球改为「重新自检预设」 */
-- (void)reProbePreset;
-- (void)armPresetSelfCheck;
-- (void)tickPresetSelfCheckWithResult:(NSDictionary *)result;
+/* 2.0.0r6：手动标定下线，四角走内置预设；长按球=重新学习一遍 */
+- (void)armRecognizer;
+- (void)restartRecognition;
+- (void)toggleBoardScheme;
 - (void)toggleHUD;
 - (void)showEngineStatus;
 - (void)applyThinkMs:(NSInteger)v;
@@ -182,7 +180,7 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
      * 人机/排位各一套，启动即可用。这里只把「预设自检」挂上：
      * 连续 6 秒读不出合法局面 → 自动换另一套预设再试一次，仍不行就在 HUD 上明说。
      */
-    [self armPresetSelfCheck];
+    [self armRecognizer];
     [self refreshEngineDot];
 }
 
@@ -216,7 +214,7 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
         if (!self2 || !self2.enabled) return;
         if (!self2.activated) [self2 activate];
         /* 2.0.0r5：长按不再进四点标定，改为「换一套预设重新识别」 */
-        [self2 reProbePreset];
+        [self2 restartRecognition];
     };
     self.ballWindow.onMenuItem = ^(NSInteger action) {
         __strong typeof(weakSelf) self2 = weakSelf;
@@ -228,6 +226,9 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
             case JJMenuActionPlugin:
                 [self2 setPluginEnabled:!self2.enabled];
                 break;
+                break;
+            case JJMenuActionBoardScheme:
+                [self2 toggleBoardScheme];
                 break;
             case JJMenuActionHUD:
                 [self2 toggleHUD];
@@ -304,8 +305,13 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     e1.action = 0;              // 0 = 无动作，只展示
     [arr addObject:e1];
 
-    /* ★ 2.0.0r5：原「手动标定」项已移除 —— 四角改用内置预设（JJ_PRESET_*），
-       开机即用，不需要用户参与。留着长按球做「换预设重试」的兜底。 */
+    /* ★ 2.0.0r6：四角是内置预设，但人机与排位两套只差 50pt 纵向，
+       必须让用户能选 —— 选错就整盘读不出来，且现在没有自动兜底。 */
+    BOOL isRank = ([[JJCalibrator shared] currentCalibScheme] == 1);
+    JJMenuEntry *eScheme = [JJMenuEntry title:@"棋盘" symbol:@"square.grid.3x3"];
+    eScheme.action = JJMenuActionBoardScheme;
+    eScheme.value = isRank ? @"排位" : @"人机";
+    [arr addObject:eScheme];
 
     JJMenuEntry *e3 = [JJMenuEntry title:@"HUD" symbol:@"rectangle.topthird.inset.filled"];
     e3.action = JJMenuActionHUD;
@@ -790,18 +796,22 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     }
 }
 
-#pragma mark - 预设自检（2.0.0r5）
+#pragma mark - 识别启动与重试（2.0.0r6）
 
-/* 预设自检：四角现在写死，唯一可能出问题的是「用了错的那套预设」。
-   做法：打开插件后给 6 秒观察窗，期间只要出现过一次 legalNow/codesValid，
-   就认为预设选对了并锁定；6 秒都没读出合法局面 → 换另一套预设重试一次
-   （人机 ↔ 排位，两者只差 50pt 纵向），仍不行就在 HUD 上明说，不再静默。 */
-- (void)armPresetSelfCheck {
-    self.presetSwitchLeft = 1;      /* 只自动切换一次，避免来回抖 */
-    self.presetProbeDeadline = [[NSDate date] timeIntervalSince1970] + 6.0;
+/* 四角来自内置预设（JJConfig.h），不再做「读不出来就换另一套」的自动兜底 ——
+   两套坐标各自对应一个固定场景，切换靠菜单里手动选，自动切换反而会在
+   边缘情况下左右横跳。这里只负责把识别流水线拉起来。 */
+/* 在人机 / 排位两套内置预设之间切换。两套只差棋盘纵向位置 50pt。 */
+- (void)toggleBoardScheme {
+    NSInteger next = ([[JJCalibrator shared] currentCalibScheme] == 1) ? 0 : 1;
+    [[JJCalibrator shared] applyPresetScheme:next];
+    [self armRecognizer];
+    [self.ballWindow toast:(next == 1 ? @"已切换：排位赛棋盘" : @"已切换：人机对战棋盘")];
+}
 
-    /* 2.0.0r5：原来这些状态是 recalibrate/handleCalibration 里设的。
-       手动标定下线后必须在这里设全，否则 tick 不会跑起来（state 停在 Idle）。 */
+- (void)armRecognizer {
+    /* 这些状态原先由 recalibrate/handleCalibration 设置；
+       手动标定下线后必须在这里设全，否则 tick 不会跑（state 停在 Idle）。 */
     self.state = JJGameStateWaitingBoard;
     self.lastFrameSerial = 0;
     self.lastFingerprint = nil;
@@ -809,161 +819,63 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     self.learnFailCount = 0;
     self.loadedTemplateCount = 0;
     [self startTimer];
-
-    NSLog(@"[JJCheat] 预设自检开始：当前=%@",
+    NSLog(@"[JJCheat] 识别启动：预设=%@，四角来自内置常量",
           [[JJCalibrator shared] currentCalibScheme] == 1 ? @"排位" : @"人机");
 }
 
-- (void)tickPresetSelfCheckWithResult:(NSDictionary *)result {
-    if (self.presetSwitchLeft <= 0) return;
-    BOOL ok = [result[@"legalNow"] boolValue] || [result[@"codesValid"] boolValue];
-    if (ok) {
-        self.presetSwitchLeft = 0;
-        NSLog(@"[JJCheat] 预设自检通过：%@ 这套四角与当前对局匹配",
-              [[JJCalibrator shared] currentCalibScheme] == 1 ? @"排位" : @"人机");
-        return;
-    }
-    if ([[NSDate date] timeIntervalSince1970] < self.presetProbeDeadline) return;
-
-    self.presetSwitchLeft--;
-    NSLog(@"[JJCheat] 预设自检失败：%@ 这套读不出合法局面 → 换另一套重试",
-          [[JJCalibrator shared] currentCalibScheme] == 1 ? @"排位" : @"人机");
-    [[JJCalibrator shared] switchPresetScheme];
-    self.presetProbeDeadline = [[NSDate date] timeIntervalSince1970] + 6.0;
-    self.lastFrameSerial = 0;        /* 强制下一帧重新下发四角 */
-    self.lastFingerprint = nil;
-    self.learnedBoard = NO;
-    self.learnFailCount = 0;
-    self.loadedTemplateCount = 0;
-    self.state = JJGameStateWaitingBoard;
-    [self.ballWindow toast:@"已切换棋盘预设，正在重新识别"];
-}
-
-/* 长按球：手动重新自检（不恢复四点标定）。用于换机型/App 改版后一键重试。 */
-- (void)reProbePreset {
+/* 长按球：重新学习一遍（不动预设、不重标定）。
+   用途：识别卡住、或中途重开一局后想让它重新锚定。 */
+- (void)restartRecognition {
     if (!self.enabled) {
         [[JJHUDWindow shared] showStatus:JJCopyNeedPluginOn];
         [self.ballWindow toast:JJCopyNeedPluginOn];
         return;
     }
     if (!self.activated) [self activate];
-    [[JJCalibrator shared] switchPresetScheme];
-    [self armPresetSelfCheck];
-    self.lastFrameSerial = 0;
-    self.lastFingerprint = nil;
-    self.learnedBoard = NO;
-    self.learnFailCount = 0;
-    self.loadedTemplateCount = 0;
-    self.state = JJGameStateWaitingBoard;
-    [self startTimer];
-    [self.ballWindow toast:@"已切换预设，重新识别中"];
-}
-
-#pragma mark - 手动标定（2.0.0r5 起未接线，保留实现待清理）
-
-- (void)manualCalibrate {
-    if (!self.enabled) {
-        [[JJHUDWindow shared] showStatus:JJCopyNeedPluginOn];
-        [self.ballWindow toast:JJCopyNeedPluginOn];
-        return;
-    }
-    if (!self.activated) [self activate];
-    self.autoCalibrating = NO;
-    [self recalibrate];
-}
-
-- (void)recalibrate {
-    [[JJCalibrator shared] snapshot];
-    [self.timer invalidate];
-    self.timer = nil;
-    self.learnedBoard = NO;
-    self.state = JJGameStateCalibrating;
-
-    [self.ballWindow toast:JJCopyCalibTapFourCorners];
-    __weak typeof(self) weakSelf = self;
-    [[JJHUDWindow shared] beginCalibrationWithCompletion:^(NSArray<NSValue *> *corners) {
-        __strong typeof(weakSelf) self2 = weakSelf;
-        [self2 handleCalibration:corners];
-    }];
-}
-
-- (void)handleCalibration:(NSArray<NSValue *> *)corners {
-    if (corners.count != 4) return;
-    /* 2.0.1 四角几何校验：点歪 / 聚团 / 顺序反 → 拒绝，保留上一次成功标定 */
-    if (![[JJCalibrator shared] handleManualCalibration:corners]) {
-        [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
-        if ([[JJCalibrator shared] restoreSnapshot]) {
-            self.learnedBoard = YES;
-            self.state = JJGameStateRunning;
-            self.calibrationPending = NO;
-            [self startTimer];
-            [[JJHUDWindow shared] showStatus:JJCopyCalibInvalidRestored];
-            [self.ballWindow toast:JJCopyCalibInvalidRestored];
-        } else {
-            self.state = JJGameStateWaitingBoard;
-            [self startTimer];
-            [[JJHUDWindow shared] showStatus:@"四角无效 · 请按左上→右上→右下→左下重标"];
-        }
-        return;
-    }
-
-    self.lastFrameSerial = 0;
-    self.lastFingerprint = nil;
-    self.lastLearnAttempt = 0;
-    self.learnFailCount = 0;
-    self.calibrationPending = YES;
-    self.state = JJGameStateWaitingBoard;
-
-    /* 2.1.105：标定一完成就**立刻把网格画出来**，让用户当场确认四角准不准，
-       不必等模板学习（学习失败时原来什么都不会显示）。 */
-    [[JJCalibrator shared] ensureGridPts];
-    [[JJHUDWindow shared] applyGridPoints:[JJCalibrator shared].gridPts];
-
-    /* ★ 2.0.0r1：尝试复用上次学好的 90 格模板。
-       四角与当初学习时吻合（偏差 < 14px）才用，否则丢弃重新学。
-       这样中局开插件也能立刻识别，不必回开局。 */
-    self.loadedTemplateCount = 0;
-    {
-        CGRect nb3 = [UIScreen mainScreen].nativeBounds;
-        NSArray *px = [[JJCalibrator shared] cornersForWidth:(int)nb3.size.width
-                                                      height:(int)nb3.size.height];
-        if (px) {
-            NSTimeInterval t0 = CACurrentMediaTime();
-            int n = [[JJVisionBridge shared] loadTemplatesMatchingCorners:px];
-            self.loadedTemplateCount = n;
-            if (n > 0) {
-                NSLog(@"[JJCheat] 已复用持久化模板 %d 条（%.1fms），中局也可直接识别",
-                      n, (CACurrentMediaTime() - t0) * 1000.0);
-            }
-        }
-    }
-    self.processNotBefore = 0;
-    [self startTimer];
-    [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
-    [[JJHUDWindow shared] showStatus:@"标定完成 · 请进入一局新棋（开局布局）"];
-    [self.ballWindow toast:JJCopyCalibDone];
+    [self armRecognizer];
+    [self.ballWindow toast:@"重新识别中，请停在开局画面"];
 }
 
 - (void)resetToStartPosition {
+
     /* 用户显式「重置到开局」：这里才真正清空 JS 锚盘，重标定路径不会走 */
+
     self.learnedBoard = NO;
+
     self.calibrationPending = NO;
+
     self.autoCalibrating = NO;
+
     [[JJCalibrator shared] clearRefined];
+
     self.lastFingerprint = nil;
+
     self.lastFrameSerial = 0;
+
     self.processNotBefore = 0;
+
     self.lastProcessTime = 0;
+
     self.learnFailCount = 0;
+
     self.lastSearchFen = nil;
+
     self.engineResult = nil;
+
     self.engineGen++;
+
     [[JJVisionBridge shared] resetWithFen:nil];
+
     [[JJPikafish shared] notifyNewGame];
+
     self.state = JJGameStateWaitingBoard;
+
     [self startTimer];
+
     [[JJHUDWindow shared] showStatus:@"已重置 · 等开局画面"];
+
     [self.ballWindow toast:JJCopyResetDone];
+
 }
 
 #pragma mark - 画面指纹（主线程极轻计算）
@@ -1281,7 +1193,7 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
             } else {
                 [self.timer invalidate];
                 self.timer = nil;
-                [[JJHUDWindow shared] showStatus:@"学习失败 · 请停在开局画面再点自动标定"];
+                [[JJHUDWindow shared] showStatus:@"学习失败 · 请点「重来」回开局，再重开插件"];
                 NSLog(@"[JJCheat] 学习连续失败 %ld 次，已暂停重试（未进入识别）",
                       (long)self.learnFailCount);
             }
@@ -1393,8 +1305,6 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
 - (void)handleProcessResult:(NSDictionary *)result {
     self.lastRecognition = result;
 
-    /* 2.0.0r5：预设自检（读不出合法局面就换另一套预设，只切一次） */
-    [self tickPresetSelfCheckWithResult:result];
 
     BOOL stalled = [result[@"skipAnalyze"] boolValue];
     BOOL moved = [result[@"moveDetected"] boolValue];

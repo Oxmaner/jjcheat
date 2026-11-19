@@ -106,7 +106,7 @@
    换到青蓝色后两边彻底分开：红/金 = 游戏的标记，青蓝 = 我们的建议。 */
 #define JJ_COLOR_ARROW          [UIColor colorWithRed:0.10 green:0.72 blue:1.00 alpha:0.28]
 #define JJ_COLOR_ARROW_HEAD     [UIColor colorWithRed:0.05 green:0.62 blue:1.00 alpha:0.38]
-#define JJ_CHEAT_VERSION        @"2.0.0r5"   /* 与 deb control 版本保持一致 */
+#define JJ_CHEAT_VERSION        @"2.0.0r6"   /* 与 deb control 版本保持一致 */
 #define JJ_COLOR_BOARD_LINE     [UIColor colorWithRed:0.25 green:0.78 blue:1.00 alpha:0.42]
 #define JJ_COLOR_PANEL_BG       [UIColor colorWithRed:0.04 green:0.05 blue:0.08 alpha:0.86]
 #define JJ_COLOR_TEXT_MAIN      [UIColor colorWithRed:1.00 green:0.95 blue:0.55 alpha:1.0]

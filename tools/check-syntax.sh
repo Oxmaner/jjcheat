@@ -151,6 +151,7 @@ if [ -f "$CTRL" ]; then
         return 1
     }
     check_case JJMenuActionPlugin          setPluginEnabled
+    check_case JJMenuActionBoardScheme      toggleBoardScheme
     check_case JJMenuActionHUD             toggleHUD
     check_case JJMenuActionResetBoard      resetToStartPosition
     check_case JJMenuActionThink           showThinkSheet
@@ -164,7 +165,7 @@ if [ -f "$CTRL" ]; then
         menu_fail=1
     fi
 
-    [ "$menu_fail" -eq 0 ] && echo "ok    菜单分派：7 条 action → 方法全部核对通过"
+    [ "$menu_fail" -eq 0 ] && echo "ok    菜单分派：${cnt} 条 action → 方法全部核对通过（与菜单项数一致）"
 else
     echo "FAIL  菜单一致性：找不到 $CTRL"
     menu_fail=1

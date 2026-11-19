@@ -18,10 +18,6 @@ NSString *const JJCopyEngineUnavailable = @"引擎不可用";
 NSString *const JJCopyRecogPendingKing    = @"识别待确认 · 王将不唯一";
 NSString *const JJCopyRecogPendingLowConf = @"识别待确认 · 画面不清";
 
-NSString *const JJCopyCalibAutoRunning     = @"请按左上→右上→右下→左下点四个角";
-NSString *const JJCopyCalibTapFourCorners  = @"点棋盘四个角：左上→右上→右下→左下";
-NSString *const JJCopyCalibDone            = @"标定完成 · 请进入一局新棋";
-NSString *const JJCopyCalibInvalidRestored = @"四角无效 · 已恢复上次标定";
 NSString *const JJCopyResetDone            = @"已重置 · 请停在开局棋盘画面";
 
 NSString *const JJCopySheetThinkTitle   = @"思考时间";

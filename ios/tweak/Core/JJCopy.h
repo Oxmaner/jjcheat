@@ -39,11 +39,9 @@ extern NSString *const JJCopyEngineUnavailable;     // 引擎不可用
 extern NSString *const JJCopyRecogPendingKing;      // 识别待确认 · 王将不唯一
 extern NSString *const JJCopyRecogPendingLowConf;   // 识别待确认 · 画面不清
 
-/* ---- 标定 ---- */
-extern NSString *const JJCopyCalibAutoRunning;      // 自动标定中 · 请停在开局棋盘画面
-extern NSString *const JJCopyCalibTapFourCorners;   // 点棋盘四个角：左上→右上→右下→左下
-extern NSString *const JJCopyCalibDone;             // 标定完成 · 请进入一局新棋
-extern NSString *const JJCopyCalibInvalidRestored;  // 四角无效 · 已恢复上次标定
+/* ---- 对局状态 ---- */
+/* 2.0.0r6：标定相关文案随「手动标定」一起删除 —— 四角已改为内置预设，
+   用户侧不再有「需要标定」这个状态，留着只会让人去找不存在的入口。 */
 extern NSString *const JJCopyResetDone;             // 已重置 · 请停在开局棋盘画面
 
 /* ---- 二级菜单（2.1.80） ---- */
