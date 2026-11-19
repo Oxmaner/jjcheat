@@ -593,8 +593,71 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
 
 #pragma mark - 搜索调度
 
+/* ============================================================
+ *  2.0.0r4：局面合法性预检 —— 进程内引擎的最后一道闸
+ *
+ *  为什么必须在 OBJC 层拦：
+ *    Pikafish 把「position 解析失败」当成致命错误，走
+ *    UCIEngine::terminate_on_critical_error()。原生实现是 std::exit(1)，
+ *    我们早前把 exit 换成了「置标志 + 返回」，但返回后调用栈已经残缺，
+ *    真机实测照样 SIGSEGV —— 12:36:56 那份 .ips，栈顶就是
+ *    terminate_on_critical_error + 0x7c，崩在 0x18。
+ *    所以干脆不让非法局面进引擎：这里先校验，不合格就放弃本次搜索，
+ *    上层按「没有结果」处理（不重启引擎、不重新 mmap 50MB 权重）。
+ *
+ *  检的就是 Pikafish 判非法的几类：段数/宽度、将帅各一个、士象越位。
+ *  识别网格偏半格时，最先露馅的就是「象/士被读到非法点」——
+ *  真机日志里的 `BLACK bishop(s) on invalid positions` 正是这一类。
+ * ============================================================ */
+static BOOL JJFenLooksLegal(NSString *fen) {
+    if (!fen.length) return NO;
+    NSString *board = [fen componentsSeparatedByString:@" "].firstObject;
+    NSArray<NSString *> *ranks = [board componentsSeparatedByString:@"/"];
+    if (ranks.count != 10) return NO;
+
+    /* 象的七个合法落点（黑方视角；红方按 9-r 镜像） */
+    static const int kElephant[7][2] = {{2,0},{6,0},{0,2},{4,2},{8,2},{2,4},{6,4}};
+    int kingBlack = 0, kingRed = 0;
+
+    for (int r = 0; r < 10; r++) {
+        NSData *d = [ranks[r] dataUsingEncoding:NSUTF8StringEncoding];
+        const unsigned char *p = d.bytes;
+        int col = 0;
+        for (NSUInteger i = 0; i < d.length; i++) {
+            unsigned char c = p[i];
+            if (c >= '1' && c <= '9') { col += (c - '0'); continue; }
+            if (col >= 9) return NO;                       /* 该行超宽 */
+            if (c == 'k') kingBlack++;
+            else if (c == 'K') kingRed++;
+            else if (c == 'a') { if (col < 3 || col > 5 || r > 2) return NO; }   /* 黑士越宫 */
+            else if (c == 'A') { if (col < 3 || col > 5 || r < 7) return NO; }   /* 红仕越宫 */
+            else if (c == 'b' || c == 'B') {
+                int rr = (c == 'b') ? r : 9 - r;
+                BOOL ok = NO;
+                for (int t = 0; t < 7; t++) {
+                    if (kElephant[t][0] == col && kElephant[t][1] == rr) { ok = YES; break; }
+                }
+                if (!ok) return NO;                        /* 象/相在非法落点 */
+            }
+            else if (!(c == 'r' || c == 'n' || c == 'c' || c == 'p' ||
+                       c == 'R' || c == 'N' || c == 'C' || c == 'P')) {
+                return NO;                                 /* 未知棋子字符 */
+            }
+            col++;
+        }
+        if (col != 9) return NO;                           /* 该行不足 9 格 */
+    }
+    return kingBlack == 1 && kingRed == 1;
+}
+
 - (void)analyzeFen:(NSString *)fen movetime:(NSInteger)movetime completion:(JJPikaResultBlock)completion {
     if (!fen.length) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+        return;
+    }
+    /* 2.0.0r4：非法局面绝不进引擎（引擎那条路会把整个 App 带崩） */
+    if (!JJFenLooksLegal(fen)) {
+        NSLog(@"[JJCheat][Pika] 拒绝非法局面（不给引擎，避免致命错误路径）: %@", fen);
         if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
         return;
     }
