@@ -1457,13 +1457,21 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     BOOL waiting = [rec[@"waitingOpponent"] boolValue];
     BOOL stalled = [rec[@"skipAnalyze"] boolValue];
 
-    if (eng && !waiting && !stalled) {
+    /* 2.0.0r10：棋盘明明变了、却配不出合法一步 —— 这时旧结论一律不画。
+       以前这种帧会把上一次的箭头原样端出来，于是箭头指向一个真实棋盘上
+       已经不存在的子（用户最容易察觉的错）。宁可这半秒不画。 */
+    BOOL unconfirmed = [rec[@"boardChangedUnconfirmed"] boolValue] != 0;
+
+    if (eng && !waiting && !stalled && !unconfirmed) {
         [disp addEntriesFromDictionary:eng];
     } else {
         disp[@"suggest"] = @"";
         disp[@"suggestChinese"] = @"";
         disp[@"from"] = @-1;
         disp[@"to"] = @-1;
+        if (unconfirmed && !waiting && eng) {
+            disp[@"engineBlocked"] = @"棋盘有变化 · 正在确认";
+        }
     }
     disp[@"engineState"] = [[JJPikafish shared] stateText];
     disp[@"enginePending"] = self.enginePending ? @1 : @0;

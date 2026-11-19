@@ -1010,6 +1010,47 @@ var JJEngine = {
     // 落地 codes 永远是一盘真棋，盘面不变时引擎命中缓存、一次都不重算。
     var engCodes = session.flipped ? flipCodes(cls.codes) : cls.codes;
     var stepInfo = { changed: 0, move: null, noise: [] };
+
+    /* ------------------------------------------------------------------
+     * 2.0.0r10：半区变化（屏幕坐标 row>=5 = 我方半区）
+     *
+     * 轮次判定靠 lastMoverSide，而它只有「一步棋被完整确认」时才更新。
+     * 真机上经常配不出完整一步（落点被高亮圈盖住、起点被压缩读错），于是
+     * lastMoverSide 永远停在上一次，表现就是：
+     *   我方走完，HUD 还挂着建议（以为还没走）
+     *   对方走完，HUD 还在「等待对方走子」
+     * 但「哪个半区变了」极好判，一有变化就说明那一方刚动手。所以这里先算
+     * 一个乐观信号让轮次翻过去，识别确认在后面兜底（确认结果与它一致）。
+     * 两个半区同时变化（长距离子过河、吃子动画）就放弃，交回确认逻辑。
+     * ------------------------------------------------------------------ */
+    var halfOurs = 0, halfTheirs = 0;
+    if (session.prevScreenGrid && cls.grid && cls.grid.length === 90 &&
+        session.prevScreenGrid.length === 90) {
+      for (var hq = 0; hq < 90; hq++) {
+        if (session.prevScreenGrid[hq] === cls.grid[hq]) continue;
+        if (((hq / 9) | 0) >= 5) halfOurs++; else halfTheirs++;
+      }
+    }
+    if (cls.grid && cls.grid.length === 90) {
+      session.prevScreenGrid = Array.prototype.slice.call(cls.grid);
+    }
+    var mySideNow = session.flipped ? 'black' : 'red';
+    var halfMover = null;
+    if (halfOurs > 0 && halfTheirs === 0) halfMover = mySideNow;
+    else if (halfTheirs > 0 && halfOurs === 0) halfMover = (mySideNow === 'red' ? 'black' : 'red');
+    /* 同一个判断要连着两帧都成立才采纳：落子动画的第一帧经常只变了半格，
+       单帧就翻轮次会让 HUD 抖一下（回归 S3 就是守着这条）。两帧≈0.15~0.5s，
+       比等「一步棋完整确认」仍然快一个数量级。 */
+    if (halfMover && session.optMoverSide === halfMover) {
+      session.optMoverHit = (session.optMoverHit || 0) + 1;
+      session.optMoverSeq = session.frameSeq;
+    } else if (halfMover) {
+      session.optMoverSide = halfMover;
+      session.optMoverHit = 1;
+      session.optMoverSeq = session.frameSeq;
+    } else {
+      session.optMoverHit = 0;
+    }
     session.turnUpdated = 0;   // 2.1.91：本帧轮次是否已更新（保证一帧只翻一次）
     /* 2.1.93：帧序号。**不能拿 ply 当「标记是否已处理」的指纹** ——
        推进本身会改 ply，下一帧指纹立刻对不上，于是又推一次、再改 ply……
@@ -1095,6 +1136,44 @@ var JJEngine = {
     }
 
     if (anchor) {
+      /* ★ 2.0.0r10：锚盘漂移自愈 —— 防「一步错、步步错」
+         锚盘一旦被错误的走法推进，后面每帧都拿错局面去比，箭头就会指向
+         棋盘上不存在的子。这里每帧拿当前识别结果和锚盘比一次：差得太多
+         （>3 格）且连续三帧一致（躲开动画中间态），就丢弃锚盘、以当前
+         盘面重锚。三帧与「中途进对局」的重锚门槛保持一致，
+         代价是最多错 3 帧（≈0.5s），换来不会永久跑偏。 */
+      if (codesLegal(engCodes) && codesPositionPlausible(engCodes)) {
+        var driftN = countCodesDiff(anchor, engCodes);
+        /* 只在「中等漂移」区间接管：4~9 格。
+           >= JJ_RESEAT_MIN_DIFF 属于「换局/中途进对局」，交给下面那条
+           专门的 reseat 路径（它要 3 帧确认并负责落地新局面），不要抢。 */
+        if (driftN > 3 && driftN < JJ_RESEAT_MIN_DIFF) {
+          var driftKey = 0;
+          for (var dq = 0; dq < 90; dq++) driftKey = ((driftKey * 31) + (engCodes[dq] || 0)) | 0;
+          if (session.driftKey === driftKey) session.driftStable = (session.driftStable || 0) + 1;
+          else { session.driftStable = 1; session.driftKey = driftKey; }
+          if (session.driftStable >= 3) {
+            anchor = Array.prototype.slice.call(engCodes);
+            session.anchorCodes = anchor;
+            session.anchorFen = codesToBoardFen(anchor);
+            session.anchorFlipped = !!session.flipped;
+            session.lastBoardFen = session.anchorFen;
+            session.lastRawFen = session.anchorFen;
+            session.lastResult = null;
+            session.lastDispatchedFen = '';
+            session.driftStable = 0;
+            session.driftKey = 0;
+            /* 顺手用半区变化把走子方补上，轮次不至于继续卡着 */
+            if (halfOurs > 0 && halfTheirs === 0) session.lastMoverSide = mySideNow;
+            else if (halfTheirs > 0 && halfOurs === 0)
+              session.lastMoverSide = (mySideNow === 'red' ? 'black' : 'red');
+          }
+        } else {
+          session.driftStable = 0;
+          session.driftKey = 0;
+        }
+      }
+
       stepInfo = analyzeStepDiff(anchor, engCodes);
 
       /* ★ 2.1.92：用游戏自己画的「上一步标记」直接定位走法
@@ -1611,6 +1690,22 @@ var JJEngine = {
       replacedCount: quotaFix.replaced || 0,
       droppedCount: quotaFix.dropped || 0
     };
+
+    /* 2.0.0r10：乐观轮次覆盖。
+       半区变化给出的「谁刚动过」比完整配对早 1~3 秒。这里先按它把轮次翻过去，
+       窗口 15 帧（约 2 秒）后失效；同时写回 lastMoverSide，让后续帧的推导
+       与它一致，不会来回打架。只在画面稳定帧才写，躲开落子动画。 */
+    if (isStable && session.optMoverSide && (session.optMoverHit || 0) >= 2 &&
+        (session.frameSeq - (session.optMoverSeq || 0)) <= 15) {
+      var optTurn = (session.optMoverSide === 'red') ? 'b' : 'w';
+      if (optTurn !== out.turn) {
+        out.turn = optTurn;
+        out.waitingOpponent = (optTurn !== myTurnChar) ? 1 : 0;
+        out.optimisticTurn = 1;
+      }
+      session.lastMoverSide = session.optMoverSide;
+    }
+
     session.reseatDone = 0;
     // 日志里 15:11 起一直打「检测到走法 (null) (null)」：旧代码只在
     // tracker.tryAdvance 分支填 move，主路径从来没填过。现在由锚定状态机直接给出。
@@ -1763,6 +1858,9 @@ var JJEngine = {
     out.anchorRejected = anchorRejected ? 1 : 0;
     out.anchorRejectedStreak = session.anchorRejected || 0;
     out.diffChanged = stepInfo.changed;
+    /* 2.0.0r10：看到棋盘变了、却配不出合法一步 —— 这帧的结论不能拿来画箭头，
+       否则箭头会指向一个真实棋盘上已经不存在的子。上层据此清掉箭头。 */
+    out.boardChangedUnconfirmed = (stepInfo.changed > 0 && !stepInfo.move) ? 1 : 0;
     /* 2.1.85 诊断：真机没有 log 命令，把定位轮次判定所需的三个关键量
        直接透到 HUD 第二行，肉眼就能判断「是没认出变化」还是「认错了走子方」。 */
     out.dbgMover = session.lastMoverSide || '-';
