@@ -263,6 +263,99 @@ var JJEngine = {
   },
 
   /** 在开局局面状态下学习棋盘背景 */
+  /**
+   * ★ 2.0.0r1：把学好的 90 格模板导出成可持久化的普通对象。
+   *
+   * 背景：每次开插件都强制手动标定，而「学模板」要求标准开局 32 子。
+   * 中局开插件就永远学不成、识别起不来。把模板存下来，下次直接读，
+   * 中局也能立刻识别。
+   *
+   * 只导出纯数据（Float32Array → 普通数组），由 OC 侧写成 JSON 文件；
+   * 四角校验放在 OC 侧做（它才知道当前标定值）。
+   */
+  exportTemplates: function () {
+    try {
+      if (!session.recognizer || !session.recognizer.templates) return null;
+      var src = session.recognizer.templates;
+      var out = {};
+      var total = 0;
+      for (var k in src) {
+        if (!Object.prototype.hasOwnProperty.call(src, k)) continue;
+        var list = src[k];
+        if (!list || !list.length) continue;
+        var arr = [];
+        for (var j = 0; j < list.length; j++) {
+          var it = list[j];
+          if (!it || !it.w || !it.r) continue;
+          /* 降精度到 3 位小数：归一化 patch 的有效范围 ±3 左右，
+             0.001 的量化误差对 NCC 匹配完全无感，但 JSON 体积能砍掉一半
+             （2.5MB → 1.2MB），写入/解析都更快。 */
+          var q = function (fa) {
+            var o = new Array(fa.length);
+            for (var z = 0; z < fa.length; z++) o[z] = Math.round(fa[z] * 1000) / 1000;
+            return o;
+          };
+          arr.push({
+            w: q(it.w),
+            r: q(it.r),
+            i: it.i ? q(it.i) : null
+          });
+          total++;
+        }
+        if (arr.length) out[k] = arr;
+      }
+      if (!total) return null;
+      return {
+        v: 1,
+        /* 存的是**边长**（PATCH_W=24），不是 patch 长度（576）。
+           这里原来是 .w.length，导入侧的 24 校验必然失败，等于白存。 */
+        patchW: Math.round(Math.sqrt(session.recognizer.templates[Object.keys(out)[0]][0].w.length)),
+        count: total,
+        templates: out
+      };
+    } catch (e) {
+      return null;
+    }
+  },
+
+  /**
+   * 导入模板。patchW 必须是 24（PATCH_W），否则说明是别的版本存的，直接丢弃。
+   * @returns {number} 导入的模板条数，0 表示失败
+   */
+  importTemplates: function (data) {
+    try {
+      if (!data || data.v !== 1 || data.patchW !== 24) return 0;
+      if (!session.recognizer) return 0;
+      var src = data.templates || {};
+      var t = {};
+      var count = 0;
+      for (var k in src) {
+        if (!Object.prototype.hasOwnProperty.call(src, k)) continue;
+        var list = src[k];
+        if (!list || !list.length) continue;
+        var arr = [];
+        for (var j = 0; j < list.length; j++) {
+          var it = list[j];
+          if (!it || !it.w || !it.r) continue;
+          if (it.w.length !== 24 * 24) continue;
+          arr.push({
+            w: new Float32Array(it.w),
+            r: new Float32Array(it.r),
+            i: (it.i && it.i.length === 24 * 24) ? new Float32Array(it.i) : null
+          });
+          count++;
+        }
+        if (arr.length) t[k] = arr;
+      }
+      if (!count) return 0;
+      session.recognizer.templates = t;
+      session.recognizer.templateCount = count;
+      return count;
+    } catch (e) {
+      return 0;
+    }
+  },
+
   learnBoard: function (pixels, w, h) {
     if (!session.recognizer) throw new Error('未标定');
 

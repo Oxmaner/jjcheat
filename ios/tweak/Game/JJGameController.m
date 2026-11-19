@@ -72,6 +72,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 @property (nonatomic, assign) NSTimeInterval lastProcessTime;
 @property (nonatomic, assign) NSTimeInterval processNotBefore;
 @property (nonatomic, assign) BOOL autoCalibrating;
+/* 2.0.0r1：本次进程从磁盘复用的模板条数（>0 表示中局也能直接识别） */
+@property (nonatomic, assign) int loadedTemplateCount;
 /* 重标定必须学成才采纳，失败回滚 */
 @property (nonatomic, assign) BOOL calibrationPending;
 @property (nonatomic, assign) NSTimeInterval lastHeartbeatTs;
@@ -164,13 +166,15 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [[JJHUDWindow shared] attach];
     [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
 
-    if ([[JJCalibrator shared] hasCorners]) {
-        self.state = JJGameStateWaitingBoard;
-        [[JJHUDWindow shared] showStatus:@"已就绪 · 进对局画面后自动学习"];
-        [self startTimer];
-    } else {
-        [self recalibrate];
-    }
+    /* ★ 2.0.0r1：**不再拿上次的四角直接开始识别**。
+     *
+     * 原来只要 hasCorners 就直接进 WaitingBoard，用的是上次保存（甚至是很久
+     * 以前、换过皮肤/换过机型）的四角。四角一偏，采样全错位，表现就是
+     * 「开了插件但一直识别未收敛」，而且用户完全不知道该去重标。
+     *
+     * 现在改为：**每次开启插件都强制手动标定四角**，标完才学习、才识别。
+     * 旧四角仍保留在快照里，只在「新标定被判无效」时回滚用。 */
+    [self recalibrate];
     [self refreshEngineDot];
 }
 
@@ -840,6 +844,25 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
        不必等模板学习（学习失败时原来什么都不会显示）。 */
     [[JJCalibrator shared] ensureGridPts];
     [[JJHUDWindow shared] applyGridPoints:[JJCalibrator shared].gridPts];
+
+    /* ★ 2.0.0r1：尝试复用上次学好的 90 格模板。
+       四角与当初学习时吻合（偏差 < 14px）才用，否则丢弃重新学。
+       这样中局开插件也能立刻识别，不必回开局。 */
+    self.loadedTemplateCount = 0;
+    {
+        CGRect nb3 = [UIScreen mainScreen].nativeBounds;
+        NSArray *px = [[JJCalibrator shared] cornersForWidth:(int)nb3.size.width
+                                                      height:(int)nb3.size.height];
+        if (px) {
+            NSTimeInterval t0 = CACurrentMediaTime();
+            int n = [[JJVisionBridge shared] loadTemplatesMatchingCorners:px];
+            self.loadedTemplateCount = n;
+            if (n > 0) {
+                NSLog(@"[JJCheat] 已复用持久化模板 %d 条（%.1fms），中局也可直接识别",
+                      n, (CACurrentMediaTime() - t0) * 1000.0);
+            }
+        }
+    }
     self.processNotBefore = 0;
     [self startTimer];
     [[JJHUDWindow shared] setHUDHidden:!self.hudVisible];
@@ -1083,6 +1106,23 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     BOOL accepted = [info[@"ok"] boolValue] &&
         [info[@"verifyDiff"] integerValue] <= JJ_LEARN_MAX_DIFF;
 
+    /* ★ 2.0.0r1：**已有持久化模板时，中局学习失败也放行**。
+     *
+     * learnBoard 的 verifyDiff 是「识别结果 vs 开局锚盘」的差异。中局盘面
+     * 本来就不是开局，这个差异必然很大 —— 但它不代表模板有问题，模板
+     * 在 learnBoard 里已经回滚成磁盘上那份（prevTemplates）。
+     * 只要模板条数够（>=60/90）就直接用当前盘面开跑。 */
+    BOOL tplRescue = NO;
+    if (!accepted && self.loadedTemplateCount >= 60) {
+        NSInteger tc = [info[@"templateCount"] integerValue];
+        if (tc >= 60) {
+            accepted = YES;
+            tplRescue = YES;
+            NSLog(@"[JJCheat] 学习未通过(verifyDiff=%@)但已有持久化模板 %d 条 → 直接启用",
+                  info[@"verifyDiff"] ?: @"-", self.loadedTemplateCount);
+        }
+    }
+
     /* ★ 2.1.102：真机没有 log 命令，把整份学习诊断落到容器 Documents 里。
      * 关键要看两条：① verifyDiff 到底多大 ② 学习那一刻用的 corners 是什么。
      * 离线用同一份抓帧跑 learnAndRefine 是 verifyDiff=0，真机却失败，
@@ -1190,11 +1230,23 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     self.state = JJGameStateRunning;
     self.calibrationPending = NO;
     NSArray *fc = info[@"finalCorners"];
-    if ([[JJCalibrator shared] adoptRefinedCorners:fc] && self.autoCalibrating) {
+    /* 模板救场时不采纳 finalCorners：那是按开局锚盘精修出来的，
+       中局场景下反而不如用户刚手点的四角准。 */
+    if (!tplRescue && [[JJCalibrator shared] adoptRefinedCorners:fc] && self.autoCalibrating) {
         [[JJCalibrator shared] saveAutoCalibratedCorners:fc width:w height:h];
     }
     [[JJCalibrator shared] snapshot];
     self.autoCalibrating = NO;
+
+    /* ★ 2.0.0r1：把这次学好的模板落盘（连同当时的四角），
+       下次开插件即使停在中局也能直接复用。 */
+    if (!tplRescue) {
+        NSArray *saveCorners = [[JJCalibrator shared] finalCorners];
+        if (saveCorners.count != 4) saveCorners = fc;
+        if (saveCorners.count == 4) {
+            [[JJVisionBridge shared] saveTemplatesWithCorners:saveCorners];
+        }
+    }
     /* 学成这一帧不算数：清指纹/帧序号/所有退避，保证下一张帧立刻出建议 */
     self.lastFingerprint = nil;
     self.lastFrameSerial = 0;

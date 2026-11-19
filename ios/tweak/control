@@ -1,10 +1,10 @@
-Package: com.fujiang.jjcheat
+Package: com.maclin.jjcheat
 Name: JJCheat
-Version: 2.1.0
+Version: 2.0.0r1
 Architecture: iphoneos-arm64e
 Description: JJ象棋 实时辅助（roothide / Pikafish 版）— 识别棋盘、Pikafish 推演、屏幕标注
-Maintainer: fujiang
-Author: fujiang
+Maintainer: Maclin
+Author: Maclin
 Section: Tweaks
 Icon: file:///Library/Application Support/JJCheat/logo.png
 Depends: mobilesubstrate, firmware (>= 14.0)

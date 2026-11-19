@@ -380,4 +380,78 @@ static NSString *JJScriptFingerprint(NSData *d) {
     return arr;
 }
 
+
+#pragma mark - 2.0.0r1 模板持久化
+
+static NSString *JJTemplateStorePath(void) {
+    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    return [dir stringByAppendingPathComponent:@"JJCheat_templates.json"];
+}
+
+/* 四角偏差上限（像素）：超过就认为棋盘/皮肤变了，旧模板不能再用 */
+static const CGFloat JJTemplateCornerTol = 14.0;
+
+- (void)saveTemplatesWithCorners:(NSArray *)corners {
+    if (![self loadEngine] || !self.ctx) return;
+    if (corners.count != 4) return;
+    JSValue *fn = self.ctx[@"JJEngine"][@"exportTemplates"];
+    if (!fn || fn.isUndefined) {
+        NSLog(@"[JJCheat] JS 接口缺失: exportTemplates（engine.js 是旧版）");
+        return;
+    }
+    JSValue *res = [fn callWithArguments:@[]];
+    if (!res || res.isNull || res.isUndefined) {
+        NSLog(@"[JJCheat] 模板导出为空，跳过保存");
+        return;
+    }
+    NSDictionary *payload = [res toDictionary];
+    if (![payload isKindOfClass:[NSDictionary class]]) return;
+    NSMutableDictionary *wrap = [payload mutableCopy];
+    wrap[@"corners"] = corners;
+    NSError *e = nil;
+    NSData *json = [NSJSONSerialization dataWithJSONObject:wrap options:0 error:&e];
+    if (!json) { NSLog(@"[JJCheat] 模板序列化失败: %@", e); return; }
+    if ([json writeToFile:JJTemplateStorePath() atomically:YES]) {
+        NSLog(@"[JJCheat] 模板已保存: %lu 条 / %.1f KB", (unsigned long)[payload[@"count"] integerValue], json.length / 1024.0);
+    }
+}
+
+- (int)loadTemplatesMatchingCorners:(NSArray *)corners {
+    if (corners.count != 4) return 0;
+    NSData *json = [NSData dataWithContentsOfFile:JJTemplateStorePath()];
+    if (!json.length) return 0;
+    NSError *e = nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:json options:0 error:&e];
+    if (![obj isKindOfClass:[NSDictionary class]]) return 0;
+    NSDictionary *wrap = (NSDictionary *)obj;
+    NSArray *saved = wrap[@"corners"];
+    if (![saved isKindOfClass:[NSArray class]] || saved.count != 4) return 0;
+    /* 四角校验：任何一个角偏差超过容差就不复用 —— 皮肤/机型/标定变了，
+       模板的采样基准已经不同，硬用只会把兵种认错。 */
+    CGFloat maxDev = 0;
+    for (int i = 0; i < 4; i++) {
+        NSArray *a = saved[i], *b = corners[i];
+        if (![a isKindOfClass:[NSArray class]] || a.count < 2) return 0;
+        if (![b isKindOfClass:[NSArray class]] || b.count < 2) return 0;
+        double dx = [a[0] doubleValue] - [b[0] doubleValue];
+        double dy = [a[1] doubleValue] - [b[1] doubleValue];
+        CGFloat d = (CGFloat)sqrt(dx * dx + dy * dy);
+        if (d > maxDev) maxDev = d;
+    }
+    if (maxDev > JJTemplateCornerTol) {
+        NSLog(@"[JJCheat] 模板失效：四角最大偏差 %.1fpx > %.0fpx，需重新学习", maxDev, JJTemplateCornerTol);
+        return 0;
+    }
+    if (![self loadEngine] || !self.ctx) return 0;
+    JSValue *fn = self.ctx[@"JJEngine"][@"importTemplates"];
+    if (!fn || fn.isUndefined) return 0;
+    NSMutableDictionary *payload = [wrap mutableCopy];
+    [payload removeObjectForKey:@"corners"];
+    JSValue *jsObj = [JSValue valueWithObject:payload inContext:self.ctx];
+    JSValue *r = [fn callWithArguments:@[jsObj]];
+    int n = (r && !r.isUndefined && !r.isNull) ? [[r toNumber] intValue] : 0;
+    NSLog(@"[JJCheat] 模板导入: %d 条（四角最大偏差 %.1fpx）", n, maxDev);
+    return n;
+}
+
 @end

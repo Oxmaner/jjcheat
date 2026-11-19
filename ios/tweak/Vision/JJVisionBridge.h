@@ -51,6 +51,18 @@ typedef void (^JJVisionResultBlock)(NSDictionary * _Nullable result, NSError * _
                height:(int)h
              callback:(JJVisionResultBlock)callback;
 
+
+/**
+ * ★ 2.0.0r1：学好的 90 格模板持久化。
+ *
+ * 每次开插件都强制手动标定，但「学模板」要求标准开局 32 子，中局开插件
+ * 就永远学不成。这里把 learnBoard 的成果连同当时的四角存进容器，
+ * 下次进程启动时若四角仍吻合（偏差 < 阈值）就直接复用，中局也能立刻识别。
+ */
+- (void)saveTemplatesWithCorners:(NSArray *)corners;
+/** 若已存模板且四角吻合则导入；返回导入的模板条数（0 = 没有可用模板） */
+- (int)loadTemplatesMatchingCorners:(NSArray *)corners;
+
 @end
 
 NS_ASSUME_NONNULL_END
