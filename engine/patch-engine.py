@@ -67,6 +67,23 @@ def patch(path: pathlib.Path, label: str, pairs):
     return changed
 
 
+def soft_replace(path: pathlib.Path, old: str, new: str, label: str) -> bool:
+    """可选迁移：源码已经是「上一版补丁」形态时用。
+
+    为什么需要它：CI 会缓存 engine/.build/src，上一轮构建已经把补丁打进去了。
+    这时 patch() 找不到「上游原样」的文本（已被替换成旧版补丁），会判定失败。
+    这个函数只负责把旧版补丁升级成新版，找不到就不算错。
+    """
+    if not path.is_file():
+        return False
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if new in text or old not in text:
+        return False
+    path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+    print(f"{MARK} {label}: 旧版补丁 → 新版（迁移）")
+    return True
+
+
 # ---------------------------------------------------------------
 # 1) network.h —— verify 签名改 bool + 暴露诊断访问器
 # ---------------------------------------------------------------
@@ -362,6 +379,22 @@ ENGINE_CPP_LOADNET_NEW = """void Engine::load_network(const std::filesystem::pat
     jjNetVerified = false;
 }"""
 
+# r8 时期的 go()（上一版补丁）。CI 缓存的源码树就是这种形态，先迁移再走正常补丁流程。
+ENGINE_CPP_GO_V1 = """void Engine::go(Search::LimitsType& limits) {
+    assert(limits.perft == 0);
+
+    // JJCheat: 网络没就绪时绝不能 start_thinking（评估会解引用未初始化的权重），
+    // 也绝不能 exit（同进程，宿主 App 会一起死）。只跳过本次搜索。
+    if (!verify_network())
+    {
+        if (onVerifyNetwork)
+            onVerifyNetwork("JJ: NNUE not ready, search skipped (process kept alive)");
+        return;
+    }
+
+    threads.start_thinking(pos, states, limits);
+}"""
+
 ENGINE_CPP_PERFT_OLD = """    verify_network();
 
     return Benchmark::perft(fen, depth);"""
@@ -598,6 +631,9 @@ def main():
     patch(src / "engine.h", "engine.h", [
         (ENGINE_H_OLD, ENGINE_H_NEW),
     ])
+
+    # CI 缓存的上游源码可能已经打过早一版补丁，先把 go() 迁移到最新形态
+    soft_replace(src / "engine.cpp", ENGINE_CPP_GO_V1, ENGINE_CPP_GO_NEW, "engine.cpp #1(迁移)")
 
     patch(src / "engine.cpp", "engine.cpp", [
         (ENGINE_CPP_GO_OLD, ENGINE_CPP_GO_NEW),
