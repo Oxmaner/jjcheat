@@ -807,6 +807,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [[JJCalibrator shared] applyPresetScheme:next];
     [self armRecognizer];
     [self.ballWindow toast:(next == 1 ? @"已切换：排位赛棋盘" : @"已切换：人机对战棋盘")];
+    /* 菜单开着就重建一次，否则面板上还显示旧值（看着像没切成功） */
+    if (self.ballWindow.menuVisible) [self showMenu];
 }
 
 - (void)armRecognizer {
@@ -1206,7 +1208,7 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
             if (alignOcc >= 0 && alignOcc < 10) {
                 [[JJHUDWindow shared] showStatus:@"画面里没看到棋子 · 请停在【开局】棋盘"];
             } else {
-                [[JJHUDWindow shared] showStatus:@"学习未完成 · 请停在【开局】棋盘画面"];
+                [[JJHUDWindow shared] showStatus:@"学习未完成 · 请停在开局画面"];
             }
         }
         return;

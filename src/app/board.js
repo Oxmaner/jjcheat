@@ -267,7 +267,9 @@ function boardFenToCodes(fen) {
  * 象棋每步只动一枚棋子。把本帧识别结果与「上一稳定盘面」比较：
  *   - 找「有子→空」的起点 from 和「cur[to] === prev[from]」的终点 to；
  *   - 额外变化格一律视为识别噪声，用锚盘值覆盖；
- *   - 变化格数过多（>6）或找不到一步棋结构 → 整帧丢弃。
+ *   - 变化格数过多（>3）或找不到一步棋结构 → 整帧丢弃。
+ *     一步棋正常只改 to/from 两格，吃子也是两格；出现 4 格以上说明
+ *     是拖动动画、选中高亮或噪声，按「识别异常」处理，不拿来推局面。
  * 这样每帧落地的 codes 都严格由「锚盘 + 一步棋」生成，模板抖动再也带不偏盘面。
  *
  * @returns {{changed:number, move:object|null, noise:Array}}
@@ -279,7 +281,7 @@ function analyzeStepDiff(prev, cur) {
   }
   if (changed.length === 0) return { changed: 0, move: null, noise: [] };
   var none = { changed: changed.length, move: null, noise: changed };
-  if (changed.length > 6) return none;
+  if (changed.length > 3) return none;   // 2.0.0r8：阈值 6→3（一步棋只改 2 格）
 
   var best = null;
   for (var a = 0; a < changed.length; a++) {
