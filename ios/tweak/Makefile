@@ -73,6 +73,9 @@ PIKA_LIB := $(JJ_ENGINE)/lib/libpikafish.a
 JJCheat_LDFLAGS = -L$(JJ_ENGINE)/lib -lpikafish -lc++ -Wl,-dead_strip
 
 # roothide: jbroot() 来自 libroothide
+# 2.0.0r2：jbroot 改成运行时 dlsym（Core/JJRootPath.h），**不再需要链接这份库**。
+#         这里保留是为了云端构建与历史包完全同构；手机端用 Dylix 自建工程时
+#         不必加 -lroothide，缺这份 stub 库也能正常链接出 dylib。
 ifeq ($(THEOS_PACKAGE_SCHEME),roothide)
 JJCheat_LIBRARIES = roothide
 endif

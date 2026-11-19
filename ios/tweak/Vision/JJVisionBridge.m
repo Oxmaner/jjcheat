@@ -15,10 +15,32 @@
 //  首次载入时会把内嵌副本写进 ① 的位置，之后一直读文件，方便改参数。
 //
 
+/* ★ 2.0.0r2：这段 #define 现在只是「保险」，不再是编译通过的前提。
+ * 历史：r1 想靠它把 dispatch 对象强制当 ObjC 对象处理（真机 clang 14 + 内置
+ * SDK 下 OS_OBJECT_USE_OBJC=0，strong 属性编不过），但它在 Dylix 下不生效
+ * —— 系统头已被前缀头提前带入，#ifndef 直接跳过。
+ * r2 改成「队列用 ivar，不用 strong 属性」，不再赌宏的先后顺序。
+ */
+#ifndef OS_OBJECT_USE_OBJC
+#define OS_OBJECT_USE_OBJC 1
+#endif
+
 #import "JJVisionBridge.h"
 #import "JJConfig.h"
 #import "JJEngineScript.h"
-#import <JavaScriptCore/JavaScriptCore.h>
+/* 2.0.0r1：改用同目录的最小声明头。
+   Dylix 内置的 iOS SDK（16.4 / 26.0）把 JavaScriptCore.framework 整个裁掉了，
+   用尖括号引入会直接 fatal error: file not found。
+   设备上这个框架是系统自带的，运行期必然在，所以编译期有声明即可。【iOS SDK 自带】 */
+#ifdef __has_include
+#  if __has_include(<JavaScriptCore/JavaScriptCore.h>)
+#    import <JavaScriptCore/JavaScriptCore.h>   // 正规 SDK：用官方头
+#  else
+#    import "JavaScriptCore.h"                  // 被裁剪的 SDK：用本工程的最小声明
+#  endif
+#else
+#  import <JavaScriptCore/JavaScriptCore.h>
+#endif
 
 /* engine.js 的版本标记：每个改过 JS 的版本都要换成该版新增的字面量，
    App 容器里的 engine.js 优先级最高，而装新 deb 不会覆盖它（deb 只写 jbroot
@@ -33,14 +55,24 @@
 static NSString * const kJJEngineFeatureMark = @"pikafishNative2179";
 
 // roothide 适配：jbroot 每次越狱都会换一个随机路径，必须在运行时解析。
-// 非 roothide 构建（rootful/rootless）不引这个头，避免多出 libroothide 依赖。
-#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
-#import <roothide.h>
-#endif
+// 2.0.0r2：jbroot 改走 JJRootPath.h 的运行时 dlsym，不再 import <roothide.h>，
+// 也就不再需要链接 libroothide（Dylix 自建包里没有这份 stub 库）。
+#import "JJRootPath.h"
 
-@interface JJVisionBridge ()
+@interface JJVisionBridge () {
+    /* ★ 2.0.0r2：dispatch 队列改成 ivar，不用 @property。
+     *
+     * 原因：Dylix（手机端 clang 14 + 内置 SDK）里 OS_OBJECT_USE_OBJC 实际是 0，
+     * dispatch_queue_t 是 C 结构体指针而不是 ObjC 对象，写
+     *     @property (nonatomic, strong) dispatch_queue_t engineQueue;
+     * 直接报 "property with 'retain (or strong)' attribute must be of object type"，
+     * 属性合成失败后所有 _engineQueue 全变成 "use of undeclared identifier"。
+     * 文件顶部那段 #define 在 Dylix 下不生效（系统头早被前缀头带进来了），
+     * 所以干脆不依赖这个宏：ivar 在两种宏取值下都能编过。
+     * 队列是单例里创建一次、活到进程结束，不释放也不缺内存。 */
+    dispatch_queue_t _engineQueue;
+}
 @property (nonatomic, strong) JSContext *ctx;
-@property (nonatomic, strong) dispatch_queue_t engineQueue;
 @property (nonatomic, strong) JSValue *pixelArray;      // 1.1.44 复用 14MB 像素缓冲
 @property (nonatomic, assign) NSUInteger pixelArrayLength;
 @property (nonatomic, assign) BOOL loaded;
@@ -168,9 +200,9 @@ static NSString *JJScriptFingerprint(NSData *d) {
     if (container.length) [candidates addObject:container];
 
     // ② roothide 正统路径：jbroot() -> <jbroot>/Library/Application Support/JJCheat/engine.js
-#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
-    [candidates addObject:jbroot(@"/Library/Application Support/JJCheat/engine.js")];
-#endif
+    //    非 roothide 环境 JJResolveRootPath 返回 nil，直接跳过。
+    NSString *rootedScript = JJResolveRootPath(@"/Library/Application Support/JJCheat/engine.js");
+    if (rootedScript.length) [candidates addObject:rootedScript];
     // ③ rootless（Dopamine 等）的固定 /var/jb
     [candidates addObject:JJ_ENGINE_PATH_ROOTLESS];
     // ④ rootful / 未做路径改写的 jbroot 字面量
@@ -236,7 +268,7 @@ static NSString *JJScriptFingerprint(NSData *d) {
           [src rangeOfString:kJJEngineFeatureMark].location == NSNotFound ? @"缺" : @"有",
           origin);
 
-    dispatch_sync(self.engineQueue, ^{
+    dispatch_sync(_engineQueue, ^{
         self.ctx = [[JSContext alloc] init];
         __weak typeof(self) weakSelf = self;
         self.ctx.exceptionHandler = ^(JSContext *c, JSValue *ex) {
@@ -257,7 +289,7 @@ static NSString *JJScriptFingerprint(NSData *d) {
 
 - (void)setCorners:(NSArray<NSArray<NSNumber *> *> *)corners {
     [self loadEngine];
-    dispatch_async(self.engineQueue, ^{
+    dispatch_async(_engineQueue, ^{
         JSValue *fn = self.ctx[@"JJEngine"][@"setCorners"];
         [fn callWithArguments:@[corners ?: @[]]];
     });
@@ -265,7 +297,7 @@ static NSString *JJScriptFingerprint(NSData *d) {
 
 - (void)resetWithFen:(NSString *)fen {
     [self loadEngine];
-    dispatch_async(self.engineQueue, ^{
+    dispatch_async(_engineQueue, ^{
         JSValue *fn = self.ctx[@"JJEngine"][@"reset"];
         [fn callWithArguments:@[fen ?: [NSNull null]]];
     });
@@ -283,7 +315,7 @@ static NSString *JJScriptFingerprint(NSData *d) {
     self.busy = YES;
 
     __weak typeof(self) weakSelf = self;
-    dispatch_async(self.engineQueue, ^{
+    dispatch_async(_engineQueue, ^{
         __strong typeof(weakSelf) self2 = weakSelf;
         NSDictionary *result = nil;
         if (self2 && self2.ctx) {
@@ -328,7 +360,7 @@ static NSString *JJScriptFingerprint(NSData *d) {
     self.busy = YES;
 
     __weak typeof(self) weakSelf = self;
-    dispatch_async(self.engineQueue, ^{
+    dispatch_async(_engineQueue, ^{
         __strong typeof(weakSelf) self2 = weakSelf;
         if (!self2 || !self2.ctx) { self2.busy = NO; return; }
         JSContext *ctx = self2.ctx;

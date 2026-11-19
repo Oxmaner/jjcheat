@@ -88,10 +88,15 @@ jobs:
             "engine/.build/src/src/pikafish.nnue" \
             --expect "${{ env.PIKA_NET_SHA256 }}"
 
-      - name: 版本号随构建递增
+      # 2.0.0r1 起版本体系从 2.1.x 改成 2.0.0rX（用户要求），这里不能再写
+      # 2.1.${RUN_NUMBER} —— 否则每个包都会被改回 2.1.x。
+      # 做法：以 control 里的版本为基（2.0.0r2），追加 Debian 可比较的构建号
+      # 2.0.0r2+b86，既能看出是第几次构建，dpkg 升级链也正常递增。
+      - name: 版本号（control 为基，追加构建号）
         run: |
           set -eux
-          VER="2.1.${GITHUB_RUN_NUMBER}"
+          BASE=$(awk '/^Version:/ {print $2}' ios/tweak/control)
+          VER="${BASE}+b${GITHUB_RUN_NUMBER}"
           /usr/bin/sed -i '' -E "s/^Version: .*/Version: ${VER}/" ios/tweak/control
           grep '^Version:' ios/tweak/control
 

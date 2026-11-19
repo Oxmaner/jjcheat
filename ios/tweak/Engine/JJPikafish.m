@@ -8,6 +8,20 @@
 //  一条 spawn 都没发出去。这里改成静态库 + 内存流，引擎跑在 dylib 自己的线程里。
 //
 
+/* ★ 2.0.0r2：这段 #define 现在只是「保险」，不再是编译通过的前提。
+ *
+ * 历史：2.0.0r1 想靠它把 dispatch 对象强制当 ObjC 对象处理 —— 真机构建里
+ * clang 14 + 内置 SDK 下 OS_OBJECT_USE_OBJC 是 0，于是
+ *     @property (nonatomic, strong) dispatch_queue_t xxx;
+ * 报 "must be of object type"，属性合成失败、后面 _xxx 全不认识。
+ * 但实测这段 #define 在 Dylix 下**不生效**（系统头已被前缀头提前带入，
+ * #ifndef 直接跳过），所以 r2 改成「队列用 ivar，不用 strong 属性」，
+ * 两种宏取值都能编过，不再赌宏能不能抢在系统头之前。
+ */
+#ifndef OS_OBJECT_USE_OBJC
+#define OS_OBJECT_USE_OBJC 1
+#endif
+
 #import "JJPikafish.h"
 #import "JJPikafishInstaller.h"
 #import "JJMoveCodec.h"
@@ -58,8 +72,12 @@ static void JJFatalSignalHandler(int sig) {
    显式给引擎线程 16MB 栈（Stockfish 官方建议 ≥8MB）。 */
 #define KIKA_ENGINE_STACK_BYTES (16 * 1024 * 1024)
 
-@interface JJPikafish ()
-@property (nonatomic, strong) dispatch_queue_t pikaQueue;
+@interface JJPikafish () {
+    /* ★ 2.0.0r2：dispatch 队列改成 ivar，不用 @property（同 JJVisionBridge.m）。
+     * Dylix 里 OS_OBJECT_USE_OBJC=0，dispatch_queue_t 不是 ObjC 对象，
+     * strong 属性编不过；ivar 在 =0 / =1 两种取值下都合法。 */
+    dispatch_queue_t _pikaQueue;
+}
 @property (nonatomic, assign) JJPikaState state;
 @property (nonatomic, assign) BOOL wantRunning;
 

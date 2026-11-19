@@ -6,10 +6,7 @@
 #import "JJBallWindow.h"
 #import "JJConfig.h"
 #import "JJMenuStyle.h"
-
-#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
-#import <roothide.h>
-#endif
+#import "JJRootPath.h"   /* 2.0.0r2：jbroot 改运行时 dlsym，不再链 libroothide */
 
 static const CGFloat kJJBallSize      = 52.0;
 /** 引擎状态点直径（2.1.0 新增：球右上角小圆点） */
@@ -32,9 +29,8 @@ static const NSInteger kJJMenuCols = 2;
 static UIImage *JJLoadLogoImage(void) {
     NSString *rel = [@"/" stringByAppendingString:JJ_LOGO_REL_PATH];
     NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithCapacity:5];
-#ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
-    [paths addObject:jbroot(rel)];
-#endif
+    NSString *rooted = JJResolveRootPath(rel);
+    if (rooted.length) [paths addObject:rooted];
     [paths addObject:rel];
     [paths addObject:[JJ_ENGINE_PATH_ROOTLESS stringByReplacingOccurrencesOfString:@"engine.js"
                                                                        withString:@"logo.png"]];
