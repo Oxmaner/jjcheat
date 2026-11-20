@@ -290,6 +290,24 @@ static NSString *JJScriptFingerprint(NSData *d) {
     return self.loaded;
 }
 
+- (int)setMarkerConfirmFrames:(int)frames {
+    if (frames < JJ_MARKER_CONFIRM_MIN) frames = JJ_MARKER_CONFIRM_MIN;
+    if (frames > JJ_MARKER_CONFIRM_MAX) frames = JJ_MARKER_CONFIRM_MAX;
+    if (!self.loaded) [self loadEngine];
+    /* 与 setCorners 同样的队列纪律：JSContext 只在 _engineQueue 上碰。
+       同步等结果，好让菜单点击后立刻把「实际生效值」写回 NSUserDefaults。 */
+    __block int applied = frames;
+    dispatch_sync(_engineQueue, ^{
+        JSValue *fn = self.ctx[@"JJEngine"][@"setMarkerConfirmFrames"];
+        if (!fn || fn.isUndefined) return;
+        /* 不读返回值：本工程用的是手写最小 JavaScriptCore 头，JSValue 的
+           toInt32/toDouble 没声明。clamp 范围（1~30）两边完全一致，直接用本地值。 */
+        [fn callWithArguments:@[@(frames)]];
+        applied = frames;
+    });
+    return applied;
+}
+
 - (void)setCorners:(NSArray<NSArray<NSNumber *> *> *)corners {
     [self loadEngine];
     dispatch_async(_engineQueue, ^{

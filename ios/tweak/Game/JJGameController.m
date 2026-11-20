@@ -47,6 +47,7 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     JJMenuActionResetBoard,
     JJMenuActionThink,
     JJMenuActionEngineOptions,
+    JJMenuActionMarkerFrames,   /* 2.0.0r23：标记确认帧数（白点+白圈连续几帧一致才提交） */
     JJMenuActionEngineStatus,
 };
 
@@ -181,6 +182,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     self.processNotBefore = 0;
     [[JJScreenGrabber shared] start];
     [[JJVisionBridge shared] loadEngine];
+    /* 引擎加载成功后，把菜单里持久化的确认帧数下发进 engine.js */
+    [self applyPersistedMarkerFrames];
     /* 2.1.0：引擎独立进程，激活就开始拉起（首次要把 45MB 复制进容器 + NNUE 初始化） */
     [[JJPikafish shared] start];
     [[JJHUDWindow shared] attach];
@@ -269,7 +272,25 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
             case JJMenuActionThink:
                 [self2 showThinkSheet];
                 break;
-            case JJMenuActionEngineOptions:
+            case JJMenuActionMarkerFrames: {
+            /* 循环 1 → 2 → 3 → 5 → 8 → 12 → 16 → 20 → 30 → 1。
+               真机标记持久显示，调大只会更稳；用户自己权衡延迟与准确度。 */
+            static const int steps[] = {1, 2, 3, 5, 8, 12, 16, 20, 30};
+            int cur = [[NSUserDefaults standardUserDefaults] integerForKey:JJ_KEY_MARKER_CONFIRM];
+            if (cur <= 0) cur = JJ_MARKER_CONFIRM_DEFAULT;
+            int nxt = steps[0];
+            for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+                if (steps[i] == cur) { nxt = steps[(i + 1) % (sizeof(steps) / sizeof(steps[0]))]; break; }
+                if (steps[i] > cur) { nxt = steps[i]; break; }
+            }
+            int applied = [[JJVisionBridge shared] setMarkerConfirmFrames:nxt];
+            [[NSUserDefaults standardUserDefaults] setInteger:applied forKey:JJ_KEY_MARKER_CONFIRM];
+            NSLog(@"[JJCheat] 标记确认帧数 = %d 帧（约 %.2f 秒）", applied, applied * 0.25);
+            [[JJHUDWindow shared] showStatus:
+                [NSString stringWithFormat:@"标记确认 %d 帧（约 %.2f 秒）", applied, applied * 0.25]];
+            break;
+        }
+        case JJMenuActionEngineOptions:
                 [self2 showEngineOptionsSheet];
                 break;
             case JJMenuActionEngineStatus:
@@ -376,6 +397,16 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     /* 2.1.79：引擎可调参数统一入口。
        菜单项与 JJEngineOptions 的配置键一一对应，加新参数只改那一层 + 这里的弹窗，
        不动搜索主流程。 */
+    /* 2.0.0r23：标记确认帧数。
+       真机白点白圈是**持久显示**的（对方走完停在对方那步，直到我方走完才移动），
+       所以「连续 N 帧同一手」天然可靠，N 调大只会更稳。点击循环 1→2→3→5→8→12→16→20→30。 */
+    int mf = (int)[[NSUserDefaults standardUserDefaults] integerForKey:JJ_KEY_MARKER_CONFIRM];
+    if (mf <= 0) mf = JJ_MARKER_CONFIRM_DEFAULT;
+    JJMenuEntry *eMarkerFrames = [JJMenuEntry title:@"标记确认帧数" symbol:@"checkmark.circle"];
+    eMarkerFrames.action = JJMenuActionMarkerFrames;
+    eMarkerFrames.value = [NSString stringWithFormat:@"%d 帧 · %.2f 秒", mf, mf * 0.25];
+    [arr addObject:eMarkerFrames];
+
     JJMenuEntry *eOpts = [JJMenuEntry title:@"引擎参数" symbol:@"slider.horizontal.3"];
     eOpts.action = JJMenuActionEngineOptions;
     [arr addObject:eOpts];
@@ -392,6 +423,15 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 
     [self.ballWindow showMenuWithEntries:arr];
     [self refreshEngineDot];
+}
+
+/* 2.0.0r23：把菜单里持久化的确认帧数下发给 engine.js。
+   必须在 loadEngine 成功之后调用 —— 早于引擎加载时 JSValue 还不存在。 */
+- (void)applyPersistedMarkerFrames {
+    int mf = (int)[[NSUserDefaults standardUserDefaults] integerForKey:JJ_KEY_MARKER_CONFIRM];
+    if (mf <= 0) mf = JJ_MARKER_CONFIRM_DEFAULT;
+    int applied = [[JJVisionBridge shared] setMarkerConfirmFrames:mf];
+    NSLog(@"[JJCheat] 标记确认帧数已下发: %d 帧（配置 %d）", applied, mf);
 }
 
 - (void)setPluginEnabled:(BOOL)on {
@@ -1842,7 +1882,9 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     }
     return @{
         @"suggest": mv,
-        @"suggestChinese": JJMoveChinese(fen, mv) ?: mv,
+        /* 2.0.0r19：这里的 fen 是 searchFen —— 喂给 Pikafish 的那份，红在下。
+           必须显式告诉记谱函数朝向，否则红黑与路数会整体对调。 */
+        @"suggestChinese": JJMoveChineseEx(fen, mv, YES) ?: mv,
         @"from": res[@"from"] ?: @-1,
         @"to": res[@"to"] ?: @-1,
         @"scoreText": scoreText,
@@ -1914,12 +1956,17 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
      * 统一在这里做一次反变换，只在「喂给 HUD」这一个出口做：
      * 不要在 JJPikafish 里改（那会污染搜索缓存与日志里的 FEN），
      * 也不要在 HUD 里改（HUD 不该知道引擎坐标的存在）。
-     * 旋转 180° 正反同式，所以直接复用 JJSqRotate180。 */
-    if ([rec[@"flipped"] integerValue] != 0) {
+     *
+     * ★ 2.0.0r19 纠正：这里必须用「上下翻转」而不是 180° 旋转，且方向是反的 ——
+     *   执红（红在屏幕下方）：引擎 row 0 ↔ 屏幕 row 9 → 要翻
+     *   执黑（红在屏幕上方）：引擎 row 0 ↔ 屏幕 row 0 → 不翻
+     *   r18 之前执红完全不翻（真机症状：箭头画到空交叉点上，红炮 h2e2 被画到顶部黑方区），
+     *   执黑却翻成了 180°（列被镜像 → 指向对角）。 */
+    if ([rec[@"flipped"] integerValue] == 0) {
         NSInteger f = [disp[@"from"] integerValue];
         NSInteger t = [disp[@"to"] integerValue];
-        if (f >= 0 && f < 90) disp[@"from"] = @(JJSqRotate180((int)f));
-        if (t >= 0 && t < 90) disp[@"to"] = @(JJSqRotate180((int)t));
+        if (f >= 0 && f < 90) disp[@"from"] = @(JJSqFlipVertical((int)f));
+        if (t >= 0 && t < 90) disp[@"to"] = @(JJSqFlipVertical((int)t));
 
         /* pv 是 ICCS 串序列，将来画多层箭头时同样需要旋转。
            ICCS 与内部 sq 的关系：col = sq%9, rank = 9 - sq/9（见 JJMoveCodec.m 顶部）。
@@ -1936,13 +1983,40 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
                     [pv2 addObject:m];
                     continue;
                 }
-                int ra = JJSqRotate180(a), rb = JJSqRotate180(b);
+                int ra = JJSqFlipVertical(a), rb = JJSqFlipVertical(b);
                 /* sq → ICCS：列 = sq%9 的字母，rank = 9 - sq/9 */
                 [pv2 addObject:[NSString stringWithFormat:@"%c%d%c%d",
                                 (char)('a' + ra % 9), 9 - ra / 9,
                                 (char)('a' + rb % 9), 9 - rb / 9]];
             }
             disp[@"pv"] = pv2;
+        }
+    }
+
+    /* ★ 2.0.0r19：出箭头前校验起点格在当前盘面上真有子。
+       盘面被脏帧污染时（例如 reseat 采纳了整行错乱的帧），引擎会基于错误 FEN
+       给出一步棋，画出来就是「空交叉点上冒出一个箭头」—— 用户最容易察觉的错。
+       校验用的 anchorFen 是屏幕序，与上面翻转后的 from 同一坐标系。 */
+    {
+        NSInteger ff = [disp[@"from"] integerValue];
+        if (ff >= 0 && ff < 90) {
+            NSString *af = rec[@"anchorFen"] ?: rec[@"fen"] ?: @"";
+            int pc = JJPieceAtFen(af, (int)ff);
+            /* 只有「明确是空格」(0) 才拦。pc<0 = FEN 解析失败
+               （anchorFen 为空或格式异常），那种情况不该误伤箭头。 */
+            if (pc == 0) {
+                static NSTimeInterval s_lastArrowWarn = 0;
+                NSTimeInterval nowA = [[NSDate date] timeIntervalSince1970];
+                if (nowA - s_lastArrowWarn > 3.0) {
+                    s_lastArrowWarn = nowA;
+                    NSLog(@"[JJCheat] 箭头已拦下：起点格 %ld 在当前盘面上是空的（anchor=%@）",
+                          (long)ff, af);
+                }
+                disp[@"suggest"] = @"";
+                disp[@"suggestChinese"] = @"";
+                disp[@"from"] = @-1;
+                disp[@"to"] = @-1;
+            }
         }
     }
 

@@ -32,6 +32,25 @@ int JJSqRotate180(int sq) {
     return (9 - r) * 9 + (8 - c);
 }
 
+/** 上下翻转（行镜像，列不变）。引擎坐标(row 0=红方底线) ↔ 屏幕坐标(row 0=屏幕顶)
+    之间只差这一次翻转 —— 不是 180°，180° 会把列也镜像，箭头就指到对角去了。 */
+int JJSqFlipVertical(int sq) {
+    if (sq < 0 || sq >= 90) return -1;
+    return (9 - sq / 9) * 9 + (sq % 9);
+}
+
+/** 取 FEN（屏幕序，红在上）某一格的兵种编码：0=空，1..7 红，8..14 黑，-1=解析失败。
+    给「画箭头前校验起点真的有子」用 —— 盘面若被脏帧污染，箭头会指向空交叉点。 */
+static int8_t *JJBoardFromFen(NSString *boardFen);   /* 定义在下方 */
+int JJPieceAtFen(NSString *fen, int sq) {
+    if (sq < 0 || sq >= 90) return -1;
+    int8_t *b = JJBoardFromFen(fen);
+    if (!b) return -1;
+    int v = b[sq];
+    free(b);
+    return v;
+}
+
 /* ============================================================
  *  中文记谱 —— 移植自 engine.js cst/constants.js 的 mvToChinese，
  *  与 JS 侧「检测到走法」的中文口径保持一致。
@@ -82,9 +101,36 @@ static int8_t *JJBoardFromFen(NSString *boardFen) {
     return board;
 }
 
+/** 把 90 格局面上下翻转（行镜像，列不变）。
+    用于把「红在上」的 FEN 盘面转成「红在下」的引擎坐标 —— JJSqFromICCS 返回的是
+    引擎坐标（红在下），而 JJBoardFromFen 按 FEN 原序把第一行当 row 0。 */
+static void JJBoardFlipVertical(int8_t *board) {
+    if (!board) return;
+    for (int r = 0; r < 5; r++) {
+        for (int c = 0; c < 9; c++) {
+            int a = r * 9 + c;
+            int b = (9 - r) * 9 + c;
+            int8_t t = board[a];
+            board[a] = board[b];
+            board[b] = t;
+        }
+    }
+}
+
 NSString *JJMoveChinese(NSString *boardFen, NSString *iccs) {
+    /* 默认认为传入的 FEN 是「红在上」（屏幕序，与 anchorFen / lastMoveFenBefore 一致） */
+    return JJMoveChineseEx(boardFen, iccs, NO);
+}
+
+/* fenRedAtBottom：传入的 FEN 是否为「红在下」（如 searchFen 那种喂给引擎的朝向）。
+   ★ 2.0.0r19：这里必须把两侧坐标对齐。JJSqFromICCS 返回引擎坐标（红在下），
+   而 JJBoardFromFen 按 FEN 原序建盘。r18 之前没做这一步，真机日志表现为
+   「h7e7 黑：炮二平五」「b0c2 黑：马八进七」——红炮被当成黑炮、黑马被当成红马，
+   颜色和路数全错。 */
+NSString *JJMoveChineseEx(NSString *boardFen, NSString *iccs, BOOL fenRedAtBottom) {
     int8_t *board = JJBoardFromFen(boardFen);
     if (!board) return iccs;
+    if (!fenRedAtBottom) JJBoardFlipVertical(board);
 
     /* 走子方：FEN 第 2 个字段 w=红 b=黑，缺省红 */
     NSArray *parts = [boardFen componentsSeparatedByString:@" "];

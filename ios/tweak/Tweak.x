@@ -19,6 +19,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 
+#import "JJConfig.h"
 #import "JJGameController.h"
 #import "JJVisionBridge.h"
 #import "JJHUDWindow.h"
@@ -108,7 +109,7 @@ static void JJCaptureThrottled(EAGLContext *ctx, NSUInteger target) {
        比手写 method_setImplementation + 全类表遍历轻得多。 */
     %init;
 
-    NSLog(@"[JJCheat] tweak 已加载 (pid=%d, 2.1.0 pikafish)", getpid());
+    NSLog(@"[JJCheat] tweak 已加载 (pid=%d, %@ pikafish)", getpid(), JJ_CHEAT_VERSION);
 
     /* 诊断日志：只报事实，不做分支。
        EAGLContext 一定存在、presentRenderbuffer: 一定有实现，

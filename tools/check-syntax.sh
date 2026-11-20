@@ -142,11 +142,11 @@ if [ -f "$CTRL" ]; then
     check_case() {
         action="$1"; expect="$2"
         # 取该 case 之后 3 行，看有没有调用预期方法
-        if grep -A3 "case $action:" "$CTRL" | grep -q "$expect"; then
+        if grep -A12 "case $action:" "$CTRL" | grep -q "$expect"; then
             return 0
         fi
         echo "FAIL  菜单分派：$action 应调用 $expect"
-        grep -A3 "case $action:" "$CTRL" | sed 's/^/      /'
+        grep -A12 "case $action:" "$CTRL" | sed 's/^/      /'
         menu_fail=1
         return 1
     }
@@ -159,6 +159,7 @@ if [ -f "$CTRL" ]; then
     check_case JJMenuActionThink           showThinkSheet
     check_case JJMenuActionEngineOptions   showEngineOptionsSheet
     check_case JJMenuActionEngineStatus    showEngineStatus
+    check_case JJMenuActionMarkerFrames    setMarkerConfirmFrames
 
     # 禁止按下标分派（case 0..9 这种）
     if grep -qE 'case [0-9]+:' "$CTRL"; then

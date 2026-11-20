@@ -1,4 +1,4 @@
-﻿//
+//
 //  JJHUDWindow.h
 //  JJCheat
 //

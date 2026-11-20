@@ -49,11 +49,24 @@ int JJSqFromICCS(NSString *iccs, int idx);
  *  否则两处实现迟早分叉 —— 这正是这次 bug 的成因。 */
 int JJSqRotate180(int sq);
 
+/** 上下翻转（行镜像，列不变）。引擎坐标 ↔ 屏幕坐标只差这一次翻转。
+    ★ 不要用 JJSqRotate180 代替它 —— 180° 会连列一起镜像，箭头会指到对角。 */
+int JJSqFlipVertical(int sq);
+
+/** 取 FEN（屏幕序，红在上）某一格的兵种编码：0=空，1..7 红，8..14 黑，-1=解析失败。 */
+int JJPieceAtFen(NSString *fen, int sq);
+
 /** 中文记谱（「炮二平五」）。
     boardFen = 棋盘部分或完整 FEN（10 行斜杠分隔，第 1 行 = 屏幕最上）。
     iccs = 标准 ICCS 一步。走子方从 FEN 的 w/b 字段读；缺省按红方。
     解析失败返回 ICCS 原串。逻辑移植自 engine.js 的 cst/constants.js mvToChinese，
     保持两端口径一致（回归里有对照断言）。 */
 NSString *JJMoveChinese(NSString *boardFen, NSString *iccs);
+
+/** 同上，但显式指定传入 FEN 的朝向（2.0.0r19）。
+    fenRedAtBottom=NO：FEN 红在上（anchorFen / lastMoveFenBefore，与屏幕一致）
+    fenRedAtBottom=YES：FEN 红在下（searchFen，喂给 Pikafish 的那份）
+    JJSqFromICCS 返回引擎坐标（红在下），不区分朝向会让红黑、路数全部对调。 */
+NSString *JJMoveChineseEx(NSString *boardFen, NSString *iccs, BOOL fenRedAtBottom);
 
 NS_ASSUME_NONNULL_END
