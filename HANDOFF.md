@@ -1,608 +1,583 @@
-# JJCheat 交接文档（roothide / 2026-11-17 版）
+# JJCheat 交接文档
 
-> 接手前先读 **§0 与 §2**。§2 是当前唯一真正的阻塞点，在它解决之前，任何抓帧/引擎改动都是盲改。
+> 最后更新：2026-11-20　当前版本：**2.0.0r18**（已构建、已装机验证过一次）
+> 读者：接手的 AI / 开发者。本文档目标是让你**不读全部代码也能安全改动**。
 
 ---
 
-## §0 状态速览（2026-11-17 15:45）
+## 0. 一句话说清这是什么
 
-| 项 | 状态 |
+iOS 越狱插件（roothide 方案）。注入「JJ 象棋」（`cn.jj.chinachess` / 进程名 `TKLobby_chess_tuanjie`），做三件事：
+
+1. 从 Metal 渲染帧里**读出棋盘**（90 格模板匹配，无机器学习）
+2. 把局面喂给**同进程的 Pikafish**（中国象棋 NNUE 引擎）算一步
+3. 用**浮窗 + 箭头**标出建议着法
+
+不支持模拟器、不支持未越狱设备、**只支持游戏原始皮肤**。
+
+---
+
+## 1. 五分钟上手
+
+### 1.1 本地自检（改完代码必须先跑）
+
+```bash
+cd jjcheat-patch
+
+# ① JS 主逻辑打包（会生成 dist/engine.js）
+node tools/bundle.js
+# 正常输出：打包完成 / 模块数 7 / 体积 xxx KB
+
+# ② 回归测试（10 组、158 条断言）
+node tools/regression.js
+# 正常输出：全部通过 OK  engine.js = xxx 字节
+
+# ③ 原生侧语法检查（15 个目标）
+export PATH="/c/Program Files/LLVM/bin:$PATH"
+SDK="/f/MacLin/Documents/theos-sdks/iPhoneOS16.5.sdk"
+bash tools/check-syntax.sh
+# 正常输出：通过 15 个，失败 0 个
+```
+
+**三个都绿才算改完。** `check-syntax.sh` 还包含「菜单 action 与 switch 一致性」检查——加菜单项必须同步它。
+
+### 1.2 出包（不能本地编译 deb，只能走 CI）
+
+本地没有 Theos 环境，**必须推 GitHub 触发 Actions**：
+
+```bash
+# 用 patch_repo.ps1 里的 token；仓库 Oxmaner/jjcheat
+# ① 用 Git Trees API 提交（base_tree = 当前 head 的 tree，只放改动的文件）
+# ② POST /actions/workflows/build-roothide-deb.yml/dispatches  body: {"ref":"main"}
+# ③ 轮询 /actions/runs/{id} 直到 conclusion=success
+# ④ 产物在 run 页面底部 Artifacts：JJCheat-roothide-deb（约 48.5 MB）
+```
+
+**推送铁律**：推完必须用 `GET /contents/<path>?ref=main` 把文件拉回来比对 md5。
+r15 那次构建失败就是因为漏推了 `JJVisionBridge.m`（只推了 .h，报「方法未实现」）。
+
+### 1.3 装机
+
+- 用户自己从 GitHub Actions 下载 deb 安装（他手上有 MCP 时也可以直接推）
+- 包内 48MB 里 **47MB 是 NNUE 权重**（`pikafish.nnue`，50308806 字节），只有 dylib（约 2MB）和 engine.js（约 350KB）会变
+- 装机后看日志确认 `engine.js 字节数: xxxxxx` 与本地 `dist/engine.js` 一致
+
+---
+
+## 2. 目录与文件职责
+
+```
+jjcheat-patch/
+├── ios/tweak/                  原生插件（Theos，约 7.9k 行 .m+.h）
+│   ├── Tweak.x                 入口：Logos 钩子，冷启动注入
+│   ├── control                 包版本（改版本改这里 + JJConfig.h 两处）
+│   ├── Makefile                roothide 打包配置
+│   ├── Core/
+│   │   ├── JJConfig.h          ★ 所有原生侧常量（版本号也在这）
+│   │   ├── JJCopy.h/.m         HUD/提示文案集中处
+│   ├── Capture/
+│   │   ├── JJMetalGrabber.m    ★ Metal 钩子：摘要轮询 + 真读帧 + BGRA→RGBA
+│   │   ├── JJScreenGrabber.m   兜底抓帧（Metal 不可用时）
+│   ├── Vision/
+│   │   ├── JJVisionBridge.m    ★ OC ↔ JS 桥（JavaScriptCore）
+│   │   ├── JJEngineScript.c    engine.js 的字节数组（由 CI 生成）
+│   ├── Engine/
+│   │   ├── JJPikafish.m        ★ 引擎调度：UCI 收发、看门狗、保活
+│   │   ├── JJPikafishInstaller.m  权重查找与安装（jbroot 多路径）
+│   │   ├── JJEngineOptions.m   参数持久化（NSUserDefaults）
+│   │   ├── JJMoveCodec.m       UCCI ↔ 中文记谱
+│   ├── Game/
+│   │   ├── JJGameController.m  ★★ 主控制器（1955 行，最难改的文件）
+│   │   ├── JJCalibrator.m      四角预设 + 学习 + 采纳画面反解的四角
+│   ├── UI/
+│   │   ├── JJHUDWindow.m       浮窗（纯显示层，hitTest 恒返回 nil）
+│   │   ├── JJBallWindow.m      悬浮球 + 菜单 + 二级面板
+│   │   ├── JJMenuSheet.m       二级面板控件（步进器/开关/动作行）
+├── src/                        JS 源码（约 4.2k 行，模块化）
+│   ├── cst/constants.js        sq 编码、走法编码 C.mv
+│   ├── cst/position.js         走法生成/合法性（引擎级）
+│   ├── cst/notation.js         FEN 解析
+│   ├── vision/recognizer.js    ★★ 识别核心（2700 行）：模板学习、90 格分类
+│   ├── vision/templates.js     模板存取
+│   ├── vision/tracker.js       朝向判定
+│   ├── app/board.js            ★ 规则校验 + analyzeStepDiff
+├── tools/
+│   ├── bundle.js               ★★ 构建脚本 + 主流程（2523 行，含 JJEngine 对象）
+│   ├── regression.js           ★★ 回归测试（1116 行）
+│   ├── check-syntax.sh         原生语法 + 菜单一致性检查
+├── engine/
+│   ├── patch-engine.py         ★ Pikafish 源码打补丁（4 处，见 §7.3）
+├── dist/engine.js              构建产物（不要手改）
+└── .github/workflows/build-roothide-deb.yml   CI
+```
+
+**代码规模**：原生 7.9k 行（.m+.h）/ JS 4.2k 行（src）+ `bundle.js` 2523 行（构建脚本兼主流程）+ `regression.js` 1116 行（测试）。
+
+---
+
+## 3. 一帧的完整生命周期
+
+```
+① Metal 钩子 presentDrawable
+   ├─ 摘要轮询：每 0.15s（等对方时 0.35s）读 90 个角点比对
+   └─ 摘要变了才拷 14MB（低优先级队列，不在渲染线程）
+        ↓
+② JJGameController.tick（250ms 一次）
+   ├─ 帧指纹没变 → 整帧跳过（静态零开销）
+   ├─ 没学过棋盘 → learnAndRefine（异步，主线程不等）
+   └─ 学过 → processPixels（异步）
+        ↓
+③ engine.js JJEngine.process
+   ├─ 90 格模板匹配 → codes[90]（0=空,1~7红,8~14黑）
+   ├─ 锚盘比对 → stepInfo{changed, move, noise}
+   ├─ 白点白圈（标记法）→ 走法
+   ├─ 锚盘推进 / 轮次翻面
+   └─ 输出：fen / needSearch / searchFen / 各类诊断
+        ↓
+④ handleProcessResult
+   ├─ 清 HUD 旧箭头、显示文案
+   ├─ needSearch → JJPikafish analyzeFen:movetime:
+   └─ 写 moves.log / engine.log
+        ↓
+⑤ 引擎回调 → engineDisplayDictFrom → HUD 画箭头
+```
+
+---
+
+## 4. 走子确认：白点白圈（**本项目最核心的机制**）
+
+### 4.1 游戏给的标记
+
+JJ 象棋在**上一步**上画两个东西：
+
+| 标记 | 位置 | 外观 |
+|---|---|---|
+| **白点** | 起点格（此时已空）中心 | 直径约 12pt 的实心小圆点 |
+| **白圈** | 落点格（有子）外围 | 外径约 58pt（半径 29pt）的环，环宽 4~6pt |
+
+**红黑两方画得完全一样**，判哪一方只能看落点那颗子的字色。
+
+### 4.2 判据（真机实测值，2026-11-20 用户手动走 10 轮验证 10/10）
+
+```js
+K.RING_MIN = 0.06   // 环带与环外的「中性色差」，有圈 0.084、普通格 ≤0.039
+K.DOT_MIN  = 10     // 中心 9×9 采样窗口的白像素个数，起点 53、普通空位 0
+```
+
+**关键约束**（都是真机踩出来的）：
+
+- 白点只在「**锚盘有子 且 当前识别为空**」的格里找（那才是棋子离开的地方）
+- 一圈多点时取**分数最高**的白点
+- 一圈多圈时（走子快，旧圈没淡出）**按分数从高到低遍历，取第一个没在去重窗口内的**
+
+### 4.3 三条提交路径（优先级从高到低）
+
+| 路径 | 条件 | 记录 src |
+|---|---|---|
+| **① 白点+白圈齐全** | 两点都有 + 规则合法 + 帧洁净 | `marker` |
+| **② 只有白圈** | 在锚盘里反查「唯一能走到该格」的起点 | `marker-ring` |
+| **③ 差分兜底** | 前两条都不成 + 稳定 3 帧 + 超 1.5s + **零噪声** | `diff` |
+
+**③ 的门槛极高**，因为 r17 之前吃过血亏：标记一丢，差分连着提交 10 步带噪声的帧，盘面从 diff=3 漂到 32，整盘崩掉。现在要求 `noise.length === 0`（变动恰好一进一出两格）。
+
+### 4.4 帧洁净度闸门（r17 新增）
+
+```js
+K.MAX_MOVE_CHANGE = 6   // 一手真棋最多动 2 格，加 4 格抖动容限
+```
+
+- 标记齐全但整帧与锚盘差 > 6 格 → **整帧作废**
+- 连续 2 秒被挡 → 放宽到 12 格（否则差分要求 ≤3 格，两条路都不通会死锁）
+
+---
+
+## 5. 轮次判定
+
+```js
+lastMoverSide   // 'red' | 'black' | null，最近一次「确认」，是唯一真源
+```
+
+- 每提交一手：`lastMoverSide = 走这手的颜色`
+- 显示轮次时：`turn = (lastMoverSide === mySide) ? 对方 : 我方`
+- **不要用 `movePly % 2` 推轮次** —— 漏识别一步就永久卡死（2.1.84 之前的坑）
+
+**对称轮次翻转（2.1.91）**：白点白圈都读不到时，只要「盘面变了」且连续 2 帧，就翻轮次。
+**r17 起：只翻轮次，绝不重锚锚盘。** 原来这里会「连续两帧一致就把当前帧当新锚盘」，而噪声帧偏得很稳定，导致盘面一路漂。
+
+---
+
+## 6. 锚盘（anchor）：唯一真相
+
+```js
+session.anchorCodes   // 90 格兵种编码，程序认定的「当前局面」
+session.anchorFen     // 上面的 FEN 形式
+```
+
+**铁律**：只有走子确认（①/②/③ 任一）通过后才推进锚盘，且只改 `from`/`to` 两格（`anchor.slice()` 后改两点）。
+
+锚盘的建立与自愈：
+
+| 场景 | 触发 | 条件 |
+|---|---|---|
+| 无锚盘 | `if (!anchor)` | **连续 2 帧**识别盘面完全一致 + `codesLegal` + `codesPositionPlausible` |
+| 朝向变了 | `anchorFlipped !== flipped` | 当前盘面合法 |
+| 中等漂移 | `changed` 在 4~9 格 | 连续 **3 帧**同一盘面 |
+| 换局/中途进对局 | `changed >= 8` | 连续 3 帧（相邻差 **≤2 格**）+ 合法 |
+
+> 漂移自愈只接管 4~9 格，≥8 格交给 reseat，两者不能抢（回归 C2 守着这条）。
+
+---
+
+## 7. 引擎集成（Pikafish）
+
+### 7.1 为什么是同进程静态库
+
+iOS 沙盒**禁止 exec**，越狱环境也绕不过签名。所以 Pikafish 编成 `libpikafish.a`（arm64 + arm64e）链进 `JJCheat.dylib`，通过 C 接口 `jjpika_start/send/recv/stop/running` 收发 UCI。
+
+**代价**：引擎里任何 `exit()` 会连带杀掉 JJ 象棋。
+
+### 7.2 UCI 时序（**必须严格遵守**）
+
+```
+Ready      --position/--go-->  Searching
+Searching  --stop(pending)-->  ← 新请求只进 pendingFen，不发 position
+Searching  --bestmove-->       Ready → 先补发 ucinewgame（若有），再 flushPending
+```
+
+- 搜索中绝不发新 `position`（有状态守卫 + 串行队列 + `engineGen` 代号三道保险）
+- 搜索中收到「新局」只设 `pendingNewGame=YES` 并发 `stop`，等 `bestmove` 回来再发 `ucinewgame`
+- **关插件只 stop 搜索、保活引擎**（`stopSearch`），并清掉 `pendingFen/pendingCb`，否则引擎会在关掉之后又搜一次
+
+### 7.3 引擎源码补丁（`engine/patch-engine.py`，4 处）
+
+| # | 位置 | 改什么 | 为什么 |
+|---|---|---|---|
+| 1 | `network.h/.cpp` | `verify()` 改 bool | 失败要能返回，不能 `exit` |
+| 2 | `engine.cpp go()` | 网络没就绪 → 只跳过搜索 | 原为 `exit(EXIT_FAILURE)` |
+| 2b | `engine.cpp go()` | **校验结果缓存**（`static jjNetVerified`） | 原来每步重读 61MB 权重，每步卡 0.3~0.8s |
+| 3 | `uci.cpp` | `position` 失败不 `exit` | 非法 FEN 不能杀 App |
+| 4 | `tt.cpp` | 分配失败不 `exit` | 内存紧张时不能杀 App |
+
+**CI 会缓存 `engine/.build/src`**，里面已是「上一版补丁」形态，所以 `patch()` 找不到原文会失败。解法：`soft_replace()` 做「旧版补丁 → 新版」迁移。**每次改引擎补丁，必须把上一版文本登记成 V1。**
+
+---
+
+## 8. 菜单与参数面板
+
+菜单 9 项（`JJMenuAction` 枚举 → switch 必须一一对应，`check-syntax.sh` 会校验）：
+
+| action | 作用 |
 |---|---|
-| 仓库 | `Oxmaner/jjcheat`（private），head `276c05e`，包版本 **2.1.67** |
-| 架构 | 2.1.x 已重构：`Capture/` `Core/` `Engine/` `Game/` `UI/` `Vision/`，引擎换成**进程内 Pikafish**（不是 1.x 的 JS 引擎） |
-| 设备安装 | `com.fujiang.jjcheat` **2.1.67** 完整包已装（50 MB，md5 `57d57d52…` 与本地一致） |
-| dylib | `…/DynamicLibraries/JJCheat.dylib` 2545504 B, md5 `615701a5…8caa592c` = **诊断版**（`nextDrawable` hook 体为 `return %orig`） |
-| **阻塞** | **tweak 没有被注入进游戏进程**：重启多次、`[JJCheat]` 日志一条都没有（详见 §2） |
-| 崩溃 | 14:31 那份 `.ips` 分析完 → **主线程渲染循环的 0x0，与 2.1.61/62/63 修的引擎线程无关**（详见 §3） |
-| 未验证 | 诊断包「摘掉 Metal hook 后是否还崩」——因为 §2 阻塞，这个实验始终没拿到数据 |
+| `JJMenuActionPlugin` | 开关插件 |
+| `JJMenuActionBoardScheme` | 棋盘预设：人机 / 排位（r10 起两套数值相同） |
+| `JJMenuActionResync` | **重新同步**（清锚盘 + 清结论 + 清指纹，HUD 立即抹箭头） |
+| `JJMenuActionClearLogs` | 点「版本」号触发：清 `moves-*.log` / `engine-*.log` |
+| `JJMenuActionManualCalibrate` | 手动四点标定（保留但 UI 已删，正常不用） |
+| `JJMenuActionHUD` | HUD 显示开关 |
+| `JJMenuActionResetBoard` | 重置到开局 |
+| `JJMenuActionThink` | 思考面板（**跟随「按时间/按深度」模式**） |
+| `JJMenuActionEngineOptions` | 引擎参数（思考方式 / 资源 / 其它三组） |
+| `JJMenuActionEngineStatus` | 引擎状态 |
+
+**思考面板必须跟随模式**：`o.thinkDepth > 0` 时调层数（预设 10/14/18/22），否则调毫秒（350/650/1000/2000）。r15 修过一次——原来写死只改 ms。
+
+**参数是否真的下发**：日志搜 `搜索方式`，会打 `go depth N（按深度）` 或 `go movetime N ms（按时间）`。
 
 ---
 
-## §1 环境
+## 9. 诊断日志速查（**排障第一入口**）
+
+### 9.1 心跳（每 30 秒一行，最有用）
+
+```
+盘面心跳 ply=12 turn=w wait=0 newGame=0 engine=引擎就绪 rejected=1 reseat=0
+        skip=none ring=0.095/0 dot=53 mk=ok diffReject=4 usedDiff=1
+```
+
+| 字段 | 含义 | 正常值 | 异常含义 |
+|---|---|---|---|
+| `ply` | 已确认步数 | 单调 +1 | 跳 2 → 一手被算两次 |
+| `wait` | 是否等对方 | 与 `turn` 互斥 | `wait=0` 但 `skip=waitingOpponent` → 不一致（r17 已修） |
+| `reseat` | 本帧是否换局重锚 | 0 | 频繁 1 → 识别整体崩 |
+| `ring` | `环分/距上次见圈帧数` | 0.08~0.15 / 0~5 | 前者 <0.06 → 没画圈；后者 >20 → 5 秒没见圈 |
+| `dot` | 本帧最大白点分 | 40~60 | <10 → 白点没读到或没画 |
+| `mk` | 标记卡在哪一步 | `ok`/`okRing` | 见下表 |
+| `diffReject` | 差分因带噪被拒次数 | 少量 | 持续涨 → 识别质量差 |
+| `usedDiff` | 差分兜底累计次数 | **长期 0** | >0 → 标记在丢 |
+
+`mk` 取值：
+
+| 值 | 含义 | 下一步 |
+|---|---|---|
+| `ok` | 白点+白圈提交 | 正常 |
+| `okRing` | 只有白圈，反查成功 | 正常（白点丢了） |
+| `noRing` | 没有圈 | 看 `ring`，可能没画/换了皮肤 |
+| `ringDedup` | 有圈但全被去重/残留过滤 | 可能一直是上一手的圈 |
+| `ringOnly` | 有圈但白点和反查都不成 | 看 `dot` |
+| `dirty` | 帧太脏（>6 格）被洁净度闸门挡 | 识别漂移 |
+| `ruleReject` | 白点读到了但走法规则不合法 | 白点点错格了 |
+
+### 9.2 其它关键行
+
+```
+着法链 #3 h9g7  dirty=0 usedDiff=0      ← 每提交一手
+检测到走法 b7e7 炮二平五 → FEN ...       ← 附带 FEN 与锚盘
+引擎调度 ply=.. turn=.. skip=..          ← 为什么跳过搜索
+搜索方式: go movetime 650ms（按时间）    ← 参数是否真下发
+读不到走子标记 · 请点菜单「重新同步」      ← markerLost 提示
+```
+
+### 9.3 日志文件（沙箱内）
+
+```
+Library/Application Support/JJCheat/moves-<yyyyMMdd-HHmmss>.log   每局一个
+Library/Application Support/JJCheat/engine-<yyyyMMdd-HHmmss>.log  每局一个
+```
+
+- `moves.log` 每行：`{n, uci, zh, fen, src, gain, ts}`；`event` 行标记 `newgame`/`resync`/`undo`
+- `engine.log` 每行：`{fen, bestmove, score, depth, nodes, winrate, ts}`
+- 点菜单里的「版本」号可一键清理（带文件数与体积提示）
+
+---
+
+## 10. 常量总表（改阈值只改这两处）
+
+### JS 侧：`tools/bundle.js` 里的 `K` 对象
+
+| 键 | 值 | 作用 |
+|---|---|---|
+| `RING_MIN` | 0.06 | 白圈判据 |
+| `DOT_MIN` | 10 | 白点判据（9×9 白像素数） |
+| `SETTLE_FRAMES` / `SETTLE_MS` | 3 / 1500 | 差分兜底的定格门槛 |
+| `OPT_HIT` / `OPT_WINDOW` | 2 / 15 | 乐观轮次 |
+| `MARKER_DEDUP` | 12 | 同一落点去重窗口（帧） |
+| `SKIN_HI/LO`、`SKIN_OK_HI/LO` | 1.45/0.75、1.30/0.85 | 皮肤提示（带滞回） |
+| `UNDO_STABLE` | 2 | 悔棋连续帧数 |
+| `MAX_MOVE_CHANGE` | 6 | 帧洁净度 |
+
+### 原生侧：`ios/tweak/Core/JJConfig.h`
+
+| 宏 | 值 | 说明 |
+|---|---|---|
+| `JJ_CHEAT_VERSION` | `2.0.0r18` | 与 `control` 必须一致 |
+| `JJ_THINK_MS_DEFAULT/MIN/MAX` | 650 / 100 / 3000 | 思考时间 |
+| `JJ_PROCESS_MIN_GAP` | 0.25 | tick 最小间隔（≈4 fps） |
+| `JJ_METAL_PEEK_INTERVAL` | 0.15 | 摘要轮询（我方） |
+| `JJ_PEEK_WAIT_OPPONENT/OUR_TURN` | 0.35 / 0.15 | 抓帧分档 |
+| `JJ_FRAME_DIFF_THRESHOLD` / `JJ_FP_POINT_DELTA` | 260 / 45 | 帧指纹阈值 |
+| `JJ_LEARN_MAX_FAIL` | 6 | 学习连败后降频 |
+| `JJ_PRESET_AI_*` / `JJ_PRESET_RANK_*` | 28/257/398/659 | 棋盘四角（两套相同） |
+
+---
+
+## 11. 踩坑清单（**最值钱的部分，改代码前先看完**）
+
+### 11.1 构建 / 推送类
+
+| 坑 | 现象 | 解法 |
+|---|---|---|
+| **`bundle.js` 里写反引号** | `engine.js` 语法错误、`SyntaxError: Unexpected identifier` | 主流程被包在模板字符串里，注释里出现 `` ` `` 会截断模板。**全文件只允许 2 个反引号（模板首尾）** |
+| **只按修改时间筛文件推送** | CI 报「方法声明了但没实现」 | 时间筛选会漏。推完必须逐个 `GET /contents` 比对 md5 |
+| **CI 缓存 `engine/.build/src`** | `patch()` 期望原文出现 1 次、实际 0 次 | 用 `soft_replace()` 把上一版补丁迁移成新版 |
+| **`open(path,'w')` 参数错** | 文件被截断成 0 字节 | Python `open()` 在参数校验前就截断文件。写文件前先备份 |
+
+### 11.2 识别 / 标记类
+
+| 坑 | 现象 | 根因与解法 |
+|---|---|---|
+| **旧圈挡住新圈** | `ring` 正常但 `usedDiff=1`（标记失效） | 走子快时上一手圈没淡出且分数更高。r18 改为「按分数遍历取第一个可用」 |
+| **标记去重窗口太长** | 连走两步第二步没反应 | 30 帧（4.5s）→ 12 帧（1.8s） |
+| **白点找不到** | `mk=ringOnly` + `dot<10` | 起点格被读成「有子」就不在白点搜索范围内；或白点被棋子描边盖住 |
+| **整行颜色读反** | reseat 采纳 `pNBAKAB2` 这种盘面 | 规则上合法（黑卒可到底线），`plausible` 拦不住。属识别层，暂时无解 |
+| **结算页当棋盘** | `diff=32 repaired=6` 还在搜 | r17 加「骤降检测」：现在 <4 子且上一帧 ≥10 子 → 停止 |
+
+### 11.3 状态机类
+
+| 坑 | 现象 | 根因与解法 |
+|---|---|---|
+| **锚盘建不起来** | `anchor=` 一直为空、FEN 每帧变、`go` 刷屏 | `if (!anchor)` 那段被误删过一次（r14）。**这段以前零测试覆盖**，r16 补了 W 段 |
+| **ply 跳 2** | 日志 3→5、6→8、8→10 | 标记提交后通用路径又处理同一 move → 校验失败 → 走逃逸 → 再 +1（r17 修），以及「对称翻转 + 提交」各 +1（r18 修） |
+| **`chainDirty` 永久锁死** | 一次逃逸之后对账再也不跑、`moves.log` 的 src 永远 `resync` | 置 1 后从不清零。r17 改为「链就地重启到当前锚盘」 |
+| **`replayChain` 走子方写死 `'w'`** | `#1` 反复出现、编号不断从 1 开始 | 链从「黑方要走的局面」开始重放时第一步 `isLegal` 必失败。r18 按 `moves[0].by` 决定 |
+| **换局字段污染** | 新局第一帧翻错轮次、第一步被吞、开局误弹皮肤提示 | 20 个 `session.*` 没清。r17 补齐 |
+| **学习连败就停摆** | 大厅停留十几秒后插件死掉，必须手动关开 | `timer invalidate`。r17 改成降频重试（两处） |
+
+### 11.4 引擎类
+
+| 坑 | 现象 | 根因与解法 |
+|---|---|---|
+| **每步重读 61MB 权重** | 每步卡 0.3~0.8s | `verify_network()` 在 `Engine::go()` 第一句。r9 改为校验一次缓存 |
+| **`ucinewgame` 在搜索中发** | 重开后第一手慢半秒 | 引擎 UCI 线程会阻塞在 `wait_for_search_finished()`。r11 改严格时序 |
+| **关插件 shutdown 引擎** | 重开要等 15 秒 `readyok` | 改为 `stopSearch` 保活。代价常驻约 110MB |
+| **`stopSearch` 不清 pending** | 关插件后引擎还在搜 | r17 补清 `pendingFen/pendingCb` |
+| **深度模式太高触发看门狗** | 「偶尔这一手不出建议」 | 22 层可能超过 movetime 估算 → 提前 `stop` 丢结果。降到 16 以下或改时间模式 |
+
+### 11.5 UI 类
+
+| 坑 | 现象 | 解法 |
+|---|---|---|
+| **HUD 吃触摸** | 挡住游戏点击 | `hitTest` 恒返回 `nil`，HUD 是纯显示层 |
+| **`__weak` 捕获未持有对象** | `NSInvalidArgumentException` 崩溃 | 刚创建、还没强引用的对象赋给 `__weak` 会立刻变 nil。用 `row` 参数，别反向捕获 |
+
+---
+
+## 12. 已知未解问题（**接手后要盯着**）
+
+| # | 问题 | 现状 | 建议 |
+|---|---|---|---|
+| 1 | **白点为什么会丢**（`dot<10`） | 只知道走子快时丢，未定位到具体渲染原因 | 靠 `dot`/`mk` 两个诊断继续收数据；若确认是「没画」，考虑用「上一帧锚盘 vs 当前帧」的变化格反推起点 |
+| 2 | **引擎偶发自行重启** | 日志 `reader 线程结束` + `uciok=0` 后重握手，触发源不明 | 下次出现时抓完整 5 秒窗口的日志，看是否紧跟 `setoption` |
+| 3 | **中等噪声下漂移自愈失效** | 差 4~7 格但每帧抖动 → 「连续 3 帧一致」永不成立 | 可考虑「按格修复」：只把不在本步 from/to 的差异格按当前识别修正（风险：会把误读写进锚盘） |
+| 4 | **结算页残余棋子多时漏判** | 骤降判据是「<4 子且上一帧 ≥10」 | 阈值再调会误伤残局，建议先观察 |
+| 5 | **悔棋在链重启后失效** | 悔棋判据是「当前盘面 == 链上最后一手的走子前盘面」 | 链被清空时悔棋自动失效，属可接受；若要修，需独立于链记录「上一手盘面」 |
+| 6 | **中文记谱仅验证过一局** | `JJMoveChinese(fenWithSide, uci)` 首次接线 | 需要更多对局确认黑方编号（黑方路数从左数）是否正确 |
+| 7 | **`autoDetectBoard` 未真机验证** | 只在「学习连败、准备放弃」时触发一次 | 换皮肤场景下应重点测 |
+
+---
+
+## 13. 测试体系（`tools/regression.js`）
+
+**21 组场景、158 条断言**。加任何改动都要先跑它。
+
+| 组 | 守什么 |
+|---|---|
+| **A** | 执红：红先手、轮次、噪声门槛、派出去重 |
+| **B** | 执黑：必须等对方（红）先走，不能抢跑 |
+| **C** | 中途进对局：连续 3 帧稳定才换局重锚 |
+| **D** | 中局误点自动标定：学习失败不许污染锚盘 |
+| **E** | 坐标契约：`searchFen` 必须是引擎坐标（红在下） |
+| **F** | 格点对齐（盘均值口径）：偏移修复 / 空盘拒绝 / 已对齐不动 |
+| **H** | 引擎安全闸（王=1、王不可被吃）+ 走法规则校验 |
+| **I** | 规则校验连败 → 强制重锚（防死锁） |
+| **J** | 低置信度闸门（不硬猜） |
+| **P** | 坐标旋转公式一致性（防两侧分叉） |
+| **Q** | 模块拆分完整性（board.js 生效） |
+| **R** | 轮次判定自愈（不靠 movePly 奇偶） |
+| **S** | 落点被高亮圈盖住、起点残留、单帧不许抢跑（S3/S4） |
+| **V** | 标记优先 + 慢速定格（V0 带标记立即提交 / V1 标记缺失不推进 / V2 超时兜底 / V3 悔棋） |
+| **W** | 无锚盘重建（W1 单帧不锚 / W2 两帧一致→锚定） |
+| **X** | 乐观翻面不派发搜索 + ply 不许跳号 |
+| **Y** | 画面洁净度闸门（差 9 格整帧作废） |
+| **Z** | 差分兜底必须零噪声（锚盘不许被污染） |
+| **AB** | 连续 6 步 ply 严格 1..6 |
+| **AC** | 标记丢失 26 帧：锚盘一格不动 + 报 markerLost |
+| **AD** | 旧圈残留（0.14）不挡新圈（0.09） |
+
+**写测试的坑**：
+
+- fixture 用 `makeFixture(src, blackBottom)`，`S.markerSq`/`S.markerFromSq` 是**屏幕坐标**格号
+- `S.staleMarkerSq` 可模拟「旧圈残留」（分数 0.14，比新圈 0.09 高）
+- 断言要检查 `anchorFen` 是否被污染，不要只看 `ply`（ply 会被对称翻转 +1，是允许的）
+
+---
+
+## 14. 协作规约（用户明确要求过，必须遵守）
+
+### 14.1 铁律
+
+1. **改代码 → 自检 → 汇报 → 等用户确认出包**。不要自作主张推构建。
+2. **不生成垃圾脚本**：所有功能塞进现有工具（`bundle.js`/`regression.js`），绝不新建 `xxx_日期.py`。
+3. **改完必须三查**：`node --check`（bundle.js 语法）、`bundle`（打包）、`regression`（回归）、`check-syntax.sh`（原生）。
+4. **一次只改一件事**，改完立刻验证。多件事混在一起出错最难定位。
+5. **不确定就问**，不要脑补需求（尤其涉及识别策略、状态机语义）。
+
+### 14.2 沟通风格
+
+- 中文、直接、给证据（日志行号、代码行号）
+- 用 Markdown 表格对比「改前 / 改后」
+- 状态用 ✅ ❌ ⏳ ⚠️
+- **不要吹**：明确说「这个不确定」「这个没验证」「这是推测」
+- 出错要立刻承认 + 给补救动作，不要解释理由
+
+### 14.3 用户最在意什么
+
+| 排序 | 在意点 |
+|---|---|
+| 1 | **精准度**（宁可慢，不能错） |
+| 2 | **数据一致性**（日志、FEN、锚盘三者对得上） |
+| 3 | 稳定性（不崩、不卡死、不用手动关开） |
+| 4 | 速度 |
+
+他反复说过：「慢一点无所谓，正常人类是要思考的，只要精准度」。
+
+---
+
+## 15. 常见任务操作手册
+
+### 15.1 改一个阈值
+
+1. 改 `tools/bundle.js` 的 `K` 对象，或 `ios/tweak/Core/JJConfig.h`
+2. `node tools/bundle.js && node tools/regression.js`
+3. `bash tools/check-syntax.sh`
+4. 全绿后按 §1.2 推送
+
+### 15.2 加一个菜单项
+
+1. `JJGameController.m` 的 `JJMenuAction` 枚举加一项
+2. `jjMenuEntries` 里加 `JJMenuEntry`，设 `action`
+3. `switch` 里加分支 + 实现方法
+4. 类扩展里声明方法
+5. **同步 `tools/check-syntax.sh` 的 `check_case` 清单**（否则一致性检查会红）
+6. 跑自检
+
+### 15.3 改引擎补丁
+
+1. 先看 `engine/patch-engine.py` 现有 4 处
+2. 改完后**把上一版文本登记成 `ENGINE_CPP_GO_V1`**（或对应的 V1 常量）
+3. 本地用「旧形态源码树」验证 `soft_replace` 迁移生效
+4. 推送后看 CI 的 `jj-patch` 日志，确认全部「已替换」
+
+### 15.4 排查「HUD 和棋盘不一致」
+
+按这个顺序看日志：
+
+```
+1. mk=？           → 标记法卡在哪一步
+2. ring / dot      → 圈和点到底有没有
+3. usedDiff        → 有没有掉到差分
+4. ply 是否连续    → 有没有重复计算
+5. anchor= 是否为空 → 锚盘建起来了没
+6. reseat 是否为 1  → 是不是在反复重锚
+7. diff 多大        → 6 以内正常，20+ 说明识别整体崩
+```
+
+### 15.5 排查「不出建议」
+
+```
+1. skip=none 但有 needSearch？→ 看 needSearch 是否为 1
+2. skip=waitingOpponent？     → 轮次判定认为在等对方
+3. skip=lowconf？             → 待确认格数 > 6
+4. skip=illegal？             → 盘面非法
+5. skip=king？                → 王缺失或已被吃
+6. 搜「搜索方式」             → 引擎参数是否真下发
+7. 搜「看门狗」               → 是否被超时 stop 掉了
+```
+
+---
+
+## 16. 关键联系人 / 环境信息
 
 | 项 | 值 |
 |---|---|
-| 设备 | iPhone14,3 / iOS **15.1** / **Dopamine-roothide**（procursus(roothide)） |
-| jbroot | `/var/containers/Bundle/Application/.jbroot-DB287DC7EB4CA44A/` |
-| 目标 App | bundle `cn.jj.chinachess`，进程名 `TKLobby_chess_tuanjie` |
-| App 路径 | `/var/containers/Bundle/Application/22C9D37B-DB99-4573-95BE-62B17741E8D2/TKLobby_chess_tuanjie.app` |
-| App 二进制时间 | **Nov 10 15:26**（这之后注入行为发生了变化，见 §2） |
-| App 数据容器 | `/var/mobile/Containers/Data/Application/141CCCF6-0FE0-4492-8E22-5EDFAC205EF5/` |
-| engine.js | `…/Library/Application Support/JJCheat/engine.js`（288538 B） |
-| NNUE 权重 | `…/Library/Application Support/JJCheat/Pikafish/pikafish.nnue`（50308806 B） |
-| 屏幕 | native 1284×2778 / point 428×926 / @3x |
-| 包管理器 | Sileo 2.5.1 —— **reinstall 只卸不装，装机用 dpkg** |
-| 构建 | GitHub Actions `macos-15` + roothide/theos，产物只上传 artifact（不发 Release） |
-
-roothide 硬规则：
-
-- `data.tar` 内路径必须相对 jbroot，**不能**出现 `/var/jb`，更不能出现 `rootfs`
-- `/rootfs` 是只读系统卷
-- dylib 的 install_name 是 `@loader_path/.jbroot/Library/MobileSubstrate/DynamicLibraries/JJCheat.dylib`，依赖 `@loader_path/.jbroot/usr/lib/libroothide.dylib` 与 `libsubstrate.dylib`（→ `libellekit.dylib`）；该目录下 `.jbroot -> //` 符号链接负责把路径展开
-- 设备上 `/usr/lib/libroothide.dylib`（168576 B）与 `/usr/lib/libsubstrate.dylib -> libellekit.dylib`（787088 B）**存在**，依赖不是问题
+| 仓库 | `github.com/Oxmaner/jjcheat`（PAT 在 `patch_repo.ps1`） |
+| 设备 | iPhone（Metal 1284×2778 px / 逻辑 428×926 pt，6.7 吋机型），iOS 16.x，roothide 越狱 |
+| 目标 App | JJ 象棋（`cn.jj.chinachess`） |
+| 用户 | 定富哥（紫金铜业电解厂，业余做这个） |
+| 本地路径 | `F:/MacLin/Documents/jjcheat-patch` |
+| Theos SDK | `F:/MacLin/Documents/theos-sdks/iPhoneOS16.5.sdk` |
+| MCP（手机） | `192.168.137.123:8090`，只在工位网络可用 |
 
 ---
 
-## §2 当前阻塞：tweak 未被注入（最高优先级）
+## 17. 最后一句
 
-### 现象
+这个项目最大的教训是：**问题几乎从来不在「识别算法」，而在「状态什么时候被相信」**。
 
-重启游戏多次（`kill_app` + `launch_app`，pid 每次变），用 `get_syslog` 抓 12～25 秒窗口：
+90 格模板匹配本身足够准（10 轮真机实测 10/10）。所有严重故障都出在同一件事上——
+**某一帧的脏数据被当成了真相，写进了锚盘，然后一直错下去**。
 
-```
-JJCheat hits: 0
-```
+所以改动前先问自己：
 
-`TKLobby_chess_tuanjie` 自己的日志有（28 条，全是 `com.apple.network` 的 `tcp_input`），但**没有任何 `[JJCheat]` 输出**，也没有 ElleKit/dyld 的加载痕迹（syslog 里两条 `category: Injection` 属于系统 `com.apple.BoardServices`，与本项目无关）。
+> 这个改动，会让「不确定的帧」有机会污染锚盘吗？
 
-### 关键矛盾
-
-**今天早上 04:39 的日志是有 `[JJCheat]` 的** —— 当时能打出：
-
-```
-棋盘学习完成 { verifyDiff=0, ok=1, ... }
-引擎就绪 uciok=1
-```
-
-说明那时注入是好的。之后唯一的动作是：**重装了 deb 包**。所以是**注入配置层**的问题，不是代码。
-
-### 已排除
-
-| 假设 | 排除依据 |
-|---|---|
-| dylib 文件不在位 | 文件在，2545504 B，md5 与构建产物一致 |
-| 依赖缺失 | `libroothide.dylib`、`libsubstrate.dylib` 都在 |
-| dylib 未签名 | `LC_CODE_SIGNATURE` 存在（两个 slice 都有） |
-| plist 过滤不对 | `JJCheat.plist` 的 `Filter.Bundles` 含 `cn.jj.chinachess` |
-| trustcache 缺 cdhash | `jbctl trustcache info` 只有 1 行，但**其他能正常工作的 tweak 也不在**（如 Axon/SnowBoard），所以不是判据；且 `jbctl trustcache add` 要 root 而 `mcp-root` 不放行 |
-| postinst 有问题 | 完整包 `postinst` 只处理 engine.js / NNUE / 清理 1.x 残留，不碰签名，也不写 `.app` |
-
-### 待做（需要人工介入）
-
-1. 打开 **Bootstrap**（roothide 管理 App）→ **App List** → 确认 **JJ象棋** 的注入开关是开的；已是开的话关掉再打开，让它重新打补丁
-2. 恢复后立刻验证，只认这一行：
-   ```
-   [JJCheat] tweak 已加载 (pid=…, 2.1.x pikafish)
-   ```
-3. 若仍无日志，下一步在 dylib 的 `%ctor` **第一行**加一条无条件 `NSLog` 并重打包 —— 那是判断「有没有被 dyld 加载」的最小实验
-
-### 一个不能忽略的推论
-
-App 二进制时间是 **Nov 10 15:26**，而 04:39 的日志证明注入当时有效。若 App Store 更新（或 roothide 的补丁副本）在某个时间点被替换，注入就会失效。**接手时先确认注入，再谈崩溃。**
-
----
-
-## §3 崩溃分析：14:31 的那份 `.ips`
-
-文件：`TKLobby_chess_tuanjie-2026-11-17-143138.ips`（91962 B）
-
-```
-exception: EXC_BAD_ACCESS (SIGSEGV)
-subtype:   KERN_INVALID_ADDRESS at 0x0000000000000000     ← 空指针
-faultingThread = 0   →  com.apple.main-thread             ← 主线程
-images:    TuanjieFramework（游戏引擎）, QuartzCore, JJCheat.dylib(uuid 11f986fc-…)
-
-栈（thread 0）：
-  TuanjieFramework +9435188 / +9430248 ×2 / +17757552 / +17942824 / +3894208 / +852516
-  TuanjieFramework +126957656 / +135702576 / +133828360 / +138857036 / …
-  QuartzCore  CA::Display::DisplayLink::dispatch_items
-  QuartzCore  CA::Display::DisplayLink::dispatch_deferred_display_links
-  UIKitCore   __setupUpdateSequence_block_invoke → _UIUpdateSequenceRun
-  CoreFoundation __CFRunLoopRun
-```
-
-**这条栈里没有一帧 JJCheat，也没有一帧 JJPikafish。**
-
-> ⚠️ **15:55 更正 —— 上面这个结论只对 thread 0 成立，整体结论是错的。请先读 §11。**
->
-> 这份 `.ips` 一共 **100 个线程**（`threads` 数组在 JSON 第 39 行，普通 Read 会被 2000 字符截断，看起来像只有主线程）。其中 **thread 91 就是引擎线程，栈全部带 JJCheat.dylib 符号**，末尾停在 `Network::verify → exit(EXIT_FAILURE)`。
->
-> 也就是说：**这次崩溃确实是插件引起的**；主线程的 0x0 是引擎线程调用 `exit()` 拆进程时，撞上正在跑的渲染循环造成的二次伤害。2.1.61/62/63 修的方向（线程栈、SIGSEGV handler、setoption）全部无关。
-
-而 2.1.61 / 2.1.62 / 2.1.63 三个 commit 修的分别是「NSThread 栈 512KB→16MB」、「装 SIGSEGV handler 抓 backtrace」、「去掉 `setoption Threads/EvalFile`」—— 全部针对**引擎线程**。SIGSEGV 只影响出错线程，`faultingThread=0` 已经明确是主线程。
-
-结论：**这份崩溃大概率与引擎搜索无关**；若当时 tweak 也没注入成功（§2），那它根本与插件无关，是游戏自身的崩溃。
-
-按可能性排序的主线程嫌疑（在注入恢复后应逐一二分）：
-
-| 顺序 | 嫌疑 | 依据 |
-|---|---|---|
-| ① | `CAMetalLayer -nextDrawable` hook | Unity 主线程渲染必经此路；当前实现跨帧 `CFRetain` IOSurface |
-| ② | HUD 窗口刷新 | 也在 `DisplayLink` 驱动的 UI 更新链上 |
-| ③ | 主线程上的 JS 识别 / 状态更新 | 2.0 起已用「帧序号 + 指纹」降频，但仍可能阻塞 |
-
----
-
-## §4 仓库结构与关键文件
-
-```
-ios/tweak/
-  Tweak.x                    Logos hook 入口（EAGLContext ×3、CAMetalLayer -nextDrawable）
-  Core/JJConfig.h            全部可调参数 + 诊断开关 JJ_DISABLE_METAL_HOOK
-  Capture/JJMetalGrabber.m   Metal 抓帧（nextDrawable + 上一帧 IOSurface，专用读帧队列）
-  Capture/JJScreenGrabber.m  抓帧调度与黑帧判定
-  Vision/JJVisionBridge.m    JS 引擎桥（2.x 里还负责调 Pikafish）
-  Vision/JJEngineScript.c    engine.js 内嵌副本（构建时由 tools/gen-engine-c.py 生成）
-  Engine/JJPikafish.m        进程内 Pikafish（UCI 握手、搜索、NNUE mmap）
-  Engine/JJPikafishInstaller.m  权重落位到 App 容器
-  Engine/JJMoveCodec.m       着法编码
-  Game/JJGameController.m    状态机 / tick / 学习 / 标定联动（40 KB）
-  Game/JJCalibrator.m        四点标定 + 网格对齐
-  UI/JJHUDWindow.m           顶部信息条 + 箭头 + 标定 UI
-  UI/JJBallWindow.m          悬浮球（懒加载入口）
-  layout/DEBIAN/postinst     只处理 engine.js / NNUE / 清理残留，绝不写 .app
-```
-
-已废弃、**不要再用**：`layout/usr/bin/jjcheat-fix`（往 `.app` 塞 engine.js 会破坏签名）、`prerm` 里对应的清理逻辑仅作历史残留兜底。
-
----
-
-## §5 构建流水线
-
-```bash
-curl -X POST -H "Authorization: token <TOKEN>" \
-  https://api.github.com/repos/Oxmaner/jjcheat/actions/workflows/build-roothide-deb.yml/dispatches \
-  -d '{"ref":"main"}'
-```
-
-11 步 ≈ 5–7 分钟：取代码 → 工具链 → roothide/theos → ldid+dpkg → 补 iPhoneOS16.5 SDK → **缓存/交叉编译 Pikafish** → **版本号递增** → 打包 engine.js → `make package` → 校验产物 → 上传 artifact（deb / engine.js / Pikafish 静态库）。
-
-版本号规则：`2.1.${GITHUB_RUN_NUMBER}`，即**每次构建自动 +1**。
-
-产物大小 ~50 MB（主要是 Pikafish 二进制 + NNUE）。
-
----
-
-## §6 设备操作：iOS MCP（重要，本轮新增能力）
-
-服务地址 `http://192.168.137.11:8090/mcp`，ios-mcp **1.2.8**，共 **46 个工具**。
-本项目会话里**没有**把 MCP 挂进原生工具表，是直接用 JSON-RPC 走 HTTP 调用的；辅助脚本在
-`F:\MacLin\Documents\jjcheat-local\`：`mcp_call.py`（通用调用）、`grab_shot.py`（截图）、`list_tools.py`。
-
-调用要点：
-
-- `initialize` → 拿 `Mcp-Session-Id` → `tools/call`
-- 参数一律用 **base64 传 JSON**（`mcp_call.py <tool> <b64> --b64`），PowerShell 直接传引号会被吃掉，导致 `Missing required parameter`
-- 设备锁屏/熄屏时，**交互类与 Shell 类工具会被拦截**，只放行状态查询、截图、`wake_and_home`
-
-### 48 个工具里真正用得上的
-
-| 用途 | 工具 | 备注 |
-|---|---|---|
-| 跑 shell | `run_command` | **uid=501(mobile)，不是 root**；`timeout` 上限 30s |
-| 抓实时日志 | `get_syslog` | 支持 `process` / `last_seconds`(≤60) / `max_lines`(≤5000)。**这是看 `[JJCheat]` 的唯一手段** |
-| 崩溃报告 | `get_crash_logs` / `read_crash_log` | 当前只有 `WiFiLQMMetrics*.ips`，游戏自己的没落盘 |
-| 装包 | `install_app` | 只认设备上已存在的 `.deb/.ipa`；装 deb 会重启 SpringBoard |
-| 写文件 | `write_file` | 支持二进制走 base64；返回 `resolved_path` 会重写进 jbroot，但 shell 里同样可见 |
-| 截屏/OCR | `screenshot` / `ocr_screen` / `describe_screen` | 游戏是 Unity，AX 几乎拿不到节点，**用截图或 OCR** |
-| 启动 App | `launch_app` | **设备锁屏时会失败**并报成 `LSApplicationWorkspace … returned NO`，误导性极强；先 `wake_and_home` 再启动 |
-| 提权 | `mcp-root` | 只放行包内工具、受限 `chmod`/`launchctl`、`dpkg -i\|-r <绝对路径>`。实测 `id`、`dpkg -i` 都被拒（`Command is not permitted`），**不要指望它** |
-
-### 装包的三条路径（按可靠性排序）
-
-1. **`write_file` 分块 + 设备端拼接（最可靠，实测可用）**
-   - 单次请求体上限约 128 KB 原始字节（1.2 MB base64 会 `413 Payload Too Large`）
-   - 每块 base64 后写成 `p00000.b64 …`，再 `cat jjpart/p0*.b64 | base64 -di > jjfull.deb`
-   - **两个坑**：① 每块独立 base64 会在接缝处补 `=`，必须用 `-d` + `-i` 或逐块解码追加；② `probe.b64` 之类的探测文件会被 `p*.b64` 通配符吃进去，导致拼接结果比正常多出整整一块
-   - 校验：`md5sum` 必须与本地一致（本次 `57d57d52da3a58d4c299a34e1d9e9f99`）
-   - 然后 `install_app` 指向 `/var/mobile/jjfull.deb`
-2. **`/upload_file` + `install_app`（小文件可用）**
-   - 必须 **直接 POST 原始二进制** + `Content-Type: application/octet-stream` + `X-Filename`
-   - multipart 会 415；50 MB 会被服务端掐断（`RemoteDisconnected`）；2.5 MB 的 dylib 能过
-   - 返回的 `/var/mobile/Library/Caches/ios-mcp-uploads/…` 路径**在 shell 里看不到**，但 `install_app` 能用
-3. **mini deb（只换 dylib，应急用）**
-   - 只打包 `JJCheat.dylib`（xz 后约 417 KB），`Version` 改成 `2.1.67+diag1`
-   - **副作用**：`Installed-Size` 与实际不符，dpkg 状态不干净。**仅用于应急，事后要补完整包**
-
-已废弃：本机开 TCP/HTTP 让设备用 `/dev/tcp` 拉 —— 当前不是管理员，防火墙全开加不了入站规则，连不通。
-
----
-
-## §7 编译坑（本轮实际踩到，务必避免重犯）
-
-| # | 坑 | 报错 | 解法 |
-|---|---|---|---|
-| 1 | **JJConfig.h 带 BOM** | `identifier contains Unicode character <U+FEFF>` + `#endif without #if` | 用 PowerShell `Set-Content -Encoding utf8` 拉的文件会带 BOM，PS 5.1 还会叠加；用 python 循环剥掉所有 `\xef\xbb\xbf` |
-| 2 | **用 `#if` 包住整个 `%hook` 块** | `function '_logos_method$…' has internal linkage but is not defined [-Werror,-Wundefined-internal]` | Logos 的 `%init` 会为 `%hook` 内声明的方法生成注册代码。正确做法：**方法保留，方法体内条件编译** |
-| 3 | `%ctor` 里同步遍历全类表装 hook | 启动被拖死，日志只到 `tweak 已加载` | 延迟 1.5s 异步装 + `@try/@catch` |
-| 4 | `presentDrawable:` 的 orig 只按 `[self class]` 查 | 查不到 → 不调原实现 → **黑屏**；且该游戏压根不走 present 家族 | 沿父类链按「类名#selector」查表，找不到也要走保底 |
-| 5 | 相信 `CARenderServer` 的 `usable=1` | 返回全黑且因「非 nil」永不回退 | 必须验帧内容 |
-| 6 | 以为 hook `presentRenderbuffer:` 能抓 Metal 游戏 | 永不触发 | 先判渲染后端（`nextDrawable` 计数） |
-| 7 | `data.tar` 出现 `/rootfs/...` | dpkg `Read-only file system` | data 内路径一律相对 jbroot |
-| 8 | 在 `tick`（主线程 + 2 Hz）里做重活 | 卡死（1.1.35 就是这么把游戏卡死的） | 重活放后台队列，或加「只做一次」的闸 |
-
----
-
-## §8 抓帧链路现状（供改 Metal 时参考）
-
-```
-JJScreenGrabber.grabRGBAWithWidth:height:
-  ① GL-hook（EAGLContext presentRenderbuffer 三变体）—— 对本游戏不触发
-  ② Metal（JJMetalGrabber）—— 主路径
-  ③ CARenderServer —— roothide 下 usable=1 但全黑，已永久关闭
-  ④ CALayer renderInContext —— 基本全黑，偶发抓到一帧
-```
-
-Metal 实现（2.0 重构后）：
-
-```c
-// %orig 之前：取出上一帧的 surface，交给专用队列读（渲染线程零拷贝）
-void JJMetalBeforeNextDrawable(void) {
-    gNextDrawableCount++;
-    if (!gCaptureEnabled) { JJDropPending(); return; }
-    IOSurfaceRef s = JJTakePending(&w, &h);
-    if (!s) return;
-    if (atomic_compare_exchange_strong(&gReadBusy, &0, 1) && 间隔够) {
-        dispatch_async(JJReadQueue(), ^{ JJReadSurface(s, w, h); CFRelease(s); … });
-    } else { CFRelease(s); }
-}
-// %orig 之后：记住本次 drawable 的 surface（CFRetain）
-void JJMetalAfterNextDrawable(id drawable) { … JJStorePending(s, …); }
-```
-
-实测数据（2.1.63，注入正常时）：`nextDrawable=1351 present=78 captured=178 fail=0 surfaceMiss=0 surfaceMiss=0`、`frame=14267808 B`（=1284×2778×4），画面真实可用。**该游戏不调 `presentDrawable` 家族**（三个变体都 hook 上了，`present` 却停在 78 不动）。
-
-诊断开关：`Core/JJConfig.h` 里 `JJ_DISABLE_METAL_HOOK`，为 1 时 hook 体直接 `return %orig`（不登记 surface、不读 IOSurface）。当前装的 2.1.67 就是这个状态。
-
----
-
-## §9 下一步建议（按顺序）
-
-1. **恢复注入**（§2）——在此之前一切实验无效
-2. 确认日志出现 `[JJCheat] tweak 已加载` 后，**先原样玩一局**，看崩不崩：
-   - 崩 → 用 §7-⑧ 的方式继续二分（下一版摘 Pikafish 搜索，再下一版摘 HUD）
-   - 不崩 → 把 `JJ_DISABLE_METAL_HOOK` 改回 0，再玩一局：崩 → 锁定 Metal hook，改 ReplayKit 或给读帧加 `IOSurfaceIsInUse` 保护
-3. 崩溃若复现，立刻 `get_syslog`（`process: TKLobby`, `last_seconds: 25`）保存发生前的 `[JJCheat]` 上下文，比 `.ips` 有用得多
-4. 备选抓帧方案：**ReplayKit**（`RPScreenRecorder -startCaptureWithHandler:` → `CMSampleBuffer` → `CVPixelBuffer`），完全绕开渲染管线，任何后端都能抓；代价是抓帧瞬间要临时隐藏 HUD
-
----
-
-## §10 已知限制
-
-- 这台 Windows 机器上**没有真机验证能力**，所有本地验证都是结构性的（fat header、slices、符号、ad-hoc 签名、deb ar/control/data 布局）
-- 自动标定只做两件事：判断哪方在下（底线颜色）+ 学习背景阈值（`warmThreshold`）；**四个角点仍需手点**
-- `JJ_LEARN_MAX_DIFF = 8`，学习校验超过就拒绝，避免把已收敛的锚盘冲成乱码
-- 历史遗留：仓库 Releases 里还有 `roothide-build-19/21/22/23/24`，可删（未确认）
-
----
-
-## §11 更正 §3：14:31 崩溃的真因是引擎线程调用了 `exit()`
-
-> 本节由前一轮会话在拿到 `.ips` 全文后补充。**请连同 §3 一起读，§3 的结论以此节为准。**
-
-### 11.1 先把全部线程打印出来（`.ips` 的 `threads` 数组有 100 条）
-
-`threads` 在 JSON 第 39 行、是一整行，任何按行截断的查看方式都会丢掉后面 99 个线程。用这段脚本还原（`imageIndex` 会被映射成模块名，dylib 内的帧自带符号）：
-
-```bash
-node -e "
-const fs=require('fs');
-const p='<路径>/TKLobby_chess_tuanjie-2026-11-17-143138.ips';
-const raw=fs.readFileSync(p,'utf8');const i=raw.indexOf('\n');
-const body=JSON.parse(raw.slice(i+1));
-const imgs=body.usedImages||[];
-body.threads.forEach((t,ix)=>{
-  const fr=t.frames||[];
-  if(!fr.some(f=>imgs[f.imageIndex]&&imgs[f.imageIndex].name==='JJCheat.dylib')) return;
-  console.log('=== thread',ix,t.name||t.queue||'');
-  fr.forEach((f,k)=>{const im=imgs[f.imageIndex]||{name:'?'};
-    console.log(' #'+k,im.name,f.symbol||('0x'+f.imageOffset.toString(16)));});
-});
-"
-```
-
-### 11.2 thread 91 = 引擎线程，栈是完整带符号的
-
-```
-#0  libsystem_kernel   __psynch_cvwait
-#1  libsystem_pthread  _pthread_cond_wait
-#2  libc++             std::__1::condition_variable::wait(unique_lock<mutex>&)
-#3  TKLobby            0xf38e74
-#4  TKLobby            0xf37ea4
-#5  TKLobby            0xf157cc
-#6  TKLobby            0x102a204
-#7  libsystem_c        __cxa_finalize_ranges
-#8  libsystem_c        exit                                  ← 关键
-#9  JJCheat.dylib      Stockfish::Eval::NNUE::Network::verify(function<void(string_view)> const&, EvalFile const&, __fs::filesystem::path) const   (+2456)
-#10 JJCheat.dylib      Stockfish::Engine::verify_network() const                     (+224)
-#11 JJCheat.dylib      Stockfish::Engine::go(Search::LimitsType&)                    (+40)
-#12 JJCheat.dylib      Stockfish::UCIEngine::loop()                                  (+3816)
-#13 JJCheat.dylib      jjpika_start                                                  (+1036)
-#14 JJCheat.dylib      0x79578
-#15 Foundation         __NSThread__start__ → _pthread_start → thread_start
-```
-
-读法：帧号越小越内层。`exit` 的返回地址落在 `Network::verify+2456`，即 **`Network::verify` 调用了 `exit`**；`exit` 再跑 `__cxa_finalize_ranges`（全局析构），析构链里某个 `TKLobby` 静态析构函数在等条件变量。
-
-### 11.3 源码依据（Pikafish-2026-09-06，与我们 `engine/build-ios.sh` 的 `PIKA_TAG` 一致）
-
-```cpp
-void Engine::go(Search::LimitsType& limits) {
-    assert(limits.perft == 0);
-    verify_network();                       // ← go 的第一件事就是校验网络
-    threads.start_thinking(pos, states, limits);
-}
-
-void Engine::verify_network() const {
-    const auto file = path_from_utf8(std::string(options["EvalFile"]));
-    network->verify(onVerifyNetwork, networkFile, file);
-    ...
-}
-
-void Network::verify(const std::function<void(std::string_view)>& f,
-                     const EvalFile& evalFile, fs::path evalfilePath) const {
-    if (evalfilePath.empty()) evalfilePath = evalFile.defaultName;
-    if (evalFile.current != evalfilePath) {          // ← 网络没加载成功
-        if (f) { /* 打印 5 行 ERROR: ... The engine will be terminated now. */ }
-        exit(EXIT_FAILURE);                          // ← 唯一出口，直接杀进程
-    }
-    if (f) { f("NNUE evaluation using ..."); }
-}
-```
-
-`evalFile.current` 只在 `Network::load_external` 里、且 `load(stream)` 解析成功时才被赋值。所以 **`exit` 只有一种触发条件：NNUE 网络没被成功加载**。
-
-### 11.4 为什么崩的是主线程（解释所有旧现象）
-
-`exit()` 跑在引擎线程上，会执行 atexit + 全部全局析构（**包括 TuanjieFramework 的静态对象**）。此时主线程还活着，正在 `CA::Display::DisplayLink::dispatch_items` 里逐帧渲染。渲染代码踩到已被析构的状态 → 主线程 `EXC_BAD_ACCESS at 0x0`，栈里全是 TuanjieFramework 的帧。这就同时解释了：
-
-- 为什么「HUD 显示 `engine=思考中`，马上闪退」——`思考中` 就是 `go` 发出去的那一刻；
-- 为什么 thread 0 的栈里没有任何 JJCheat 帧——真正的元凶在另一个线程；
-- 为什么 2.1.62 的进程内 SIGSEGV handler 从来没落盘——它挂在**主线程**上，但 `exit` 走的是正常退出流程，不是我们的 handler 路径；
-- 为什么越狱机的 CrashReporter 之前拿不到 `.ips`——这是 `bug_type 309` / `isCorpse:1`，属于「进程自己走了」而不是标准崩溃上报路径。
-
-**结论：`0x0 SIGSEGV` 不是搜索里的空指针，是 `exit()` 拆进程时的二次伤害。** 2.1.61（16MB 栈）、2.1.62（signal handler）、2.1.63（去掉 `setoption Threads/EvalFile`）全都打在症状上。
-
-### 11.5 一个必须接受的重构性事实
-
-`verify_network()` 是 `go` 的必经路径，而它在网络没加载时**直接 `exit`**。这意味着：**2.1.5x 至今没有任何一个版本在真机上真正搜过一步棋**。所有「引擎就绪 / uciok=1 / 引擎自报 Pikafish」都只说明构造与握手成功，和网络加载是两件事；而 `verifyDiff=0 ok=1` 是**棋盘识别**的判据，跟引擎完全无关。之前把这些读成「引擎 OK、建议要出来了」，是本轮最大的误导源。
-
-### 11.6 为什么这条 ERROR 从来没人看见（我们自己的日志把证据吞了）
-
-`ios/tweak/Engine/JJPikafish.m::handleLineOnQueue:` 的判断顺序是：
-
-```objc
-if ([line hasPrefix:@"info "]) { self.lastInfo = ...; return; }      // ← 先命中这里
-...
-if ([line hasPrefix:@"info string"] || ... || [line rangeOfString:@"NNUE"]...) {
-    NSLog(@"%@ 引擎输出: %@", kPikaLog, line);                        // ← 永远到不了
-}
-```
-
-引擎的错误块是以 `info string ERROR: ...` 输出的（`print_info_string` 会统一加 `info string ` 前缀），**全部被第一个分支吃掉并 return**。所以包括 `NNUE evaluation using ...`、`Network replica 1: ...` 在内的所有引擎自述，一次都没进过日志。修法：把 `info string` 判断挪到 `info ` **之前**。
-
-### 11.7 权重本身是好的（已逐项核对）
-
-| 项 | 值 | 判读 |
-|---|---|---|
-| 包内文件 | `…/JJCheat/Pikafish/pikafish.nnue`，50,308,806 B | 在 |
-| sha256 | `071aefc0730e124876a97609a4a75624d62fa5d3155858c9646a1a8272e9e458` | 记录备查 |
-| 文件头 | `28 b5 2f fd` | **zstd 帧 magic**，是压缩网络，`read_compressed_nnue` 负责解压 |
-| 解压后 | 64,701,992 B | 解压正常完成 |
-| 头部 version | `0x6A448AFA` | == 源码 `constexpr u32 Version = 0x6A448AFAu`，**版本匹配** |
-| 头部 desc | `Network trained with the https://github.com/official-pikafish/pikafish-nnue-pytorch trainer.` | 官方网络 |
-| 远端 `master-net/pikafish.nnue` | `Content-Length: 50308806` | 与我们这份**同尺寸**，即当前官方 master-net |
-
-`read_compressed_nnue` 解压失败会返回空 stream，随后 `read_header` 失败 → `current` 不赋值 → `verify` → `exit`。所以链路上还有三种可能，**现有证据无法区分**：
-
-1. 运行时 `std::ifstream` 打不开（`binaryDirectory` 由 `argv[0].parent_path()` 推出，shim 传的是权重文件本身，理论上对）；
-2. `hashValue != Network::hash`（架构哈希不符）；
-3. `Detail::read_parameters` / `stream.peek()==eof` 不符（参数布局或尾部多余字节）。
-
-`master-net` 是**滚动发布**（`scripts/net.sh` 直接拉这个 tag），源码却钉在 `Pikafish-2026-09-06`。版本号一致只说明粗粒度格式没变，**不能保证 `Network::hash` 与参数布局一致** —— 这是最可疑的一条。
-
-### 11.8 2.1.68 应该怎么做（建议方案，尚未实施）
-
-我们自己在 CI 里编 Pikafish（`engine/build-ios.sh` 里 `git clone --branch $TAG`），所以可以直接打补丁，**让网络校验失败变成可观测的降级，而不是杀掉宿主 App**：
-
-**① 编译期补丁（新增 `engine/patches/0001-no-exit-on-verify.patch`，在 clone 之后 `git apply`）**
-
-- `src/nnue/network.cpp`：`void verify(...)` → `bool verify(...)`；删掉 `exit(EXIT_FAILURE)`，改为 `return false;`（ERROR 文本照旧先打印）；成功分支 `return true;`
-- `src/nnue/network.h`：同步改声明
-- `src/engine.cpp`：`void verify_network() const` → `bool`（`verify` 结果 && 各 replica 状态）；`go()` 改成
-  ```cpp
-  if (!verify_network()) { onVerifyNetwork("JJ: 网络校验失败，本次不搜索"); return; }
-  threads.start_thinking(pos, states, limits);
-  ```
-  **必须提前 return**：网络没加载就 `start_thinking` 会在评估里解引用未初始化的权重。
-
-**② 让失败原因自己说清楚（同一补丁里加 3 条 `info string JJ-NNUE:`）**
-
-- `Network::load_external`：打印 `dir/evalfilePath` 与 `read_compressed_nnue` 返回的字节数（0 = 解压/开文件失败）
-- `Network::read_parameters`：`read_header` 失败、`hashValue != Network::hash`（打印**文件哈希与引擎哈希的十六进制**）、参数解析失败、尾部多余字节，四种分别打不同文案
-- `verify`：成功后打印 `NNUE evaluation using ...`（原本就有，只是被日志过滤器吞了）
-
-**③ OC 侧**：`handleLineOnQueue:` 调整判断顺序（见 §11.6）；`info string` 一律 `NSLog`，并把最后 5 条引擎输出显示到 HUD，这样失败原因在球上一眼可见。
-
-**④ CI 护栏（防再犯）**：在 `macos-15` runner 上编一个 10 行小程序，`#include "nnue/nnue_architecture.h"` + `nnue_feature_transformer.h`，打印
-`NetworkArchitecture::get_hash_value() ^ FeatureTransformer::get_hash_value()`，再读权重文件头的 `u32[1]` 比对，不一致就让构建失败；同时把权重 sha256（`071aefc0…`）钉进 workflow，`master-net` 漂移时立刻报警。
-
-### 11.9 对 §2「tweak 未注入」的一条旁证
-
-这份 14:31 的 `.ips` 里 **`usedImages[21]` 就是我们**：
-
-```
-name : JJCheat.dylib
-path : /private/var/containers/Bundle/Application/.jbroot-DB287DC7EB4CA44A/usr/lib/TweakInject/JJCheat.dylib
-uuid : 11f986fc-38c2-3d81-9c8d-218f15b0b588
-```
-
-而且 thread 91 正在跑 `jjpika_start`。所以 **14:31 时注入是成功的、引擎线程是活的**。注入失效发生在 **14:31 之后**（时间上最接近的是 2.1.67 诊断包的重装），§2 的排查范围可以据此收窄。
-
----
-
-## §12 2.1.68 实施：把 exit 改成降级（推翻 2.1.64~67）
-
-### 12.1 先说推翻的部分
-
-2.1.64~67 那五个 commit 建立在「崩溃在主线程渲染、与引擎无关」上（§3 的原结论），具体是：给 `CAMetalLayer -nextDrawable` 加 `JJ_DISABLE_METAL_HOOK=1` 开关、本地写 ReplayKit 抓帧器、以及随后的 BOM/Logos 编译修补。**这条线全部作废**（§11 已证明 thread 91 就是引擎，且栈里有 `exit`）。
-
-处理方式：本地源码整体重置回 `fe5c204e`（2.1.63）的树，接手方新增的
-`ios/tweak/JJMetalGrabber.m`、`JJReplayGrabber.h/.m` 三个多余文件删除，
-`JJConfig.h` / `Tweak.x` 的诊断开关回退。只保留一个纯技术修补：**`JJConfig.h` 去掉 BOM**（BOM 是我自己引入的，去掉无副作用）。
-
-> 提醒：`jjcheat-patch/` 不是 git 仓库，所以「回滚」是从 GitHub 上按 blob 拉回来覆盖的。以后接手时如果发现本地与云端 head 不一致，别假设本地是新的。
-
-### 12.2 引擎补丁（`engine/patch-engine.py`，构建时自动应用）
-
-单文件 14 处替换，规则是「原文本必须恰好出现 1 次」，否则构建直接失败 ——
-源码漂移时立刻变红，绝不静默产出一个「补丁没打上」的包。幂等，可反复跑。
-
-| 文件 | 改动 |
-|---|---|
-| `nnue/network.h` | `verify()` → `bool`；文件尾新增 5 个诊断访问器声明 |
-| `nnue/network.cpp` | 加 `<cstdio>`；加 TU 级静态诊断量；`read_header` 拆开「读不出」与「版本不符」；`read_parameters` 四类失败分别记录；`load_external` 记录解压字节数与实际路径；**`verify()` 删除 `exit(EXIT_FAILURE)`，改 `return false`** |
-| `engine.h` | `verify_network()` → `bool` |
-| `engine.cpp` | `go()` 失败时提前 return（不 `start_thinking`、不 exit）；`perft()` 失败返回 `u64(0)`；`verify_network()` 返回 `ok` 并给 `onVerifyNetwork` 判空 |
-
-失败时输出的那一行是这次的关键产物：
-
-```
-info string JJ-NNUE FAIL reason=<原因> | path=<实际路径> | decompressed=<字节> |
-            fileHash=0x<文件架构哈希> engineHash=0x<本引擎架构哈希> | requested=<请求的文件名>
-```
-
-`reason` 的取值直接对应剩余可能：
-`header unreadable (file missing, empty or not zstd)` /
-`format Version mismatch` / `architecture hash mismatch (net not built for this engine)` /
-`feature-transformer parameters unreadable` / `layer-stack parameters unreadable` /
-`trailing bytes or bad stream state`
-
-**为什么不给 `Network` 加成员存错误**：官方注释明确要求它保持 trivially-copyable（要映射进共享内存、不能有析构），加 `std::string` 会破坏这个契约。所以诊断量放 TU 级 `static`，通过 free function 读。
-
-### 12.3 构建与 CI
-
-- `engine/build-ios.sh`：编译前调 `patch-engine.py`；产物断言 lib 里存在 `_jj_last_network_load_error`（缺符号 = 补丁没生效，拒绝出包）；`needs_build()` 也检查这个符号，避免复用打补丁前的旧 `.a`。
-- `.github/workflows/build-roothide-deb.yml`：缓存键纳入 `patch-engine.py`；新增「校验 NNUE 权重指纹」步骤，`PIKA_NET_SHA256` 钉死为 `071aefc0…e458`。`scripts/net.sh` 拉的是滚动发布 `master-net`，官方换网络后新权重可能与本 `PIKA_TAG` 架构不符 —— 一漂构建就红。
-- `engine/check-net.py`（新增）：校验存在性、大小下限、zstd 头（`28b52ffd`）、sha256。
-
-### 12.4 OC 侧
-
-- `JJPikafish.m::handleLineOnQueue:`：**`info string` 判断提到 `info ` 之前**。这是「引擎有没有加载上权重」一直看不见的直接原因（详见 §11.6）。新增 `lastEngineNotice` 保存该行。
-- `JJPikafish.h`：暴露 `lastEngineNotice`。
-- `JJGameController.m::showEngineStatus`：「皮卡鱼引擎」详情面板显示引擎自述；判定失败时补一句「网络校验没通过 → 引擎会跳过搜索（不会再闪退）」。
-- `featureMark` → `pikafishNative2168`。
-
-### 12.5 本地校验
-
-`node tools/bundle.js`（288,538 B）+ `node tools/regression.js`（全绿）+ `bash tools/check-syntax.sh`（11 文件全绿）。补丁脚本在真实 Pikafish 源上跑过两遍：第一遍 14 处全替，第二遍全部「已是目标状态，跳过」。
-
-### 12.6 待真机验证
-
-- commit `4b416edc` / run #68；HANDOFF 另推 `de27e95b`
-- 期望：**HUD 显示「思考中」后不再闪退**。若 NNUE 真有问题，HUD 详情面板与 syslog 会出现
-  `引擎自述: info string JJ-NNUE FAIL reason=… fileHash=… engineHash=…`
-- 判读：
-  - `decompressed=0` → 文件没打开或不是 zstd（查沙盒路径 / postinst 是否落盘）
-  - `fileHash ≠ engineHash` → 权重与本源码不配套 → 换权重或改 `PIKA_TAG`，这是当前最可疑的一条
-  - 其它 reason → 按字面查参数布局/尾部字节
-  - 出现 `NNUE evaluation using …` → 网络终于加载成功，接着看 bestmove 与箭头
-
----
-
-## §13 权重与源码必须成对 —— 一次走错又走对的排查（结论已更正）
-
-> **本节 17:0x 重写过。下面 13.4 之前那版结论（"随包 4.19MB 网络"）是错的，已作废。**
-
-### 13.1 真机把剩余可能性收敛成一个
-
-2.1.70 补丁按设计工作（App 不再闪退），日志直接给出原因：
-
-```
-engine=思考中
-info string JJ-NNUE FAIL reason=architecture hash mismatch (net not built for this engine)
-  | path=…/Pikafish/pikafish.nnue | decompressed=64701992 B
-  | fileHash=0xCACA41C8 engineHash=0x40C70FA6 | requested=pikafish.nnue
-info string NNUE not ready, search skipped (process kept alive)
-```
-
-文件在、路径对、zstd 解压成功 → 不是"读不到文件"，是**架构哈希不符**。
-
-### 13.2 第一次走错：以为 tag 的发布包里带着"配套网络"
-
-`Pikafish-2026-09-06` 的 Release 里确实有个 `pikafish.nnue`（4,186,919 B，zstd，
-解压 5,505,024 B，头 hash `0x40C70FA6` —— 与该 tag 源码算出来的一致）。
-2.1.71 装上去后：识别正常 `verifyDiff=0`、容器里 50MB 旧权重被 `kJJMaxNetSize`
-判无效并重拷、hash mismatch 也不再报 —— 但换成了下一个错：
-
-```
-info string JJ-NNUE FAIL reason=feature-transformer parameters unreadable
-```
-
-解剖文件才明白：那份网络解压只有 **5.5MB**，而该版本架构的
-`ThreatWeightSize = ThreatInputDimensions(45547) × L1(1024)` ≈ **46.6MB** ——
-**数据量根本不够**。它是另一条架构线的网络，只是头部哈希碰巧等于 FT^NA。
-**教训：文件头 hash 相等 ≠ 文件可用，还要看解压后的字节数对不对得上架构尺寸。**
-
-### 13.3 真正的答案：master 的 `Network::hash` 多了一项
-
-master `nnue/network.h`：
-
-```cpp
-static constexpr u32 LayerStackTableHash = 0x5A7AB1E5u;
-static constexpr u32 hash = FeatureTransformer::get_hash_value()
-                          ^ NetworkArchitecture::get_hash_value()
-                          ^ LayerStackTableHash;
-```
-
-之前的编译期探针只算前两项（`0x90B0F02D`），漏了第三个常量。补上：
-
-```
-0x90B0F02D ^ 0x5A7AB1E5 = 0xCACA41C8   ← 与 master-net 权重头一字不差
-```
-
-交叉验证：master-net 参数区第一个 u32 正是 `0x5A7AB1E5`，随后是 `RawLayerStacks=32`
-与 32 项 u16 fallback 表，与该版本 `read_parameters` 逐字段对得上。
-
-**所以 master 源码 + master-net 本来就是配套的一对。** 一直不匹配是因为
-源码钉在 tag `Pikafish-2026-09-06`（旧架构 `0x40C70FA6`），而 `scripts/net.sh`
-永远拉最新 master-net（`0xCACA41C8`）—— 两者错位，仅此而已。
-
-### 13.4 最终改动
-
-| 位置 | 改动 |
-|---|---|
-| `engine/build-ios.sh` | 源码钉 **commit**（`PIKA_COMMIT=8d8db92f77190dece8bd4fca9609fe2eab531844`，master HEAD 2026-11-15）；用 codeload tarball 取（`git clone --branch` 吃不了 commit）；权重回到 `scripts/net.sh` |
-| `engine/check-net.py` | `MIN_SIZE` 40MB；校验 zstd 头与 sha256 |
-| `workflow` | `PIKA_TAG` → `PIKA_COMMIT`；`PIKA_NET_SHA256=071aefc0…e458`（master-net） |
-| `Engine/JJPikafishInstaller.m` | 尺寸窗口 20~120MB（太小=截断或残留旧小网络；太大=异常；上限同时保证老用户容器里的旧文件被判无效并重拷） |
-| `engine/pikafish.nnue` | **已删除**（云端也删了），不再随包 |
-
-### 13.5 顺手修正一处误导性 HUD 文案
-
-引擎拒绝搜索时（NNUE 没就绪 / 引擎不可用），HUD 原来落到兜底分支显示
-**「视角未对齐 · 请回开局画面」** —— 那句话把人往识别方向引，而问题在引擎。
-现在 `JJGameController` 透传 `engineBlocked`，HUD 显示
-「引擎网络未就绪 · 点球看⑥详情」；真的识别失败才说视角未对齐。
-
-> 这也是 2026-11-17 17:02 用户看到"视角未对齐"的原因 —— 当时引擎因 NNUE
-> 加载失败跳过了搜索，根本没有建议可画，与视角无关。
-
-### 13.6 换版本时的清单
-
-1. 定 `PIKA_COMMIT` 为 Pikafish 某个 commit（master 或某个稳定点）
-2. 取 `scripts/net.sh` 的 master-net，算 `Network::hash` 与文件头比对
-   （注意 master 的公式含 `^ LayerStackTableHash`）
-3. **再核对解压后字节数与架构尺寸**（`ThreatWeightSize` 等），别只看 hash
-4. 更新 workflow 的 `PIKA_NET_SHA256`
-5. 尺寸若跨出 20~120MB 窗口，同步改 `check-net.py` 与 `JJPikafishInstaller.m`
+如果会，加闸门；如果不会，放手改，但要补测试。
