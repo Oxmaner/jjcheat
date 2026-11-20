@@ -72,6 +72,10 @@ typedef void (^JJPikaProgressBlock)(NSDictionary *info);
 /** 停止引擎（插件关闭时调用）：发 quit，线程自行退出。 */
 - (void)shutdown;
 
+/** 2.0.0r17：只停当前搜索，不拆引擎（权重、置换表、线程全部保活）。
+    用于「关闭插件」—— 下次开启是瞬时的，不必重 mmap 50MB 权重。 */
+- (void)stopSearch;
+
 /**
  * 分析一个局面（FEN 必须是引擎坐标：红在下 + w/b 走子方，与 engine.js
  * 的 engineFen 同源）。回调主线程。

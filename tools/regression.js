@@ -389,6 +389,168 @@ function main() {
     throw new Error('W2 失败：连续两帧同一盘面仍未建立锚盘（会一直无锚盘空转）');
   }
   console.log('     W2 两帧一致 → 锚定成功 ✓（anchor=%s）', w2.anchorFen);
+
+  /* ===== X. 2.0.0r17：乐观翻面不许派发搜索 =====
+     真机日志：我方 h7e7 提交（ply=1 等对方）后，下一帧只检测到对方半区变了、
+     真实走法还没确认，却已经 go movetime —— 拿半成品盘面去搜，结论可能指错。
+     现在乐观翻面只负责清箭头，搜索必须等标记正式提交。 */
+  console.log('');
+  console.log('========== X. 乐观翻面不派发搜索（2.0.0r17）==========');
+  const X = makeFixture(src, false);
+  X.learnOpening(false);
+  X.frame('X0 开局轮到我', X.S0.slice(), () => {});
+  const xStep = X.S0.slice(); xStep[54] = 0; xStep[45] = 7;   // 我方红兵进一
+  X.S.markerSq = 45; X.S.markerFromSq = 54;
+  const x0 = X.frame('X1 我方走子（标记确认）', xStep, r => {
+    if (!r.waitingOpponent) throw new Error('我方走完应等对方');
+  });
+  if (x0.ply !== 1) throw new Error('应有 ply=1');
+  /* 对方半区变化，但**没有标记**（真实走法尚未确认） */
+  X.S.markerSq = -1; X.S.markerFromSq = -1;
+  const xStep2 = xStep.slice(); xStep2[27] = 0; xStep2[36] = 14;
+  X.setCodes(xStep2);
+  /* 乐观轮次需要连续两帧一致才采纳，所以要喂两次 */
+  X.JJ.process(new Uint8ClampedArray(4), 1, 1, { live: true });
+  const x1 = X.JJ.process(new Uint8ClampedArray(4), 1, 1, { live: true });
+  console.log('     X2 对方半区变化（无标记）| optimistic=%s search=%s wait=%s',
+    x1.optimisticTurn, x1.needSearch, x1.waitingOpponent);
+  if (!x1.optimisticTurn) throw new Error('连续两帧对方半区变化应触发乐观翻面');
+  /* 2.0.0r17：同一盘面重复喂，ply 不许再涨（标记提交后不许被通用路径二次处理） */
+  const x2 = X.JJ.process(new Uint8ClampedArray(4), 1, 1, { live: true });
+  if (x2.ply !== x1.ply) {
+    throw new Error('ply 在同一步上又涨了（标记提交被通用路径重复处理，ply 会跳 2）');
+  }
+  if (x1.needSearch) {
+    throw new Error('乐观翻面时不该派发搜索（会拿未确认的盘面去搜）');
+  }
+  console.log('     乐观翻面 ✓ 且未派发搜索 ✓（等标记确认后再搜）');
+
+  /* ===== Y. 2.0.0r17：画面洁净度闸门 =====
+     真机日志：11:58:17 #24 c6c5 的 diff=9、11:58:27 #26 的 diff=7 都提交了。
+     一手真棋最多动 2 格，多出来的格子是识别漂移 —— 标记齐全也不该拿这一帧
+     去推锚盘（from/to 可能正好落在那几格噪声上）。 */
+  console.log('');
+  console.log('========== Y. 画面洁净度闸门（2.0.0r17）==========');
+  const Y = makeFixture(src, false);
+  Y.learnOpening(false);
+  Y.frame('Y0 开局轮到我', Y.S0.slice(), () => {});
+  const yBad = Y.S0.slice();
+  /* 造 9 格变化（红 5 兵 + 黑 4 卒各进一格，全部合法），远超一手棋的 2 格 */
+  [54, 56, 58, 60, 62].forEach(function (sq) { yBad[sq] = 0; yBad[sq - 9] = 7; });
+  [27, 29, 31, 33].forEach(function (sq) { yBad[sq] = 0; yBad[sq + 9] = 14; });
+  Y.S.markerSq = 45;          // 标记照旧指向「红兵 54→45」
+  Y.S.markerFromSq = 54;
+  const y1 = Y.frame('Y1 标记齐全但整帧差 9 格（应整帧作废）', yBad, () => {});
+  if (y1.ply !== 0) throw new Error('脏帧不该推进锚盘（ply 应为 0，实际 ' + y1.ply + '）');
+  if (!y1.dirtyFrameSkip) throw new Error('应记一次 dirtyFrameSkip');
+  console.log('     脏帧被挡 ✓（ply 仍为 0，dirtyFrameSkip=%s，未污染锚盘）', y1.dirtyFrameSkip);
+
+  /* ===== Z. 2.0.0r17：差分兜底必须「零噪声」 =====
+     真机日志（12:13:10 起）：白点白圈一丢，旧的「稳定 1.5s 就采纳差分」
+     连着提交 10 步，diff 从 3 涨到 32，整盘崩掉。
+     现在带噪声的差分就算等到定格也不许提交。 */
+  console.log('');
+  console.log('========== Z. 差分兜底必须零噪声（2.0.0r17）==========');
+  const Z = makeFixture(src, false);
+  Z.learnOpening(false);
+  Z.frame('Z0 开局轮到我', Z.S0.slice(), () => {});
+  const zStep = Z.S0.slice(); zStep[54] = 0; zStep[45] = 7;
+  Z.S.markerSq = 45; Z.S.markerFromSq = 54;
+  const z1 = Z.frame('Z1 我方走一步（标记齐全）', zStep, () => {});
+  if (z1.ply !== 1) throw new Error('Z1 应提交到 ply=1，实际 ' + z1.ply);
+  /* 轮到对方：两个黑卒各进一格（4 格变化 = 一步 + 一格噪声），且完全不画标记 */
+  Z.S.markerSq = -1;
+  Z.S.markerFromSq = -1;
+  const zDirty = zStep.slice();
+  zDirty[27] = 0; zDirty[36] = 14;
+  zDirty[29] = 0; zDirty[38] = 14;
+  Z.setCodes(zDirty);
+  const zt0 = Date.now();
+  let z2 = null;
+  while (Date.now() - zt0 < 2200) {           // 等过 1.5s 定格门槛
+    z2 = Z.JJ.process(new Uint8ClampedArray(4), 1, 1, { live: true });
+    if (z2.ply !== 1) break;
+    sleepMs(250);
+  }
+  console.log('     Z2 带噪声的差分帧 | ply=%s usedDiff=%s diffReject=%s inferred=%s dirtySkip=%s reseat=%s',
+    z2 && z2.ply, z2 && z2.usedDiff, z2 && z2.diffRejected,
+    z2 && z2.dbgInferred, z2 && z2.dirtyFrameSkip, z2 && z2.reseat);
+  /* 注意：这里 ply 允许涨 —— 「对称轮次翻转」会翻轮次（HUD 不卡），但
+     它已经不再用猜出来的帧重锚。真正要守住的是**锚盘不被污染**。 */
+  if (z2.usedDiff) throw new Error('带噪声的差分被采纳了（usedDiff=' + z2.usedDiff + '）');
+  if (z2.anchorFen !== z1.anchorFen) {
+    throw new Error('锚盘被带噪声的帧污染了：' + z1.anchorFen + ' → ' + z2.anchorFen);
+  }
+  console.log('     带噪声的差分被拒 ✓（等再久也不拿它推锚盘）');
+
+  /* ===== AB. 2.0.0r17：连续 6 步，ply 必须严格 1→6 =====
+     真机日志里出现过 ply 3→5、6→8、12→14 的跳号（标记提交之后通用路径
+     又处理了同一个 move，走了「规则连败逃逸」再给 ply 加一次）。
+     这里用连续 6 步红黑交替把这条路彻底守住。 */
+  console.log('');
+  console.log('========== AB. 连续走子 ply 必须严格递增（2.0.0r17）==========');
+  const AB = makeFixture(src, false);
+  AB.learnOpening(false);
+  AB.frame('AB0 开局轮到我', AB.S0.slice(), () => {});
+  let abBoard = AB.S0.slice();
+  /* 红兵进、黑卒进，交替 6 步；每步都带白点+白圈 */
+  const AB_MOVES = [
+    [54, 45, 7], [27, 36, 14],
+    [56, 47, 7], [29, 38, 14],
+    [58, 49, 7], [31, 40, 14]
+  ];
+  for (let k = 0; k < AB_MOVES.length; k++) {
+    const mv = AB_MOVES[k];
+    abBoard = abBoard.slice();
+    abBoard[mv[0]] = 0;
+    abBoard[mv[1]] = mv[2];
+    AB.S.markerFromSq = mv[0];
+    AB.S.markerSq = mv[1];
+    const rr = AB.frame('AB' + (k + 1) + ' 第 ' + (k + 1) + ' 步（标记齐全）',
+      abBoard, null);
+    if (rr.ply !== k + 1) {
+      throw new Error('第 ' + (k + 1) + ' 步 ply 应为 ' + (k + 1) + '，实际 ' + rr.ply
+        + '（跳号说明同一个 move 被处理了两次）');
+    }
+  }
+  console.log('     6 步连续走子 ply=1..6 ✓（无跳号、无重复处理）');
+
+  /* ===== AC. 2.0.0r17：标记彻底丢失时，锚盘必须一动不动 =====
+     真机日志 12:13:10~12:15:08：白点白圈消失，差分连着提交 10 步带噪声的帧，
+     盘面从 diff=3 漂到 32，整盘崩掉。这里模拟同一场景，守两件事：
+       AC1 锚盘全程不变（不被噪声污染）
+       AC2 20 帧后报 markerLost（HUD 会提示「点重新同步」） */
+  console.log('');
+  console.log('========== AC. 标记丢失后锚盘不动（2.0.0r17）==========');
+  const AC = makeFixture(src, false);
+  AC.learnOpening(false);
+  AC.frame('AC0 开局轮到我', AC.S0.slice(), () => {});
+  const acStep = AC.S0.slice(); acStep[54] = 0; acStep[45] = 7;
+  AC.S.markerSq = 45;
+  AC.S.markerFromSq = 54;
+  const ac1 = AC.frame('AC1 带标记走一步（建立 markerEverSeen）', acStep, () => {});
+  if (ac1.ply !== 1) throw new Error('AC1 应提交到 ply=1，实际 ' + ac1.ply);
+  /* 此后白点白圈彻底消失，每帧都带噪声（两个卒各自进一格 = 一步 + 噪声） */
+  AC.S.markerSq = -1;
+  AC.S.markerFromSq = -1;
+  let acLast = null;
+  for (let k = 0; k < 26; k++) {
+    const zz = acStep.slice();
+    zz[27] = 0; zz[36] = 14;
+    if (k % 2 === 0) { zz[29] = 0; zz[38] = 14; }
+    else { zz[31] = 0; zz[40] = 14; }
+    AC.setCodes(zz);
+    acLast = AC.JJ.process(new Uint8ClampedArray(4), 1, 1, { live: true });
+  }
+  console.log('     AC 26 帧无标记 | anchor=%s markerLost=%s ringAge=%s usedDiff=%s',
+    acLast.anchorFen, acLast.markerLost, acLast.ringAge, acLast.usedDiff);
+  if (acLast.anchorFen !== ac1.anchorFen) {
+    throw new Error('锚盘被无标记的噪声帧污染：' + ac1.anchorFen + ' → ' + acLast.anchorFen);
+  }
+  if (!acLast.markerLost) {
+    throw new Error('连续 26 帧没有白圈，应报 markerLost（否则用户不知道要重新同步）');
+  }
+  console.log('     锚盘全程未动 ✓ 且已报 markerLost ✓（不再越走越乱）');
   /* ===== R. 2.1.84：轮次判定自愈（不靠 movePly 奇偶） =====
      真机症状：对方已经走子，浮窗还显示「等待对方走子」；我方走完箭头不消失。
      根因：轮次由 session.movePly % 2 推出，只要某一步漏识别、movePly 不再增长，

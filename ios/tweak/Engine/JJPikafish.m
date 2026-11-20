@@ -224,6 +224,30 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
     });
 }
 
+- (void)stopSearch {
+    dispatch_async(_pikaQueue, ^{
+        if (self.watchdog) {
+            dispatch_block_cancel(self.watchdog);
+            self.watchdog = nil;
+        }
+        /* ★ 2.0.0r17：关插件时必须把「排队中的搜索请求」一起丢掉。
+           否则 stop 之后 bestmove 回来 → handleBestmoveOnQueue 末尾会
+           flushPendingOnQueue，拿 pendingFen 再发一次 position + go ——
+           插件已经关了，引擎还在后台搜棋，白烧电也白热。 */
+        BOOL hadPending = (self.pendingFen.length > 0);
+        self.pendingFen = nil;
+        self.pendingCb = nil;
+        self.pendingNewGame = NO;
+        if (hadPending) {
+            NSLog(@"%@ 丢弃排队中的搜索请求（插件正在关闭）", kPikaLog);
+        }
+        if (self.state == JJPikaStateSearching) {
+            NSLog(@"%@ 停止搜索（引擎保活，权重不卸载）", kPikaLog);
+            [self writeLine:@"stop"];
+        }
+    });
+}
+
 - (void)notifyNewGame {
     dispatch_async(_pikaQueue, ^{
         /* UCI 时序：搜索中绝不能直接发 ucinewgame。

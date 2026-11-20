@@ -86,6 +86,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 @property (nonatomic, assign) NSInteger lastChainLen;
 /* 2.0.0r13：上次皮肤提示的时刻（5 分钟内只提示一次，别刷屏） */
 @property (nonatomic, assign) NSTimeInterval lastSkinWarnTs;
+/* 2.0.0r17：上次「走子标记丢失」提示的时刻（1 分钟冷却） */
+@property (nonatomic, assign) NSTimeInterval lastMarkerLostTs;
 /* 2.0.0r14：本局的日志时间戳（每局一对 moves-<时间>.log / engine-<时间>.log） */
 @property (nonatomic, copy, nullable) NSString *gameLogStamp;
 
@@ -206,7 +208,13 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     self.busy = NO;
     JJMetalSetCaptureEnabled(NO);
     [[JJScreenGrabber shared] stop];
-    [[JJPikafish shared] shutdown];
+    /* ★ 2.0.0r17：关插件**不再 shutdown 引擎**，只停搜索。
+       真机日志（11:40:23）：关开插件后「等待引擎就绪（15s 超时）readyok」——
+       因为 shutdown 把引擎整个拆了，再开要重新 mmap 50MB 权重 + UCI 握手，
+       这 15 秒就是用户感受到的「卡」。
+       保活后再次开启是瞬时的；代价是常驻约 110MB（48MB 哈希 + 61MB 权重）。 */
+    [[JJPikafish shared] stopSearch];
+    NSLog(@"[JJCheat] 插件已关闭（引擎保活，不拆权重）");
 }
 
 #pragma mark - 悬浮球与菜单
@@ -1297,6 +1305,8 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
 #pragma mark - 学习与识别结果
 
 - (void)handleLearnResult:(NSDictionary *)info rgba:(NSData *)rgba width:(int)w height:(int)h {
+    /* 2.0.0r17：同上的残留回调保护（学习是异步的，关插件时也可能晚到） */
+    if (!self.enabled || !self.activated) return;
     /* ★ 2.1.97：**几何检测的网格先采纳，不等模板学习**。
      *
      * learnBoard 干的是「学 90 格模板」，必须有标准开局的 32 个棋子才成功；
@@ -1318,10 +1328,15 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
                   info[@"verifyDiff"] ?: @"-");
         }
         if (self.learnFailCount >= JJ_LEARN_MAX_FAIL) {
-            [self.timer invalidate];
-            self.timer = nil;
-            [[JJHUDWindow shared] showStatus:@"学习失败 · 请检查 engine.js 后重开插件"];
-            NSLog(@"[JJCheat] 学习连续失败 %ld 次，已暂停重试", (long)self.learnFailCount);
+            /* ★ 2.0.0r17：这是「学习未完成」的另一条路径（info/templateCount 缺失）。
+               原来这里也 invalidate 定时器 —— 和大厅那处是同一个病：插件直接死掉，
+               必须手动关开。现在一起改成降频重试，画面回到棋盘就会自愈。 */
+            self.processNotBefore = [[NSDate date] timeIntervalSince1970] + 3.0;
+            [[JJHUDWindow shared] showStatus:@"请进入对局 · 停在开局棋盘"];
+            if ((self.learnFailCount % 5) == 1) {
+                NSLog(@"[JJCheat] 学习连续失败 %ld 次 → 降频重试（不停摆）",
+                      (long)self.learnFailCount);
+            }
             return;
         }
         [[JJHUDWindow shared] showStatus:@"正在学习棋盘…请停留在开局画面"];
@@ -1477,11 +1492,20 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
             if ([[JJCalibrator shared] hasSnapshot]) {
                 [self rollbackCalibration];
             } else {
-                [self.timer invalidate];
-                self.timer = nil;
-                [[JJHUDWindow shared] showStatus:@"学习失败 · 请点「重来」回开局，再重开插件"];
-                NSLog(@"[JJCheat] 学习连续失败 %ld 次，已暂停重试（未进入识别）",
-                      (long)self.learnFailCount);
+                /* ★ 2.0.0r17：**不再停摆**。
+                   真机日志（11:39:42）：在大厅停留十几秒 → 学习连败 6 次 →
+                   原来这里把定时器 invalidate 掉，插件彻底死掉，
+                   必须手动关开插件才能恢复。这是体验上最伤的一条。
+                   现在改成「降频重试」：失败越多间隔越长（1s→5s 封顶），
+                   一旦回到棋盘画面立刻自愈，不用用户做任何操作。 */
+                if (self.learnFailCount >= JJ_LEARN_MAX_FAIL) {
+                    self.processNotBefore = [[NSDate date] timeIntervalSince1970] + 3.0;
+                    [[JJHUDWindow shared] showStatus:@"请进入对局 · 停在开局棋盘"];
+                    if ((self.learnFailCount % 5) == 1) {
+                        NSLog(@"[JJCheat] 学习连续失败 %ld 次 → 降频重试（不停摆）",
+                              (long)self.learnFailCount);
+                    }
+                }
             }
             return;
         }
@@ -1589,6 +1613,10 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
 #pragma mark - 识别结果 → 引擎 → HUD
 
 - (void)handleProcessResult:(NSDictionary *)result {
+    /* ★ 2.0.0r17：关闭插件的瞬间可能还有一帧正在异步识别，回调晚到几百毫秒。
+       真机日志（12:04:31 action=100 关插件 → 12:04:33 还打出「着法链 #39」）
+       证明这条路径存在。丢弃即可，避免关了还在改锚盘/写日志。 */
+    if (!self.enabled || !self.activated) return;
     self.lastRecognition = result;
 
 
@@ -1600,6 +1628,20 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     /* 2.0.0r12：着法链记账（双轨之一）。每新增一步打一行，
        带「谁走的 / 中文记谱 / 靠什么判出来的 / 链是否被重锚污染」。
        界面上不显示，出问题时从这里回溯。 */
+    /* ★ 2.0.0r17：走子标记丢失提示。
+       差分闸门收紧后，如果这套皮肤彻底不画白点白圈，整局都不会推进
+       （这是刻意的：宁可停，也不拿脏帧推锚盘）。必须让用户知道该怎么做。 */
+    if ([result[@"markerLost"] integerValue] != 0) {
+        NSTimeInterval mNow = [[NSDate date] timeIntervalSince1970];
+        if (mNow - self.lastMarkerLostTs > 60) {
+            self.lastMarkerLostTs = mNow;
+            [self.ballWindow toast:@"读不到走子标记 · 请点菜单「重新同步」"];
+            NSLog(@"[JJCheat] 走子标记丢失：ringAge=%@ ringMax=%@ diffReject=%@",
+                  result[@"ringAge"] ?: @"-", result[@"ringMax"] ?: @"-",
+                  result[@"diffRejected"] ?: @"-");
+        }
+    }
+
     /* 2.0.0r13：皮肤提示。本插件只对原始皮肤做模板，换皮肤后亮度分布会偏移，
        识别会明显变差。这里只提示、不阻断（皮肤可能只是明暗不同），
        5 分钟内最多提示一次。 */
@@ -1727,11 +1769,16 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     NSTimeInterval hb = [[NSDate date] timeIntervalSince1970];
     if (hb - self.lastHeartbeatTs >= JJ_HEARTBEAT_GAP) {
         self.lastHeartbeatTs = hb;
-        NSLog(@"[JJCheat] 盘面心跳 ply=%@ turn=%@ wait=%@ newGame=%@ engine=%@ rejected=%@ reseat=%@ skip=%@",
+        /* 2.0.0r17：补上标记诊断 —— ringMax（本帧最大环分，≥0.06 才算有白圈）、
+           ringAge（距上次见到白圈多少帧）、diffReject（差分因带噪声被拒的次数）。
+           这组数一看就知道「是圈没画出来、还是画了但阈值没够」。 */
+        NSLog(@"[JJCheat] 盘面心跳 ply=%@ turn=%@ wait=%@ newGame=%@ engine=%@ rejected=%@ reseat=%@ skip=%@ ring=%@/%@ diffReject=%@ usedDiff=%@",
               result[@"ply"] ?: @"-", result[@"turn"] ?: @"-",
               result[@"waitingOpponent"] ?: @"-", result[@"newGame"] ?: @"-",
               [[JJPikafish shared] stateText], result[@"anchorRejected"] ?: @"-",
-              result[@"reseat"] ?: @"-", result[@"skipReason"] ?: @"-");
+              result[@"reseat"] ?: @"-", result[@"skipReason"] ?: @"-",
+              result[@"ringMax"] ?: @"-", result[@"ringAge"] ?: @"-",
+              result[@"diffRejected"] ?: @"-", result[@"usedDiff"] ?: @"-");
     }
 
     if (moved) {

@@ -185,10 +185,8 @@ var session = {
      直接推出轮次：谁走的子，下一步就轮到另一方。漏步也能自愈。 */
   lastMoverSide: null,
   /* 2.1.85：高亮圈兜底相关状态。
-     hiddenDstFrom/Streak：落点被高亮圈盖住读成空时，用连续 2 帧确认「起点确实空了」；
-     highlightLostPiece：已经翻过轮次但落点坐标未知的那颗棋子兵种，供后续帧补回。 */
-  hiddenDstFrom: -1,
-  hiddenDstStreak: 0,
+     highlightLostPiece：已经翻过轮次但落点坐标未知的那颗棋子兵种，供后续帧补回。
+     （2.0.0r17：hiddenDstFrom/Streak 只有赋值没有读取，已删除） */
   highlightLostPiece: 0,
   highlightInferred: 0,
   /* 2.1.88：通用兜底「等对方时盘面在变」的连续帧计数。 */
@@ -230,7 +228,10 @@ var K = {
   SKIN_LO: 0.75,         /* 亮度增益低于此值 → 疑似非原始皮肤 */
   SKIN_OK_HI: 1.30,      /* 回到该区间自动解除提示（滞回，防抖） */
   SKIN_OK_LO: 0.85,
-  UNDO_STABLE: 2         /* 悔棋：连续几帧回到旧盘面才认 */
+  UNDO_STABLE: 2,        /* 悔棋：连续几帧回到旧盘面才认 */
+  /* 一手真棋最多动 2 格（吃子也是 2 格），加上识别抖动允许到 6 格。
+     超过就说明这一帧识别整体不可信，不能拿它推锚盘。 */
+  MAX_MOVE_CHANGE: 6
 };
 
 function recordMove(session, from, to, piece, src, uci) {
@@ -358,9 +359,50 @@ var JJEngine = {
     session.pendingAnchorKey = 0;
     session.pendingAnchorHits = 0;
     session.usedDiffFallback = 0;
+    session.dirtyFrameSkip = 0;
+    session.dirtySince = 0;
+    session.dirtyRelaxed = 0;
+    session.diffRejected = 0;
+    /* ★ 2.0.0r17：这里**不能清成 0**。
+       ringAge 的算法是「当前帧号 − 上次见到白圈的帧号」，而帧号是跨局递增的。
+       清成 0 会让 ringAge 直接等于几千 → 换局后第一帧就满足
+       markerLost（>20 帧）→ 立刻弹出「读不到走子标记」的假警告。
+       设成当前帧号 = 把「换局这一刻」当作刚见过，给 20 帧宽限。 */
+    session.ringSeenSeq = session.frameSeq || 0;
+    session.ringMaxNow = 0;
+    session.lastOccCount = 0;
     session.anchorRejected = 0;
     session.prevAnchorFen = '';
     session.lastMoveText = '';
+    /* ★ 2.0.0r17：换局清零补齐。
+       下面这些字段以前没清，会从上一局带过来，逐条都有实际后果：
+         optMover*     上一局的乐观翻面状态 → 新局第一帧可能立刻翻到错的一方
+         markerDone*   上一局的标记去重窗口 → 新局第一手落在同一格会被吞掉
+         genChgStreak  上一局的连续计数   → 新局第一帧就满足「连续 2 帧」
+         flipCooldown  上一局的冷却       → 新局前 10 帧不许翻轮次
+         drift*        上一局的漂移判定   → 新局可能立刻触发重锚
+         skinWarn      结算页设的皮肤警告 → 新局开局误弹「请换回原始皮肤」
+         统计量         跨局累计，日志数字会越来越离谱 */
+    session.optMoverSide = null;
+    session.optMoverHit = 0;
+    session.optMoverSeq = 0;
+    session.markerDoneSq = -1;
+    session.markerDoneSeq = 0;
+    session.genChgStreak = 0;
+    session.flipCooldown = 0;
+    session.driftKey = 0;
+    session.driftStable = 0;
+    session.skinWarn = 0;
+    session.lastGain = 0;
+    session.ruleFail = 0;
+    session.chainResets = 0;
+    session.markerHit = 0;
+    session.markerBoth = 0;
+    session.highlightInferred = 0;
+    session.undoCount = 0;
+    session.prevScreenGrid = null;
+    /* markerEverSeen 故意**不清**：它描述的是「这套皮肤会不会画白圈」这个属性，
+       跨局依然成立；清掉会让新局头几帧误走差分兜底。 */
     if (!keepAnchor) {
       session.lastBoardFen = '';
       session.lastRawFen = '';
@@ -1121,6 +1163,11 @@ var JJEngine = {
     var engCodes = session.flipped ? flipCodes(cls.codes) : cls.codes;
     var stepInfo = { changed: 0, move: null, noise: [] };
 
+    /* ★ 2.0.0r17：盘面棋子数。<4 且上一帧还有 >=10 → 判定「已离开棋盘」
+       （结算页/大厅/切页），见下方骤降检测。 */
+    var occCount = 0;
+    for (var oc = 0; oc < 90; oc++) if (engCodes[oc]) occCount++;
+
     /* ------------------------------------------------------------------
      * 2.0.0r10：半区变化（屏幕坐标 row>=5 = 我方半区）
      *
@@ -1151,15 +1198,24 @@ var JJEngine = {
     /* 同一个判断要连着两帧都成立才采纳：落子动画的第一帧经常只变了半格，
        单帧就翻轮次会让 HUD 抖一下（回归 S3 就是守着这条）。两帧≈0.15~0.5s，
        比等「一步棋完整确认」仍然快一个数量级。 */
-    if (halfMover && session.optMoverSide === halfMover) {
+    /* ★ 2.0.0r17：计数规则修正。
+       原来写成「无变化帧把计数清零」，可半区变化只在**跳变那一帧**可见，
+       下一帧就检测不到 → 计数被清零 → 永远凑不满 OPT_HIT 次
+       → 整个乐观轮次形同废码（r10 加的，从没真正生效过）。
+       正确语义是「变化出现 → 下一帧没有被反向覆盖 → 确认」。
+       换另一方时必须归 1，否则会接着上一方的计数一帧就凑满。 */
+    if (halfMover) {
+      if (session.optMoverSide === halfMover) {
+        session.optMoverHit = (session.optMoverHit || 0) + 1;
+      } else {
+        session.optMoverSide = halfMover;
+        session.optMoverHit = 1;
+      }
+      session.optMoverSeq = session.frameSeq;
+    } else if (session.optMoverSide &&
+               (session.frameSeq - (session.optMoverSeq || 0)) <= K.OPT_WINDOW) {
+      /* 没有新变化 = 上一次判断没被推翻，累加一次 */
       session.optMoverHit = (session.optMoverHit || 0) + 1;
-      session.optMoverSeq = session.frameSeq;
-    } else if (halfMover) {
-      session.optMoverSide = halfMover;
-      session.optMoverHit = 1;
-      session.optMoverSeq = session.frameSeq;
-    } else {
-      session.optMoverHit = 0;
     }
     session.turnUpdated = 0;   // 2.1.91：本帧轮次是否已更新（保证一帧只翻一次）
     session.undoApplied = 0;   // 2.0.0r13：本帧是否发生了悔棋回退
@@ -1394,7 +1450,14 @@ var JJEngine = {
           if (cls.rings[rm] > ringMax) ringMax = cls.rings[rm];
         }
       }
-      if (ringMax >= K.RING_MIN) session.markerEverSeen = 1;
+      if (ringMax >= K.RING_MIN) {
+        session.markerEverSeen = 1;
+        session.ringSeenSeq = session.frameSeq;
+      }
+      /* 记录「最近一次见到白圈是第几帧」，配合输出判断标记是不是彻底不画了。
+         真机日志 12:13 之后 usedDiff 连成串，但当时没法区分
+         「圈没画出来」和「圈画了但阈值没够」—— 这两个数一看就清楚。 */
+      session.ringMaxNow = ringMax;
 
       /* 2.0.0r13：皮肤提示。
          本插件只针对原始皮肤做模板，换皮肤后亮度/色温分布会明显偏移。
@@ -1404,7 +1467,8 @@ var JJEngine = {
          只提示、不阻断：皮肤可能有明暗差异，硬拦会误伤正常对局。 */
       var gNow = (session.recognizer && session.recognizer.lastStats)
         ? session.recognizer.lastStats.gain : 0;
-      if (gNow > 0) {
+      /* 只在真正下棋时判皮肤：结算页/大厅画面变暗会让 gain 冲到 1.9 误报 */
+      if (gNow > 0 && occCount >= 6) {
         session.lastGain = gNow;
         if (gNow < K.SKIN_LO || gNow > K.SKIN_HI) session.skinWarn = 1;
         else if (gNow >= K.SKIN_OK_LO && gNow <= K.SKIN_OK_HI) session.skinWarn = 0;
@@ -1467,8 +1531,29 @@ var JJEngine = {
           if (mkC < K.DOT_MIN) mkF = -1;
         }
 
-        /* ① 白点 + 白圈齐全 → 直接就是这一步 */
-        if (mkT >= 0 && mkF >= 0 && stepIsRuleLegal(anchor, mkF, mkT)) {
+        /* ① 白点 + 白圈齐全 → 直接就是这一步
+           ★ 2.0.0r17：再加一道「画面洁净度」闸门。
+           标记齐全只说明「这一手是它」，不说明「这一帧的识别整体可信」。
+           真机日志里出现过 diff=9、diff=7 却照样提交的帧（11:58:17 #24、
+           11:58:27 #26）—— 一手真棋最多动 2 格，多出来的格子是识别漂移，
+           被当成这一步一起写进锚盘，几帧后只能靠 reseat 兜回来。
+           所以：本帧与锚盘差超过 MAX_MOVE_CHANGE 格 → 整帧作废，等下一帧。 */
+        var frameClean = (stepInfo.changed <= K.MAX_MOVE_CHANGE);
+        if (!frameClean && mkT >= 0) {
+          session.dirtyFrameSkip = (session.dirtyFrameSkip || 0) + 1;
+          if (!session.dirtySince) session.dirtySince = Date.now();
+          /* 兜底：连续 2 秒都因洁净度被挡 → 放宽到 12 格。
+             不放松的话会死锁：脏帧标记被挡 → 差分又要求 changed<=3 →
+             两条路都走不通，HUD 永久停在「走子中…」、ply 不再推进。 */
+          if (Date.now() - session.dirtySince >= 2000 && stepInfo.changed <= 12) {
+            frameClean = true;
+            session.dirtyRelaxed = (session.dirtyRelaxed || 0) + 1;
+            session.dirtySince = 0;
+          }
+        } else if (frameClean) {
+          session.dirtySince = 0;
+        }
+        if (mkT >= 0 && mkF >= 0 && frameClean && stepIsRuleLegal(anchor, mkF, mkT)) {
           var pf = anchor[mkF];
           var cap0 = anchor[mkT] || 0;
           var nx0 = anchor.slice();
@@ -1498,8 +1583,8 @@ var JJEngine = {
           }
         }
 
-        /* ② 只有白圈 → 在锚盘里反查唯一能走到该格的起点 */
-        if (!stepInfo.move && mkT >= 0) {
+        /* ② 只有白圈 → 在锚盘里反查唯一能走到该格的起点（同样要过洁净度闸门） */
+        if (!stepInfo.move && mkT >= 0 && frameClean) {
           var cands = [], candsEmpty = [];
           for (var fi = 0; fi < 90; fi++) {
             if (fi === mkT) continue;
@@ -1558,8 +1643,18 @@ var JJEngine = {
                        session.pendingSince > 0 &&
                        (Date.now() - session.pendingSince) >= K.SETTLE_MS;
         var noMarkerSupport = !session.markerEverSeen;
-        if (!settleOk && !noMarkerSupport) {
+        /* ★ 2.0.0r17：差分兜底必须**零噪声**。
+           真机日志（12:13:10 起）：白点白圈一丢，这套「稳定 1.5s 就采纳差分」
+           连着提交了 10 步（usedDiff 一路 1），diff 从 3 涨到 32，最后整盘崩掉、
+           只能靠 reseat 收场。差分带着噪声提交时，那几格噪声会被当成
+           「这一步」写进锚盘 —— 一次两次看不出来，连起来就彻底跑飞。
+           现在：变动必须恰好是「一进一出」两格（noise 为空）才放行；
+           有噪声就继续等，宁可停在「走子中…」也不拿脏帧推进。 */
+        var diffCleanEnough = !!(stepDiffRaw.move && (stepDiffRaw.noise || []).length === 0);
+        var diffAllowed = noMarkerSupport || (settleOk && diffCleanEnough);
+        if (!diffAllowed) {
           stepInfo = { changed: stepDiffRaw.changed, move: null, noise: stepDiffRaw.noise };
+          if (stepDiffRaw.move) session.diffRejected = (session.diffRejected || 0) + 1;
         } else if (stepDiffRaw.move) {
           /* 兜底命中计数：真机上这个数应该长期为 0，一旦上涨说明标记在丢 */
           session.usedDiffFallback = (session.usedDiffFallback || 0) + 1;
@@ -1593,7 +1688,12 @@ var JJEngine = {
         // 连着 3 帧（旧帧缓存）就把学习刚锚定的标准开局 reseat 成错误盘面。
         var frameDiff = session.reseatPrev
           ? countCodesDiff(session.reseatPrev, engCodes) : 999;
-        session.reseatCount = (frameDiff <= 6)
+        /* ★ 2.0.0r17：连续判据 6 → 2 格。
+           原来是「相邻两帧差 ≤6 就算连续」，识别处于漂移状态时每帧都在 5~6 格
+           抖，轻轻松松凑满 3 帧 → reseat 用一个错的盘面重锚（真机 12:14:15、
+           12:14:45 两次）。改成要求几乎完全一致，漂移帧就没法抱团过关。
+           「中途进对局」那条路有 JJ_RESEAT_REJECT_LIMIT 强制兜底，不会被饿死。 */
+        session.reseatCount = (frameDiff <= 2)
           ? (session.reseatCount || 0) + 1 : 1;
         session.reseatPrev = Array.prototype.slice.call(engCodes);
         var plausibleNow = codesLegal(engCodes) && codesPositionPlausible(engCodes);
@@ -1635,7 +1735,11 @@ var JJEngine = {
 
       if (!reseat) {
         var nextAnchor = anchor.slice();
-        if (stepInfo.move) {
+        /* ★ 2.0.0r17：标记法提交之后，stepInfo 里仍带着那一步，通用路径会把它
+           当成「一步新走法」再校验一次 —— 而锚盘已经推进、起点已空 → 校验必然
+           失败 → 走「规则连败逃逸」，又给 ply 加一次。真机日志里 6→8、8→10、
+           12→14 的跳号就是这么来的。本帧已提交过就不再处理同一个 move。 */
+        if (stepInfo.move && !session.turnUpdated) {
           // 2.1.76：先用规则验证这一步真走得通（马腿/炮架/仕出宫/车穿子），
           // 只靠 codesLegal + codesPositionPlausible 拦不住这些。
           var ruleOk = stepIsRuleLegal(anchor, stepInfo.move.from, stepInfo.move.to);
@@ -1700,8 +1804,17 @@ var JJEngine = {
               session.lastMoverSide = failMover;
               session.turnUpdated = 1;
               /* 2.0.0r12：这里是以当前识别重锚，不是识别到的一步走子，
-                 必须把着法链标记为脏，避免拿它当「本局着法」去对账。 */
-              session.chainDirty = 1;
+                 着法链不能再当「本局着法」用。
+                 ★ 2.0.0r17：原来只是把 chainDirty 置 1，而它**从来不会清零**
+                 （只有悔棋里清）—— 一次逃逸就把对账永久锁死，moves.log 里的
+                 src 也永远是 resync。真机日志 #7 之后全 dirty=1 就是这么来的。
+                 现在改成「链就地重启」：以当前锚盘为新起点、清空旧着法，
+                 起点从此可信，对账继续跑。 */
+              session.moves = [];
+              session.chainLen = 0;
+              session.chainStartFen = session.anchorFen || '';
+              session.chainResets = (session.chainResets || 0) + 1;
+              session.chainDirty = 0;
               if (failMover) {
                 session.movePly = (session.movePly || 0) + 1;
               } else {
@@ -1736,8 +1849,6 @@ var JJEngine = {
                 move: { from: fromSq, to: toSq, piece: movedPiece, captured: capturedPiece }
               };
               session.highlightInferred = (session.highlightInferred || 0) + 1;
-              session.hiddenDstFrom = -1;
-              session.hiddenDstStreak = 0;
               stepResolved = true;
             }
           }
@@ -1746,19 +1857,10 @@ var JJEngine = {
              两边都做会导致同一帧 ply 被加两次（回归 S4 实测 ply 1→3）。 */
         }
 
-        /* ★ 2.1.88：通用兜底 —— 上面 emptyCnt==1 覆盖不到的情况
+        /* ★ 2.1.91 / 2.0.0r17：**对称轮次翻转** —— 不猜「谁走的」，只认「盘面变了」
          *
-         * 真机 2.1.87 诊断：HUD 显示 d2（看到 2 格变化）但锚盘始终不推进，
-         * 于是浮窗一直重复开局时的建议，点它游戏判非法、轮次也永远不翻。
-         *
-         * 成因是 emptyCnt 可能不是 1：走子动画/高亮残留让**起点格没被读成空**，
-         * 或者读数抖动让两格同时"变形"而不是"一空一有"。这条路径下
-         * 具体走法配不出来，但有一件事是确定的：
-         *   **我方刚走完（正在等对方）、而盘面确实在变 → 只能是对方走了。**
-         * 用连续 2 帧一致排除单帧噪声后直接翻轮次。
-         * 落点与兵种都留待后续帧识别补全，绝不把猜测写进锚盘。
-         */
-        /* ★ 2.1.91：**对称轮次翻转** —— 不猜「谁走的」，只认「盘面变了」
+         * （原来的 2.1.88「我方刚走完就只能是对方走」方案已被这条取代，
+         *   旧注释一并删除，避免两套说法互相矛盾。）
          *
          * 前面的方案都卡在同一件事上：得先判断出"这步是谁走的"，判错就整盘乱。
          * 但象棋是严格的双方交替，所以轮次其实只取决于**盘面变了几次**：
@@ -1810,29 +1912,27 @@ var JJEngine = {
             session.plyGuessed = 1;          // 轮次是推的，日志可追溯
             session.ruleFail = 0;
             /* 2.0.0r12：这一步是「高亮推断」出来的，不是标记读出来的 ——
-               记账时标明来源，对账时据此判断可信度。 */
-            session.chainDirty = 1;
+               链里没有这一步的记录，所以链要就地重启到当前锚盘
+               （同 escape 路径：dirty 一旦置 1 就永远清不掉，会锁死对账）。 */
+            session.moves = [];
+            session.chainLen = 0;
+            session.chainStartFen = session.anchorFen || '';
+            session.chainResets = (session.chainResets || 0) + 1;
+            session.chainDirty = 0;
             session.highlightInferred = (session.highlightInferred || 0) + 1;
             session.genChgStreak = 0;
             session.flipCooldown = 10;       // ~1.5s 冷却，避免连续误翻
 
-            /* ★ 2.1.94：翻轮次的**同时必须让盘面跟上**。
-               只翻轮次、不动锚盘的话，引擎会在一个早已不存在的局面上算棋，
-               真机上就表现为「给的建议指向一颗根本不在那个位置的棋子」
-               （用户看到的「马二进三，可马不在这儿」）。
-               条件：当前识别盘面合法、且与上一帧完全一致（说明已经稳定，
-               不是落子动画的中间态），才用它重锚。 */
-            var syncOk = codesLegal(engCodes) && codesPositionPlausible(engCodes);
-            if (syncOk && session.prevEngCodes &&
-                countCodesDiff(session.prevEngCodes, engCodes) === 0) {
-              anchor = Array.prototype.slice.call(engCodes);
-              session.anchorCodes = anchor;
-              session.anchorFen = codesToBoardFen(anchor);
-              session.prevAnchorFen = '';
-              session.lastBoardFen = session.anchorFen;
-              session.anchorSynced = (session.anchorSynced || 0) + 1;
-            }
-            session.prevEngCodes = Array.prototype.slice.call(engCodes);
+            /* ★ 2.0.0r17：**不再用猜出来的帧重锚**。
+               2.1.94 这里原本是「只要当前识别帧合法、且连续两帧一致，就拿它
+               当新锚盘」。问题是「连续两帧一致」在噪声下极容易满足 —— 识别
+               整体偏了的时候，它偏得**很稳定**，每帧都是同一批错格。
+               真机日志（12:09 起）：这条路径反复重锚，盘面一步步从
+               真机日志（12:09 起）：这条路径反复重锚，盘面一步步从开局漂到 rnb2ab2/1R2ak3 这种乱局，diff 最后到 32，
+               整盘崩掉只能靠 reseat 收场。
+               所以：轮次照翻（HUD 不卡），但**锚盘只认白点白圈那一手**。
+               代价是标记长时间读不到时盘面会落后（HUD 有「读不到走子标记」
+               提示引导用户点「重新同步」），但绝不会越漂越远。 */
 
             session.lastResult = null;       // 丢掉旧建议，逼它按新轮次重算
             session.lastDispatchedFen = '';
@@ -1991,6 +2091,12 @@ var JJEngine = {
         out.turn = optTurn;
         out.waitingOpponent = (optTurn !== myTurnChar) ? 1 : 0;
         out.optimisticTurn = 1;
+        /* ★ 2.0.0r17：局部变量必须一起改。
+           下面「轮到对方就跳过搜索」用的是这个局部变量 ——
+           只改 out 不改它，会出现「HUD 显示轮到我方、但这一帧被当成
+           等待对方跳过搜索」的割裂状态（真机日志里 wait=0 与
+           skip=waitingOpponent 同时出现，就是这么来的）。 */
+        waitingOpponent = (out.waitingOpponent == 1);
       }
       session.lastMoverSide = session.optMoverSide;
     }
@@ -2154,9 +2260,22 @@ var JJEngine = {
     out.settling =
       (stepDiffRaw && stepDiffRaw.changed > 0 && !session.turnUpdated) ? 1 : 0;
     out.usedDiff = session.usedDiffFallback || 0;
+    /* 标记诊断：ringMax=本帧最大环分（≥0.06 才算有白圈）、ringAge=距上次见到白圈多少帧 */
+    out.ringMax = session.ringMaxNow ? Math.round(session.ringMaxNow * 1000) / 1000 : 0;
+    out.ringAge = session.ringSeenSeq ? (session.frameSeq - session.ringSeenSeq) : -1;
+    out.diffRejected = session.diffRejected || 0;
+    /* ★ 2.0.0r17：标记丢失提示。
+       这套皮肤以前画过白圈（markerEverSeen=1），但已经 20 帧（约 5 秒）没见过 ——
+       说明不是「偶尔丢一帧」，而是彻底不画了（换了皮肤 / 游戏版本变了 /
+       画面被浮窗挡住）。这时差分闸门会一直拒绝提交，整局不推进，
+       必须给用户一个明确的动作：点菜单里的「重新同步」。 */
+    out.markerLost = (session.markerEverSeen && (out.ringAge < 0 || out.ringAge > 20)) ? 1 : 0;
     out.chainLen = session.chainLen || 0;
     out.chainDirty = session.chainDirty ? 1 : 0;
     out.chainResets = session.chainResets || 0;
+    /* 因「画面不洁净」被挡下的帧数：真机上应少量，持续上涨说明识别质量下滑 */
+    out.dirtyFrameSkip = session.dirtyFrameSkip || 0;
+    out.dirtyRelaxed = session.dirtyRelaxed || 0;
     /* 0=正常 1=疑似非原始皮肤 */
     out.skinWarn = session.skinWarn ? 1 : 0;
     out.undo = session.undoApplied ? 1 : 0;
@@ -2229,6 +2348,21 @@ var JJEngine = {
       out.searchFen = '';
       return out;
     }
+    /* ★ 2.0.0r17：离开棋盘 / 对局结束检测。
+       真机日志（11:52:54 起）：对局结束进结算画面，识别在一个完全不是棋盘的
+       画面上硬读，diff=40、repaired=6，还照样派搜索 —— HUD 就会乱跳。
+       判据用「骤降」而不是「子少」：正常残局也可能只剩 3~4 子。 */
+    var prevOcc = session.lastOccCount || 0;
+    if (occCount > 0) session.lastOccCount = occCount;
+    if (occCount > 0 && occCount < 4 && prevOcc >= 10) {
+      out.skipAnalyze = 1;
+      out.skipReason = 'ended';
+      out.needSearch = 0;
+      out.searchFen = '';
+      session.lastDispatchedFen = '';
+      return out;
+    }
+
     /* 2.0.0：轮到对方（典型是我方执黑的开局第一手）时整段跳过搜索。
        不是 skipAnalyze：上层不会因此退避，对方一落子下一帧就能立刻出建议。 */
     if (waitingOpponent) {
@@ -2267,6 +2401,17 @@ var JJEngine = {
 
     out.searchFen = analyzeFen;
     out.needSearch = (analyzeFen !== session.lastDispatchedFen) ? 1 : 0;
+
+    /* ★ 2.0.0r17：乐观翻面不许派发搜索。
+       真机日志（11:40:32 我方 h7e7 提交 → 11:40:35 又 go movetime）：
+       那一帧只检测到对方半区有变化、轮次被「乐观」翻了过来，但真实走法还
+       没被标记确认，于是拿一帧半成品盘面去搜 —— 结论自然可能指错。
+       现在乐观翻面只负责「清箭头 + 显示对方走子中」，
+       搜索必须等这一步被标记正式提交（turnUpdated=1）之后才发。 */
+    if (out.optimisticTurn && !session.turnUpdated) {
+      out.needSearch = 0;
+      out.searchFen = '';
+    }
     if (out.needSearch) session.lastDispatchedFen = analyzeFen;
 
     return out;
