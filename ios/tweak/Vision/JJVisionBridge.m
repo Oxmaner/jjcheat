@@ -298,6 +298,30 @@ static NSString *JJScriptFingerprint(NSData *d) {
     });
 }
 
+- (nullable NSArray<NSArray<NSNumber *> *> *)autoDetectCornersWithPixels:(NSData *)rgba
+                                                                   width:(int)w
+                                                                  height:(int)h {
+    if (![self loadEngine]) return nil;
+    JSContext *ctx = self.ctx;
+    if (!ctx) return nil;
+    JSValue *arrVal = [self makePixelArray:rgba width:w height:h];
+    if (!arrVal) return nil;
+    /* 注意：这里跑在调用方线程上（学习已连续失败，主线程此刻没有别的事要做）。
+       90 格圆盘拟合 + 边缘投影合计约 100~300ms，不再往队列里塞。 */
+    JSValue *fn = ctx[@"JJEngine"][@"autoDetect"];
+    JSValue *res = [fn callWithArguments:@[arrVal, @(w), @(h)]];
+    if (!res || res.isUndefined || res.isNull) return nil;
+    NSArray *raw = [res toArray];
+    if (raw.count < 4) return nil;
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:4];
+    for (id q in raw) {
+        NSArray *p = [q isKindOfClass:[NSArray class]] ? q : nil;
+        if (p.count < 2) return nil;
+        [out addObject:@[@([p[0] doubleValue]), @([p[1] doubleValue])]];
+    }
+    return out;
+}
+
 - (void)resetWithFen:(NSString *)fen {
     [self loadEngine];
     dispatch_async(_engineQueue, ^{
