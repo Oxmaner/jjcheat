@@ -1719,7 +1719,11 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
                 BOOL byBlack = [result[@"lastMoveBy"] isEqualToString:@"black"];
                 fenForZh = [fenBefore stringByAppendingString:(byBlack ? @" b" : @" w")];
             }
-            NSString *zh = uci.length ? (JJMoveChinese(fenForZh, uci) ?: uci) : @"";
+            /* ★ 2.0.0r30：fenForZh 来自 session.prevAnchorFen = codesToBoardFen(anchor)，
+               而 codesToBoardFen 的输出 row0 = 黑方底线（FEN 规范）= **红在下**，
+               所以必须显式传 YES。原来用默认的 JJMoveChinese(..., NO)（假设红在上）
+               会多翻一次，红黑编号与路数整体对调 —— 记谱里「炮二平五」会写成「炮八平五」。 */
+            NSString *zh = uci.length ? (JJMoveChineseEx(fenForZh, uci, YES) ?: uci) : @"";
             NSLog(@"[JJCheat] 着法链 #%ld %@  dirty=%@ usedDiff=%@",
                   (long)chainLen, uci.length ? uci : @"-",
                   result[@"chainDirty"] ?: @"0",
@@ -1962,11 +1966,22 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
      *   执黑（红在屏幕上方）：引擎 row 0 ↔ 屏幕 row 0 → 不翻
      *   r18 之前执红完全不翻（真机症状：箭头画到空交叉点上，红炮 h2e2 被画到顶部黑方区），
      *   执黑却翻成了 180°（列被镜像 → 指向对角）。 */
-    if ([rec[@"flipped"] integerValue] == 0) {
+    /* ★ 2.0.0r30：**推翻了 r19 的结论**。r19 写成「执红翻、执黑不翻」，正好反了 ——
+     * 真机症状：执红时箭头整条画到对面（用户 2026-11-21 反馈「标记箭头在对面」）。
+     *
+     * 正确的数学依据（JJMoveCodec.m 顶部：col = sq%9, rank = 9 - sq/9）：
+     *   UCCI 'h2'（红炮起步位）→ rank 2 → 内部 sq 的 row = 9-2 = 7
+     *   row 7 = 屏幕第 7 行（从顶数）= 从底数第 3 行 = 红炮真实位置 ✓
+     * 即 **JJSqFromICCS 的输出本身已经是屏幕坐标（row0 = 屏幕顶）**，执红时不需要任何翻转。
+     *
+     * 执黑时屏幕整体转了 180°，所以要旋回来 —— 必须是 **180° 旋转（行列同时反）**，
+     * 不能用「上下翻转」（那样列会错，箭头指到对角）。
+     */
+    if ([rec[@"flipped"] integerValue] != 0) {
         NSInteger f = [disp[@"from"] integerValue];
         NSInteger t = [disp[@"to"] integerValue];
-        if (f >= 0 && f < 90) disp[@"from"] = @(JJSqFlipVertical((int)f));
-        if (t >= 0 && t < 90) disp[@"to"] = @(JJSqFlipVertical((int)t));
+        if (f >= 0 && f < 90) disp[@"from"] = @(JJSqRotate180((int)f));
+        if (t >= 0 && t < 90) disp[@"to"] = @(JJSqRotate180((int)t));
 
         /* pv 是 ICCS 串序列，将来画多层箭头时同样需要旋转。
            ICCS 与内部 sq 的关系：col = sq%9, rank = 9 - sq/9（见 JJMoveCodec.m 顶部）。
@@ -1983,7 +1998,7 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
                     [pv2 addObject:m];
                     continue;
                 }
-                int ra = JJSqFlipVertical(a), rb = JJSqFlipVertical(b);
+                int ra = JJSqRotate180(a), rb = JJSqRotate180(b);
                 /* sq → ICCS：列 = sq%9 的字母，rank = 9 - sq/9 */
                 [pv2 addObject:[NSString stringWithFormat:@"%c%d%c%d",
                                 (char)('a' + ra % 9), 9 - ra / 9,
@@ -2001,7 +2016,11 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
         NSInteger ff = [disp[@"from"] integerValue];
         if (ff >= 0 && ff < 90) {
             NSString *af = rec[@"anchorFen"] ?: rec[@"fen"] ?: @"";
-            int pc = JJPieceAtFen(af, (int)ff);
+            /* from 此时已是**屏幕坐标**；anchorFen 是**引擎视角**（红在下）。
+               执黑时两者差 180°，先转回去再查那颗子（Rotate180 自反）。 */
+            int ckSq = ([rec[@"flipped"] integerValue] != 0)
+                     ? JJSqRotate180((int)ff) : (int)ff;
+            int pc = JJPieceAtFen(af, ckSq);
             /* 只有「明确是空格」(0) 才拦。pc<0 = FEN 解析失败
                （anchorFen 为空或格式异常），那种情况不该误伤箭头。 */
             if (pc == 0) {

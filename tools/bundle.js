@@ -731,6 +731,8 @@ var JJEngine = {
     // 现在直接把标准开局写成基线：后续 process 只允许「锚盘 + 一步棋」，
     // 这四格从此不会被带偏，也不会再触发无意义的重算。
     if (ok) {
+    /* 2.0.0r30：开局验证通过 = 执红/执黑已确定，锁死朝向 */
+    session.orientLocked = true;
       var anchorEng = Array.prototype.slice.call(startMap);   // 引擎坐标（红在下）
       session.anchorCodes = anchorEng;
       session.anchorFen = codesToBoardFen(anchorEng);
@@ -1163,9 +1165,23 @@ var JJEngine = {
         session.orientVote = vote;
         session.orientCount = 1;
       }
-      if (!session.orientSeen || (session.orientCount || 0) >= 2) {
+      /* ★ 2.0.0r30：**开局锁定执红/执黑**。
+         帅/将 + 仕相的位置投票是很硬的证据，但它是**逐帧**跑的 ——
+         中局帅仕相被杀光后，零星噪声也能凑出反向票，把 flipped 翻过来，
+         于是整盘坐标突然 180°，箭头/记谱全指到对面。
+         规则：开局学习确认（orientLocked）之后就锁死；
+               只有当反向票连续 8 帧一致（约 2 秒）才接受翻转 —— 那是真换边，
+               不是噪声。 */
+      var needVote = session.orientLocked ? 8 : 2;
+      if (!session.orientSeen || (session.orientCount || 0) >= needVote) {
+        var newFlipped = (vote === 'black');
+        /* engine.js 没有日志设施（[JJCheat] 日志全部来自原生），
+           翻转事件通过 out.orientFlip 暴露给 HUD/日志。 */
+        if (session.orientSeen && session.orientLocked && newFlipped !== session.flipped) {
+          session.orientFlip = (session.orientFlip || 0) + 1;
+        }
         session.orientSeen = true;
-        session.flipped = (vote === 'black');
+        session.flipped = newFlipped;
       }
     })(cls.codes);
 
@@ -1534,7 +1550,30 @@ var JJEngine = {
          这时标记根本不会被查询，错误走法就这么进了锚盘，之后整局都在飘。
          现在改成标记无条件先跑：只要白点+白圈齐全且规则合法，就以它为准，
          覆盖 diff 的结果；diff 降级为「标记不完整时」的兜底。 */
-      if (!reseat && cls.rings) {
+      /* ★ 2.0.0r30：**标记检测必须与 anchor 同坐标系**。
+         事实链（已逐条核对代码）：
+           cls.codes / cls.rings / cls.centers 同序，row0 = 屏幕顶（gridPoints 的 corners[0]=左上）
+           anchor / engCodes = FEN 序，row0 = 屏幕顶（JJBoardFromFen 注释：第一个 rank 串 = 屏幕最上一行）
+           执红（flipped=0）：engCodes = cls.codes，两者同序 ✓
+           执黑（flipped=1）：engCodes = flipCodes(cls.codes) → 被转了 180°，
+                              而 cls.rings 仍停在屏幕序 → 拿去索引 anchor 就差 180° ✗
+         所以执黑时先把 rings/centers 也转 180°，让整段标记逻辑统一在引擎序下工作。 */
+      var ringsUse = cls.rings, centersUse = cls.centers;
+      if (session.flipped && cls.rings) {
+        ringsUse = new Float32Array(90);
+        for (var fi0 = 0; fi0 < 90; fi0++) {
+          var fr0 = (fi0 / 9) | 0, fc0 = fi0 % 9;
+          ringsUse[(9 - fr0) * 9 + (8 - fc0)] = cls.rings[fi0];
+        }
+        if (cls.centers) {
+          centersUse = new Float32Array(90);
+          for (var fi1 = 0; fi1 < 90; fi1++) {
+            var fr1 = (fi1 / 9) | 0, fc1 = fi1 % 9;
+            centersUse[(9 - fr1) * 9 + (8 - fc1)] = cls.centers[fi1];
+          }
+        }
+      }
+      if (!reseat && ringsUse) {
         /* ★ 2.0.0r17：**取「第一个可用的白圈」，而不是「环分最高的那一个」**。
            真机日志（14:10:12 起）：ring 一直是 0.066~0.131（圈在），但 usedDiff
            一路 1 —— 标记法失效。原因是走子快的时候（两手间隔约 2 秒），
@@ -1551,12 +1590,12 @@ var JJEngine = {
            放宽后也不会误提交 —— 后面还有「成对校验 + 规则合法 + 连续 N 帧确认」三重过滤。 */
         var ringCands = [];
         for (var mi = 0; mi < 90; mi++) {
-          var rs = cls.rings[mi] || 0;
+          var rs = ringsUse[mi] || 0;
           if (rs >= K.RING_MIN) ringCands.push({ sq: mi, score: rs });
         }
         if (!ringCands.length) {
           for (var mi2 = 0; mi2 < 90; mi2++) {
-            var rs2 = cls.rings[mi2] || 0;
+            var rs2 = ringsUse[mi2] || 0;
             if (rs2 >= K.RING_MIN * 0.6) ringCands.push({ sq: mi2, score: rs2 });
           }
           if (ringCands.length) session.ringRelaxed = 1;   /* 诊断：本帧靠放宽才读到圈 */
@@ -1606,7 +1645,7 @@ var JJEngine = {
                mk=dotMiss（有圈无点）。白点的定义是「棋子离开的地方」，
                判据只需：锚盘有子 + 白点分够高（取最高分，白点 53 vs 棋子中心白字更低）。 */
             if ((anchor[ci] || 0) === 0) continue;
-            var cs = cls.centers[ci] || 0;
+            var cs = centersUse[ci] || 0;
             if (cs > mkC) { mkC = cs; mkF = ci; }
           }
           if (mkC < K.DOT_MIN) {
@@ -1717,6 +1756,15 @@ var JJEngine = {
               changed: stepInfo.changed, noise: [],
               move: { from: mkF, to: mkT, piece: pf, captured: cap0 }
             };
+        } else {
+              /* ★ 2.0.0r30：**推进后盘面非法时必须复位确认计数**。
+                 否则 hits 会每帧继续累加、永远 >= confirmNeed，于是每帧都走到这里、
+                 每帧都被 codesLegal 拒掉 —— 卡在「确认通过但提交不了」，界面毫无变化。
+                 这条路径少见（stepIsRuleLegal 已保证走法合法），但一出现就是永久卡死。 */
+              session.markerConfirmKey = -1;
+              session.markerConfirmHits = 0;
+              session.mkState = 'legalReject';
+              session.anchorRejected = 1;
           }
         }
 
@@ -1760,7 +1808,15 @@ var JJEngine = {
        */
 
 
-      if (!stepInfo.move && stepInfo.changed >= JJ_RESEAT_MIN_DIFF) {
+      /* ★ 2.0.0r30：**标记正在确认中时，绝不 reseat**。
+         真机日志（2026-11-21 07:42:56 → 07:43:00）：
+           mk=confirming（标记已配对、规则已过，在等凑满 16 帧）
+           4 秒后 reseat=1，锚盘被换成识别盘面 rnbakab1r/…，之后 diff 一路 8→9→11。
+         根因是两个阈值撞车：用户把确认帧数设到 16（≈4 秒），
+         而 anchorRejected 的 forced 兜底是 12 帧 —— 确认还没等完，强制重锚先开火。
+         确认中的含义很明确：「这正好是一步棋，只是还在凑帧数」，绝不是换局。 */
+      var confirmingNow = (session.markerConfirmHits || 0) > 0;
+      if (!stepInfo.move && !confirmingNow && stepInfo.changed >= JJ_RESEAT_MIN_DIFF) {
         // 2.0.0：只有「大变化」才可能是换局 / 中途进对局。
         // 1.1.44 只要 changed>0 就进换局候选，真机首帧 diff=4 的模板噪声
         // 连着 3 帧（旧帧缓存）就把学习刚锚定的标准开局 reseat 成错误盘面。
@@ -1784,8 +1840,11 @@ var JJEngine = {
            判据取 12 格：与上面脏帧放宽阈值（dirtySince>=2s → <=12）对齐。
            超过 12 格不是「换局」就是「整行读错」，两种都不该被 forced 直接采纳；
            真换局还有 reseatCount>=3（连续 3 帧几乎一致）那条路走。 */
+        /* 确认中不给 forced 兜底开门 —— 这是 07:43:00 那次误重锚的直接原因 */
         var forced = (session.anchorRejected || 0) >= JJ_RESEAT_REJECT_LIMIT
-          && stepInfo.changed <= 12;
+          && stepInfo.changed <= 12
+          && !confirmingNow
+          && !(session.markerConfirmHits || 0);
         if (plausibleNow && (session.reseatCount >= 3 || forced)) {
           reseat = true;
           anchor = Array.prototype.slice.call(engCodes);
@@ -2263,6 +2322,9 @@ var JJEngine = {
        新圈已经被正确选中，这个数只是留证。 */
     out.ringDedupSkip = session.ringDedupSkip || 0;
     out.mkState = session.mkState || '-';
+    /* 2.0.0r30：朝向被翻转的次数（0 = 开局锁定后从未变过，正常） */
+    out.orientFlip = session.orientFlip || 0;
+    out.orientLocked = session.orientLocked ? 1 : 0;
     /* 2.0.0r28：有多少手是「识别被标记污染(changed>6)但仍靠标记提交」的 */
     out.markerDirtyAccepted = session.markerDirtyAccepted || 0;
     /* 2.0.0r26：本帧标记是不是靠放宽阈值才读到的（>0 说明画面质量在下滑） */
