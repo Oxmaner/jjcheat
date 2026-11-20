@@ -289,6 +289,78 @@ function main() {
   });
   S4.S.markerSq = -1;
   S4.S.markerFromSq = -1;
+
+  /* ===== V. 2.0.0r12：标记优先 + 慢速定格 =====
+     真机 10 轮实拍结论：白点+白圈判读 10/10。所以走法只认标记，差分降级为
+     「超时兜底」。这里守住两条新约束：
+       V1 一旦这套皮肤被证实会画标记，那么「看到变化但标记还没读全」的帧
+          **绝不能**拿去推锚盘 —— 否则又回到「一步错、步步错」。
+       V2 没有任何标记能力的皮肤（一次都没见过白圈）不能被饿死，仍可用差分。 */
+  console.log('');
+  console.log('========== V. 标记优先 + 慢速定格（2.0.0r12）==========');
+  const V = makeFixture(src, false);          // 执红
+  V.learnOpening(false);
+  V.frame('V0 开局轮到我', V.S0.slice(), () => {});
+
+  /* V0：我方红兵进一，且**带白点+白圈**（真机 10/10 的情形）→ 应立刻提交 */
+  const vStep1 = V.S0.slice(); vStep1[54] = 0; vStep1[45] = 7;
+  V.S.markerSq = 45;                          // 落点白圈（屏幕坐标）
+  V.S.markerFromSq = 54;                      // 起点白点
+  const v0 = V.frame('V0 带标记的一步（建立基线）', vStep1, r => {
+    if (!r.waitingOpponent) throw new Error('我方走完应翻到等对方');
+  });
+  if (v0.ply !== 1) throw new Error('带标记时应推进到 ply=1');
+  /* 着法链：这一步应被记下，且推演对账不该触发重启 */
+  if (v0.chainLen !== 1) throw new Error('着法链应记录 1 步，实际 ' + v0.chainLen);
+  if (v0.chainResets) throw new Error('正常提交不该触发链重启');
+  console.log('     标记齐全 → 立刻提交，ply=1 ✓  着法链 #1=%s 对账通过 ✓', v0.lastMoveUci || '-');
+
+  /* V1：轮到对方，但**这一帧没读到标记**（动画中/圈被遮）→ 只报走子中，锚盘不动 */
+  V.S.markerSq = -1;
+  V.S.markerFromSq = -1;
+  const vStep2 = vStep1.slice(); vStep2[27] = 0; vStep2[36] = 14;   // 黑卒进一
+  const v1 = V.frame('V1 有变化·标记缺失（应只报走子中，不推进锚盘）', vStep2, r => {
+    console.log('     [诊断] settling=%s usedDiff=%s chainLen=%s uci=%s',
+      r.settling, r.usedDiff, r.chainLen, r.lastMoveUci);
+    if (r.settling !== 1) throw new Error('应处于 settling 状态');
+  });
+  if (v1.ply !== 1) throw new Error('标记缺失时不该推进锚盘（ply 应仍为 1）');
+  console.log('     settling=1 且 ply 未变 ✓（等定格，不用差分抢跑）');
+
+  /* V2：同一局面持续 1.5s 以上仍读不到标记 → 差分兜底必须最终提交。
+     否则在「偶尔丢标记」的皮肤上会永久卡在「走子中」，整局不推进。 */
+  function sleepMs(ms) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  }
+  V.setCodes(vStep2);
+  let v2 = null;
+  const t0 = Date.now();
+  while (Date.now() - t0 < 2200) {
+    v2 = V.JJ.process(new Uint8ClampedArray(4), 1, 1, { live: true });
+    if (v2.ply === 2) break;
+    sleepMs(250);
+  }
+  console.log('     V2 超时后 ply=%s usedDiff=%s settling=%s',
+    v2 && v2.ply, v2 && v2.usedDiff, v2 && v2.settling);
+  if (!v2 || v2.ply !== 2) throw new Error('定格超时后差分兜底没生效（会永久卡在走子中）');
+  console.log('     超时兜底生效 ✓（标记彻底读不到时不会死等）');
+
+  /* V3：悔棋 —— 盘面回到「上一手之前」，连续两帧后应回退一步。
+     判据是「当前识别盘面 == 着法链最后一步的走子前盘面」，不靠猜。 */
+  const vStep3 = vStep2.slice(); vStep3[29] = 0; vStep3[38] = 14;   // 黑方另一路卒进一（避开 45 的去重窗口）
+  V.S.markerSq = 38; V.S.markerFromSq = 29;
+  const v3a = V.frame('V3a 黑方走一步（建立第二手）', vStep3, () => {});
+  if (v3a.ply !== 3) throw new Error('第二手应推进到 ply=3，实际 ' + v3a.ply);
+  /* 回到黑方走之前（= vStep2），连续两帧 */
+  V.S.markerSq = -1; V.S.markerFromSq = -1;
+  V.setCodes(vStep2);
+  const un1 = V.JJ.process(new Uint8ClampedArray(4), 1, 1, { live: true });
+  const un2 = V.JJ.process(new Uint8ClampedArray(4), 1, 1, { live: true });
+  console.log('     V3b 悔棋：第一帧 undo=%s ply=%s；第二帧 undo=%s ply=%s',
+    un1.undo, un1.ply, un2.undo, un2.ply);
+  if (!un2.undo) throw new Error('连续两帧回到旧盘面应判定为悔棋');
+  if (un2.ply !== 2) throw new Error('悔棋后 ply 应减 1（期望 2，实际 ' + un2.ply + '）');
+  console.log('     悔棋回退生效 ✓（ply 3→2，着法链弹出一手）');
   /* ===== R. 2.1.84：轮次判定自愈（不靠 movePly 奇偶） =====
      真机症状：对方已经走子，浮窗还显示「等待对方走子」；我方走完箭头不消失。
      根因：轮次由 session.movePly % 2 推出，只要某一步漏识别、movePly 不再增长，

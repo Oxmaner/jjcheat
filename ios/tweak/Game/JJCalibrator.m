@@ -207,7 +207,7 @@ static double JJAbsD(double v) { return v < 0 ? -v : v; }
 
 #pragma mark - 标定写入
 
-- (BOOL)handleManualCalibration:(NSArray<NSValue *> *)corners {
+- (BOOL)adoptCorners:(NSArray<NSValue *> *)corners {
     if (corners.count != 4) return NO;
 
     CGRect nb = [UIScreen mainScreen].nativeBounds;
@@ -225,7 +225,7 @@ static double JJAbsD(double v) { return v < 0 ? -v : v; }
 
     /* 四角几何校验：不接受「点歪了 / 聚成一团 / 顺序反了」的标定 */
     if (![self cornersAreSane:pxCorners]) {
-        NSLog(@"[JJCheat] 手动标定四角不合理，已拒绝：%@", pxCorners);
+        NSLog(@"[JJCheat] 采纳的四角不合理，已拒绝：%@", pxCorners);
         return NO;
     }
 

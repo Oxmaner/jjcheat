@@ -19,7 +19,6 @@
 @property (nonatomic, assign) NSInteger fromSq;      // -1 = 无
 @property (nonatomic, assign) NSInteger toSq;
 @property (nonatomic, strong) NSArray<NSArray<NSNumber *> *> *gridPts; // 屏幕像素
-@property (nonatomic, strong) NSArray<NSValue *> *calibPoints;         // point
 
 @property (nonatomic, assign) JJHUDMode mode;
 @end
@@ -34,14 +33,13 @@
         self.userInteractionEnabled = NO;
         _fromSq = -1;
         _toSq = -1;
-        _calibPoints = @[];
     }
     return self;
 }
 
 - (void)setMode:(JJHUDMode)mode {
     _mode = mode;
-    self.userInteractionEnabled = (mode == JJHUDModeCalibrate);
+    self.userInteractionEnabled = NO;   /* 2.0.0r14：纯显示，不吃触摸 */
     [self setNeedsDisplay];
 }
 
@@ -107,92 +105,6 @@
 - (void)drawRect:(CGRect)rect {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
 
-    // ---- 标定模式 ----
-    if (self.mode == JJHUDModeCalibrate) {
-        CGContextSetFillColorWithColor(ctx, [[UIColor blackColor] colorWithAlphaComponent:0.45].CGColor);
-        CGContextFillRect(ctx, self.bounds);
-
-        // 已点的角
-        NSArray *names = @[@"左上", @"右上", @"右下", @"左下"];
-        for (NSUInteger i = 0; i < self.calibPoints.count; i++) {
-            CGPoint p = [self.calibPoints[i] CGPointValue];
-            [[UIColor colorWithRed:0.1 green:1.0 blue:0.5 alpha:1.0] set];
-            CGContextFillEllipseInRect(ctx, CGRectMake(p.x - 12, p.y - 12, 24, 24));
-            NSString *t = names[i];
-            [t drawAtPoint:CGPointMake(p.x + 16, p.y - 10)
-                withAttributes:@{ NSFontAttributeName: [UIFont boldSystemFontOfSize:15],
-                                  NSForegroundColorAttributeName: [UIColor colorWithRed:0.1 green:1.0 blue:0.5 alpha:1.0] }];
-        }
-        /* ★ 2.1.105：连线必须画**全部**已点，而不是只连前两个。
-           原来这里写死 calibPoints[0] → calibPoints[1]，点第 3、4 个角时
-           屏幕上根本没有线接上去，主观感受就是「四点连线不能用」。 */
-        if (self.calibPoints.count >= 2) {
-            CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithRed:0.1 green:1.0 blue:0.5 alpha:0.9].CGColor);
-            CGContextSetLineWidth(ctx, 2);
-            CGPoint a = [self.calibPoints[0] CGPointValue];
-            CGContextMoveToPoint(ctx, a.x, a.y);
-            for (NSUInteger i = 1; i < self.calibPoints.count; i++) {
-                CGPoint q = [self.calibPoints[i] CGPointValue];
-                CGContextAddLineToPoint(ctx, q.x, q.y);
-            }
-            /* 四点齐了就把首尾连上，形成闭合四边形 */
-            if (self.calibPoints.count == 4) CGContextClosePath(ctx);
-            CGContextStrokePath(ctx);
-        }
-
-        /* ★ 2.1.105：点满四点后**立刻画出完整的 9 列 × 10 行网格预览**
-           （与上游 pikayu-jj 的交互一致：点完就能看出准不准，不必等学习）。
-           这里用的是与 JJCalibrator 完全相同的双线性插值，只是坐标系是 point。 */
-        if (self.calibPoints.count == 4) {
-            CGPoint c0 = [self.calibPoints[0] CGPointValue];
-            CGPoint c1 = [self.calibPoints[1] CGPointValue];
-            CGPoint c2 = [self.calibPoints[2] CGPointValue];
-            CGPoint c3 = [self.calibPoints[3] CGPointValue];
-            /* u 沿列(0..8)，v 沿行(0..9)：左上→右上→右下→左下 */
-            CGMutablePathRef gp = CGPathCreateMutable();
-            for (int r = 0; r <= 9; r++) {
-                CGFloat v = (CGFloat)r / 9.0;
-                for (int c = 0; c <= 8; c++) {
-                    CGFloat u = (CGFloat)c / 8.0;
-                    CGFloat x = (1-u)*(1-v)*c0.x + u*(1-v)*c1.x + u*v*c2.x + (1-u)*v*c3.x;
-                    CGFloat y = (1-u)*(1-v)*c0.y + u*(1-v)*c1.y + u*v*c2.y + (1-u)*v*c3.y;
-                    if (c == 0) CGPathMoveToPoint(gp, NULL, x, y);
-                    else CGPathAddLineToPoint(gp, NULL, x, y);
-                }
-            }
-            for (int c = 0; c <= 8; c++) {
-                CGFloat u = (CGFloat)c / 8.0;
-                for (int r = 0; r <= 9; r++) {
-                    CGFloat v = (CGFloat)r / 9.0;
-                    CGFloat x = (1-u)*(1-v)*c0.x + u*(1-v)*c1.x + u*v*c2.x + (1-u)*v*c3.x;
-                    CGFloat y = (1-u)*(1-v)*c0.y + u*(1-v)*c1.y + u*v*c2.y + (1-u)*v*c3.y;
-                    if (r == 0) CGPathMoveToPoint(gp, NULL, x, y);
-                    else CGPathAddLineToPoint(gp, NULL, x, y);
-                }
-            }
-            CGContextAddPath(ctx, gp);
-            CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithRed:0.25 green:0.78 blue:1.00 alpha:0.95].CGColor);
-            CGContextSetLineWidth(ctx, 1.0);
-            CGContextStrokePath(ctx);
-            CGPathRelease(gp);
-        }
-        // 提示
-        NSUInteger step = self.calibPoints.count;
-        NSString *tip = step < 4
-            ? [NSString stringWithFormat:@"点第 %lu 个角：%@（棋盘最外圈的交叉点）",
-                                         (unsigned long)(step + 1), names[step]]
-            : @"标定完成";
-        NSDictionary *attr = @{ NSFontAttributeName: [UIFont boldSystemFontOfSize:17],
-                                NSForegroundColorAttributeName: [UIColor whiteColor] };
-        CGSize sz = [tip sizeWithAttributes:attr];
-        CGRect box = CGRectMake((self.bounds.size.width - sz.width) / 2 - 14, 90,
-                                sz.width + 28, sz.height + 20);
-        [[UIColor colorWithRed:0 green:0 blue:0 alpha:0.75] set];
-        UIBezierPath *bp = [UIBezierPath bezierPathWithRoundedRect:box cornerRadius:10];
-        [bp fill];
-        [tip drawAtPoint:CGPointMake(box.origin.x + 14, box.origin.y + 10) withAttributes:attr];
-        return;
-    }
 
     // ---- 正常显示模式 ----
     if (self.gridPts.count == 90) {
@@ -248,14 +160,9 @@
 @property (nonatomic, strong) UILabel *lineMain;      // 中文记谱 / 状态
 @property (nonatomic, strong) UILabel *lineScore;     // 右侧分值
 @property (nonatomic, strong) UILabel *lineSub;       // 引擎状态 + 深度 + 胜率条
-@property (nonatomic, copy) void (^calibBlock)(NSArray<NSValue *> *);
-@property (nonatomic, strong) NSMutableArray<NSValue *> *calibPoints;
 /* 2.1.105：标定手势复用（原来每次进标定都 addGestureRecognizer 且从不解绑，
    第二次标定时一次点击会同时触发两个手势、一下加两个点，直接错乱） */
-@property (nonatomic, strong) UITapGestureRecognizer *calibTap;
 /* 2.1.105：撤销 / 重来 */
-@property (nonatomic, strong) UIButton *calibUndoBtn;
-@property (nonatomic, strong) UIButton *calibResetBtn;
 /** 上一次 showResult 的内容指纹；相同就跳过整轮文本排版 + 90 格重绘 */
 @property (nonatomic, copy) NSString *lastResultKey;
 @end
@@ -318,7 +225,6 @@
         [_topPanel addSubview:_lineSub];
 
         _topPanel.hidden = YES;
-        _calibPoints = [NSMutableArray array];
         [self layoutTopPanel];
     }
     return self;
@@ -370,11 +276,6 @@
     _mode = mode;
     self.hudView.mode = mode;
     self.lastResultKey = nil;   // 切模式后下一帧结果必须重绘
-    if (mode == JJHUDModeCalibrate) {
-        self.hudView.calibPoints = @[];
-        [self.calibPoints removeAllObjects];
-        self.topPanel.hidden = YES;
-    }
     [self.hudView setNeedsDisplay];
 }
 
@@ -454,6 +355,9 @@ static NSString *JJFormatNodes(NSInteger nodes) {
     NSNumber *depth = result[@"depth"] ?: @(0);
     NSNumber *nodes = result[@"nodes"] ?: @(0);
     NSString *side = [result[@"sideToMove"] isEqual:@"black"] ? @"黑方" : @"红方";
+    /* 2.0.0r11：乐观轮次（半区变化先猜的）加个后缀，和「已确认」区分开。
+       快的是提示，慢的是真相 —— 这样既不影响响应速度，也不会把猜测当结论。 */
+    if ([result[@"turnPending"] integerValue] != 0) side = [side stringByAppendingString:@"·待定"];
     NSString *engine = result[@"engineState"] ?: @"";
     if (!engine.length) engine = pending ? @"思考中" : @"-";
     NSString *blocked = result[@"engineBlocked"] ?: @"";
@@ -531,99 +435,11 @@ static NSString *JJFormatNodes(NSInteger nodes) {
     [self.hudView setNeedsDisplay];
 }
 
-- (void)beginCalibrationWithCompletion:(void (^)(NSArray<NSValue *> *))completion {
-    self.calibBlock = completion;
-    self.mode = JJHUDModeCalibrate;
-    self.hidden = NO;
-
-    /* ★ 2.1.105：手势**只创建一次并复用**。
-       原来每次 beginCalibration 都新建一个 addGestureRecognizer，而从不移除；
-       第二次标定时一次点击会被两个手势各采一个点 → 点两下就凑满 4 个点提前结束，
-       且坐标顺序错乱。这是「重标之后更不准」的直接原因。 */
-    if (!self.calibTap) {
-        self.calibTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleCalibTap:)];
-        self.calibTap.delegate = self;
-        [self.hudView addGestureRecognizer:self.calibTap];
-    }
-    self.calibTap.enabled = YES;
-
-    /* 撤销 / 重来：放在屏幕底部中央，避开棋盘主体 */
-    CGFloat by = CGRectGetHeight(self.bounds) - 92;
-    if (!self.calibUndoBtn) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(CGRectGetMidX(self.bounds) - 130, by, 110, 44);
-        [b setTitle:@"撤销上一点" forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        b.backgroundColor = [UIColor colorWithRed:0.20 green:0.45 blue:0.85 alpha:0.92];
-        b.layer.cornerRadius = 10;
-        [b addTarget:self action:@selector(calibUndo) forControlEvents:UIControlEventTouchUpInside];
-        [self.hudView addSubview:b];
-        self.calibUndoBtn = b;
-    }
-    if (!self.calibResetBtn) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(CGRectGetMidX(self.bounds) + 20, by, 110, 44);
-        [b setTitle:@"重来" forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        b.backgroundColor = [UIColor colorWithRed:0.75 green:0.25 blue:0.25 alpha:0.92];
-        b.layer.cornerRadius = 10;
-        [b addTarget:self action:@selector(calibReset) forControlEvents:UIControlEventTouchUpInside];
-        [self.hudView addSubview:b];
-        self.calibResetBtn = b;
-    }
-    self.calibUndoBtn.hidden = NO;
-    self.calibResetBtn.hidden = NO;
-}
-
-/** 撤销最后一个点 */
-- (void)calibUndo {
-    if (self.mode != JJHUDModeCalibrate) return;
-    if (self.calibPoints.count == 0) return;
-    NSMutableArray *m = [self.calibPoints mutableCopy];
-    [m removeLastObject];
-    self.calibPoints = [m copy];
-    self.hudView.calibPoints = self.calibPoints;
-    [self.hudView setNeedsDisplay];
-}
-
-/** 全部重来 */
-- (void)calibReset {
-    if (self.mode != JJHUDModeCalibrate) return;
-    [self.calibPoints removeAllObjects];
-    self.hudView.calibPoints = @[];
-    [self.hudView setNeedsDisplay];
-}
-
-- (void)handleCalibTap:(UITapGestureRecognizer *)g {
-    if (self.mode != JJHUDModeCalibrate) return;
-    CGPoint p = [g locationInView:self.hudView];
-    [self.calibPoints addObject:[NSValue valueWithCGPoint:p]];
-    self.hudView.calibPoints = [self.calibPoints copy];
-    [self.hudView setNeedsDisplay];
-
-    if (self.calibPoints.count >= 4) {
-        self.mode = JJHUDModeDisplay;
-        self.calibUndoBtn.hidden = YES;
-        self.calibResetBtn.hidden = YES;
-        NSArray *result = [self.calibPoints copy];
-        self.hudView.calibPoints = @[];
-        if (self.calibBlock) {
-            self.calibBlock(result);
-            self.calibBlock = nil;
-        }
-    }
-}
-
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t {
-    return self.mode == JJHUDModeCalibrate;
-}
-
-/** 标定模式下要吃掉触摸，显示模式完全放行 */
+/* 2.0.0r14：HUD 是纯显示层，永不拦截触摸。
+   历史上这里靠标定模式判断是否吃事件，标定下线后统一返回 nil ——
+   少一个「HUD 挡住游戏点击」的雷。 */
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (self.mode == JJHUDModeDisplay) return nil;
-    return [super hitTest:point withEvent:event];
+    return nil;
 }
 
 @end

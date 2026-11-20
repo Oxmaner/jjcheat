@@ -58,8 +58,10 @@ NS_ASSUME_NONNULL_BEGIN
 /** 学习成功：几何合理才采纳精修四角；返回是否采纳 */
 - (BOOL)adoptRefinedCorners:(NSArray *)fc;
 
-/** 手动四点标定（屏幕 point）。校验失败返回 NO，且不动任何状态。 */
-- (BOOL)handleManualCalibration:(NSArray<NSValue *> *)corners;
+/** 采纳一组四角（屏幕 point）。校验失败返回 NO，且不动任何状态。
+    2.0.0r14：原名叫 handleManualCalibration —— 手动标定下线后，唯一的调用者
+    是「学习连败时从画面反解四角」，名字与用途已经不符，故更名。 */
+- (BOOL)adoptCorners:(NSArray<NSValue *> *)corners;
 
 /** 自动标定采纳后：像素四角 → point 持久化 */
 - (void)saveAutoCalibratedCorners:(NSArray *)fc width:(int)w height:(int)h;

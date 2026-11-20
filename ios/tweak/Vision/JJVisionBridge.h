@@ -36,6 +36,14 @@ typedef void (^JJVisionResultBlock)(NSDictionary * _Nullable result, NSError * _
 - (void)resetWithFen:(nullable NSString *)fen;
 
 /**
+ * 2.0.0r11：从当前帧反解棋盘四角（像素坐标），失败返回 nil。
+ * 同步执行：调用方已确认「学习连续失败」，此时多花这点时间是值得的。
+ */
+- (nullable NSArray<NSArray<NSNumber *> *> *)autoDetectCornersWithPixels:(NSData *)rgba
+                                                                   width:(int)w
+                                                                  height:(int)h;
+
+/**
  * 学习棋盘 + 四角独立自校准，整段在引擎队列异步执行，回调回主线程。
  * learnAndRefine 跑 90 格模板匹配 + refineGrid 拟合，不能同步调用（会冻主线程）。
  */
@@ -55,7 +63,7 @@ typedef void (^JJVisionResultBlock)(NSDictionary * _Nullable result, NSError * _
 /**
  * ★ 2.0.0r1：学好的 90 格模板持久化。
  *
- * 每次开插件都强制手动标定，但「学模板」要求标准开局 32 子，中局开插件
+ * 「学模板」要求标准开局 32 子，中局开插件
  * 就永远学不成。这里把 learnBoard 的成果连同当时的四角存进容器，
  * 下次进程启动时若四角仍吻合（偏差 < 阈值）就直接复用，中局也能立刻识别。
  */

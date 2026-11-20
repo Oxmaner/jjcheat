@@ -13,7 +13,6 @@ NS_ASSUME_NONNULL_BEGIN
 
 typedef NS_ENUM(NSInteger, JJHUDMode) {
     JJHUDModeDisplay = 0,   // 只显示，不挡触摸
-    JJHUDModeCalibrate,     // 四点标定，接收触摸
 };
 
 @interface JJHUDWindow : UIWindow
@@ -46,7 +45,6 @@ typedef NS_ENUM(NSInteger, JJHUDMode) {
 - (void)showStatus:(NSString *)text;
 
 /** 进入四点标定；完成后回调（屏幕 point 坐标四角） */
-- (void)beginCalibrationWithCompletion:(void (^)(NSArray<NSValue *> *corners))completion;
 
 /** 2.1.105：只刷新网格并重绘 —— 标定完成后立刻让用户看到网格，不必等学习成功 */
 - (void)applyGridPoints:(NSArray<NSArray<NSNumber *> *> *)pts;

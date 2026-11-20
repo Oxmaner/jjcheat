@@ -152,6 +152,8 @@ if [ -f "$CTRL" ]; then
     }
     check_case JJMenuActionPlugin          setPluginEnabled
     check_case JJMenuActionBoardScheme      toggleBoardScheme
+    check_case JJMenuActionClearLogs        clearLogs
+    check_case JJMenuActionResync           resyncBoard
     check_case JJMenuActionHUD             toggleHUD
     check_case JJMenuActionResetBoard      resetToStartPosition
     check_case JJMenuActionThink           showThinkSheet

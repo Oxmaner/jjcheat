@@ -109,6 +109,10 @@ static void JJFatalSignalHandler(int sig) {
 
 /* 排队的下一个请求（新局面来了先 stop 旧的） */
 @property (nonatomic, copy) NSString *pendingFen;
+/* 2.0.0r11：搜索中收到「新对局」请求时先记下来，等 bestmove 回来再发 ucinewgame。
+   直接发会让引擎的 UCI 线程阻塞在 search_clear() 的 wait_for_search_finished()，
+   我们后续的 stop 只能排在管道里干等 —— 表现就是「重来之后第一手慢半拍」。 */
+@property (nonatomic, assign) BOOL pendingNewGame;
 @property (nonatomic, assign) NSInteger pendingMovetime;
 @property (nonatomic, copy) JJPikaResultBlock pendingCb;
 @end
@@ -222,7 +226,17 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
 
 - (void)notifyNewGame {
     dispatch_async(_pikaQueue, ^{
-        if (self.state == JJPikaStateReady || self.state == JJPikaStateSearching) {
+        /* UCI 时序：搜索中绝不能直接发 ucinewgame。
+           引擎会在 search_clear() 里等当前搜索结束，UCI 线程被占住，
+           我们的 stop 也就排不进去。正确做法是先 stop，收到 bestmove
+           之后（见 handleBestmoveOnQueue）再发 ucinewgame。 */
+        if (self.state == JJPikaStateSearching) {
+            self.pendingNewGame = YES;
+            NSLog(@"%@ 搜索中收到新局 → 先 stop，等 bestmove 后再 ucinewgame", kPikaLog);
+            [self writeLine:@"stop"];
+            return;
+        }
+        if (self.state == JJPikaStateReady) {
             NSLog(@"%@ ucinewgame（新对局）", kPikaLog);
             [self writeLine:@"ucinewgame"];
             [self writeLine:@"isready"];
@@ -588,6 +602,13 @@ static os_unfair_lock sPikaStateLock = OS_UNFAIR_LOCK_INIT;
         out[@"engine"] = @"pikafish";
         dispatch_async(dispatch_get_main_queue(), ^{ cb([out copy]); });
     }
+    /* 2.0.0r11：搜索已结束、引擎空闲，这时才是发 ucinewgame 的时机 */
+    if (self.pendingNewGame) {
+        self.pendingNewGame = NO;
+        NSLog(@"%@ 搜索结束 → ucinewgame（新对局）", kPikaLog);
+        [self writeLine:@"ucinewgame"];
+        [self writeLine:@"isready"];
+    }
     [self flushPendingOnQueue];
 }
 
@@ -699,9 +720,14 @@ static BOOL JJFenLooksLegal(NSString *fen) {
        深度模式的看门狗仍按 movetime 估算时长（depth 的耗时不可预测，
        只能给一个宽松上限，超时就当卡死处理）。 */
     NSInteger wantDepth = [JJEngineOptions shared].thinkDepth;
+    /* 2.0.0r15：把「这一手到底按什么搜」打进日志，方便真机自证参数是否生效
+       （在 iMazing 里直接搜「搜索方式」即可） */
     if (wantDepth > 0) {
+        NSLog(@"%@ 搜索方式: go depth %ld（按深度）", kPikaLog, (long)wantDepth);
         [self writeLine:[NSString stringWithFormat:@"go depth %ld", (long)wantDepth]];
     } else {
+        NSLog(@"%@ 搜索方式: go movetime %ldms（按时间）",
+              kPikaLog, (long)self.searchingMovetime);
         [self writeLine:[NSString stringWithFormat:@"go movetime %ld",
                          (long)self.searchingMovetime]];
     }

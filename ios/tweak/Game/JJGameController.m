@@ -40,6 +40,8 @@ typedef NS_ENUM(NSInteger, JJGameState) {
 typedef NS_ENUM(NSInteger, JJMenuAction) {
     JJMenuActionPlugin = 100,
     JJMenuActionBoardScheme,      /* 2.0.0r6：人机 / 排位 棋盘切换 */
+    JJMenuActionResync,           /* 2.0.0r11：以当前画面重新同步（兜底） */
+    JJMenuActionClearLogs,        /* 2.0.0r15：清理着法/引擎日志（点版本号触发） */
     JJMenuActionManualCalibrate,
     JJMenuActionHUD,
     JJMenuActionResetBoard,
@@ -78,6 +80,14 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 /* 重标定必须学成才采纳，失败回滚 */
 @property (nonatomic, assign) BOOL calibrationPending;
 @property (nonatomic, assign) NSTimeInterval lastHeartbeatTs;
+/* 2.0.0r11：本次激活是否已经试过「让画面自己给四角」（学习连败时的一次性兜底） */
+@property (nonatomic, assign) BOOL autoDetectTried;
+/* 2.0.0r12：着法链长度（只用于日志，不显示） */
+@property (nonatomic, assign) NSInteger lastChainLen;
+/* 2.0.0r13：上次皮肤提示的时刻（5 分钟内只提示一次，别刷屏） */
+@property (nonatomic, assign) NSTimeInterval lastSkinWarnTs;
+/* 2.0.0r14：本局的日志时间戳（每局一对 moves-<时间>.log / engine-<时间>.log） */
+@property (nonatomic, copy, nullable) NSString *gameLogStamp;
 
 /* ---- 2.1.0 引擎联动 ---- */
 /* 最近一次识别结果（recognition dict），拼装 HUD 用 */
@@ -99,6 +109,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 - (void)armRecognizer;
 - (void)restartRecognition;
 - (void)toggleBoardScheme;
+- (void)resyncBoard;
+- (void)clearLogs;
 - (void)toggleHUD;
 - (void)showEngineStatus;
 - (void)applyThinkMs:(NSInteger)v;
@@ -112,6 +124,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
                       rows:(NSArray<JJSheetRow *> *)rows;
 - (void)refreshActiveSheet;
 @end
+
+#pragma mark - 单例与生命周期
 
 @implementation JJGameController
 
@@ -195,6 +209,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [[JJPikafish shared] shutdown];
 }
 
+#pragma mark - 悬浮球与菜单
+
 - (void)setupBall {
     if (self.ballWindow) return;
     self.ballWindow = [[JJBallWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
@@ -229,6 +245,12 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
                 break;
             case JJMenuActionBoardScheme:
                 [self2 toggleBoardScheme];
+                break;
+            case JJMenuActionClearLogs:
+                [self2 clearLogs];
+                break;
+            case JJMenuActionResync:
+                [self2 resyncBoard];
                 break;
             case JJMenuActionHUD:
                 [self2 toggleHUD];
@@ -300,9 +322,11 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 
     /* 2.1.105：自动标定已整体移除（在你的棋盘皮肤上首尾横线被木框遮住，
        任何"自动找线"都不可靠）。原位置改为只读的插件版本号。 */
+    /* 2.0.0r15：点版本号 = 清理日志。每局会生成一对 moves-/engine- 日志，
+       长期不清理会堆很多文件；这里不另做二级菜单，点了直接清并给提示。 */
     JJMenuEntry *e1 = [JJMenuEntry title:@"版本" symbol:@"info.circle"];
     e1.value = JJ_CHEAT_VERSION;
-    e1.action = 0;              // 0 = 无动作，只展示
+    e1.action = JJMenuActionClearLogs;
     [arr addObject:e1];
 
     /* ★ 2.0.0r6：四角是内置预设，但人机与排位两套只差 50pt 纵向，
@@ -312,6 +336,12 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     eScheme.action = JJMenuActionBoardScheme;
     eScheme.value = isRank ? @"排位" : @"人机";
     [arr addObject:eScheme];
+
+    /* 2.0.0r11：显式「重新同步」——状态机再稳也有读不出来的时候，
+       给用户一个明确的兜底动作，而不是只能杀进程。 */
+    JJMenuEntry *eResync = [JJMenuEntry title:@"重新同步" symbol:@"arrow.triangle.2.circlepath"];
+    eResync.action = JJMenuActionResync;
+    [arr addObject:eResync];
 
     JJMenuEntry *e3 = [JJMenuEntry title:@"HUD" symbol:@"rectangle.topthird.inset.filled"];
     e3.action = JJMenuActionHUD;
@@ -428,69 +458,122 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     JJEngineOptions *o = [JJEngineOptions shared];
     __weak typeof(self) ws = self;
 
+    /* 2.0.0r15：这个面板必须跟着「引擎参数 → 思考方式」走。
+       以前不管选了按时间还是按深度，这里永远只调 ms —— 用户在引擎参数里
+       切到「按深度」后，思考面板仍在改一个根本不会用的值（真机反馈的问题）。 */
+    BOOL byDepth = (o.thinkDepth > 0);
+
     NSMutableArray<JJSheetRow *> *rows = [NSMutableArray array];
+    [rows addObject:[JJSheetRow info:(byDepth
+        ? [NSString stringWithFormat:@"按深度思考 · 范围 %d~%d 层，下一步生效",
+           JJ_OPT_THINK_DEPTH_MIN + 1, JJ_OPT_THINK_DEPTH_MAX]
+        : [NSString stringWithFormat:@"按时间思考 · 范围 %d~%d ms，下一步生效",
+           JJ_OPT_THINK_MS_MIN, JJ_OPT_THINK_MS_MAX])]];
 
-    [rows addObject:[JJSheetRow info:[NSString stringWithFormat:
-                                     @"下一步生效 · 范围 %d~%d ms",
-                                     JJ_OPT_THINK_MS_MIN, JJ_OPT_THINK_MS_MAX]]];
-
-    /* 步进器：每档 50ms。为什么用步进而不是键盘 —— 键盘会盖住棋盘，
-       而且这个值调一次就长期不动，微调比重新输入更顺手。
-       回调里的 row 就是本行（2.1.81 起由面板传入），不要再反向捕获自己：
-       「刚创建、还没强持有者」的对象赋给 __weak 会立刻变 nil，
-       随后 addObject 抛 NSInvalidArgumentException（真机 07:49:42 崩在这）。 */
-    JJSheetRow *step = [JJSheetRow stepper:@"时长"
-                                    symbol:@"timer"
-                                     value:[NSString stringWithFormat:@"%ld ms", (long)o.thinkMs]
-                                  onChange:^(NSInteger delta, JJSheetRow *row) {
-        __strong typeof(ws) s2 = ws;
-        if (!s2) return;
-        NSInteger v = [JJEngineOptions shared].thinkMs + delta * 50;
-        if (v < JJ_OPT_THINK_MS_MIN) v = JJ_OPT_THINK_MS_MIN;
-        if (v > JJ_OPT_THINK_MS_MAX) v = JJ_OPT_THINK_MS_MAX;
-        [s2 applyThinkMs:v announce:NO];
-        row.detail = [NSString stringWithFormat:@"%ld ms", (long)v];
-        [s2 refreshActiveSheet];
-    }];
-    [rows addObject:step];
-
-    /* 预设：包含「当前值」并打勾，一键选回默认 */
-    NSMutableArray<NSNumber *> *presets =
-        [NSMutableArray arrayWithArray:@[@(350), @(650), @(1000), @(2000)]];
-    if (![presets containsObject:@(o.thinkMs)]) [presets insertObject:@(o.thinkMs) atIndex:0];
-    for (NSNumber *n in presets) {
-        JJSheetRow *r = [JJSheetRow action:[NSString stringWithFormat:@"%@ ms", n]
-                                        symbol:@"bolt.horizontal"
-                                        detail:nil
-                                       handler:^(JJSheetRow *row) {
+    if (byDepth) {
+        /* ---- 深度模式 ---- */
+        JJSheetRow *step = [JJSheetRow stepper:@"深度"
+                                        symbol:@"arrow.down.to.line"
+                                         value:[NSString stringWithFormat:@"%ld 层", (long)o.thinkDepth]
+                                      onChange:^(NSInteger delta, JJSheetRow *row) {
             __strong typeof(ws) s2 = ws;
             if (!s2) return;
-            [s2 applyThinkMs:n.integerValue announce:YES];
-            /* 预设点完同步步进器的显示值，避免同屏两个数字不一致 */
-            step.detail = [NSString stringWithFormat:@"%ld ms",
-                           (long)[JJEngineOptions shared].thinkMs];
-            for (JJSheetRow *rr in rows) {
-                if (rr.kind == JJSheetRowKindAction) rr.on = NO;
-            }
-            row.on = YES;
+            NSInteger v = [JJEngineOptions shared].thinkDepth + delta;
+            v = MAX(1, MIN(JJ_OPT_THINK_DEPTH_MAX, v));
+            [[JJEngineOptions shared] setThinkDepth:v];
+            s2.thinkMs = [JJEngineOptions shared].thinkMs;
+            row.detail = [NSString stringWithFormat:@"%ld 层", (long)v];
+            [s2 afterEngineOptionsChanged:NO];
             [s2 refreshActiveSheet];
         }];
-        r.on = (n.integerValue == o.thinkMs);
-        [rows addObject:r];
+        [rows addObject:step];
+
+        NSMutableArray<NSNumber *> *presets =
+            [NSMutableArray arrayWithArray:@[@10, @14, @18, @22]];
+        if (![presets containsObject:@(o.thinkDepth)]) [presets insertObject:@(o.thinkDepth) atIndex:0];
+        for (NSNumber *n in presets) {
+            JJSheetRow *r = [JJSheetRow action:[NSString stringWithFormat:@"%ld 层", (long)n.integerValue]
+                                            symbol:@"list.number"
+                                            detail:nil
+                                           handler:^(JJSheetRow *row) {
+                __strong typeof(ws) s2 = ws;
+                if (!s2) return;
+                [[JJEngineOptions shared] setThinkDepth:n.integerValue];
+                step.detail = [NSString stringWithFormat:@"%ld 层",
+                               (long)[JJEngineOptions shared].thinkDepth];
+                for (JJSheetRow *rr in rows) {
+                    if (rr.kind == JJSheetRowKindAction) rr.on = NO;
+                }
+                row.on = YES;
+                [s2 afterEngineOptionsChanged:NO];
+                [s2 refreshActiveSheet];
+            }];
+            r.on = (n.integerValue == o.thinkDepth);
+            [rows addObject:r];
+        }
+    } else {
+        /* ---- 时间模式（原逻辑保持不变） ---- */
+        /* 步进器：每档 50ms。为什么用步进而不是键盘 —— 键盘会盖住棋盘，
+           而且这个值调一次就长期不动，微调比重新输入更顺手。
+           回调里的 row 就是本行（2.1.81 起由面板传入），不要再反向捕获自己：
+           「刚创建、还没强持有者」的对象赋给 __weak 会立刻变 nil，
+           随后 addObject 抛 NSInvalidArgumentException（真机 07:49:42 崩在这）。 */
+        JJSheetRow *step = [JJSheetRow stepper:@"时长"
+                                        symbol:@"timer"
+                                         value:[NSString stringWithFormat:@"%ld ms", (long)o.thinkMs]
+                                      onChange:^(NSInteger delta, JJSheetRow *row) {
+            __strong typeof(ws) s2 = ws;
+            if (!s2) return;
+            NSInteger v = [JJEngineOptions shared].thinkMs + delta * 50;
+            if (v < JJ_OPT_THINK_MS_MIN) v = JJ_OPT_THINK_MS_MIN;
+            if (v > JJ_OPT_THINK_MS_MAX) v = JJ_OPT_THINK_MS_MAX;
+            [s2 applyThinkMs:v announce:NO];
+            row.detail = [NSString stringWithFormat:@"%ld ms", (long)v];
+            [s2 refreshActiveSheet];
+        }];
+        [rows addObject:step];
+
+        /* 预设：包含「当前值」并打勾，一键选回默认 */
+        NSMutableArray<NSNumber *> *presets =
+            [NSMutableArray arrayWithArray:@[@(350), @(650), @(1000), @(2000)]];
+        if (![presets containsObject:@(o.thinkMs)]) [presets insertObject:@(o.thinkMs) atIndex:0];
+        for (NSNumber *n in presets) {
+            JJSheetRow *r = [JJSheetRow action:[NSString stringWithFormat:@"%@ ms", n]
+                                            symbol:@"bolt.horizontal"
+                                            detail:nil
+                                           handler:^(JJSheetRow *row) {
+                __strong typeof(ws) s2 = ws;
+                if (!s2) return;
+                [s2 applyThinkMs:n.integerValue announce:YES];
+                /* 预设点完同步步进器的显示值，避免同屏两个数字不一致 */
+                step.detail = [NSString stringWithFormat:@"%ld ms",
+                               (long)[JJEngineOptions shared].thinkMs];
+                for (JJSheetRow *rr in rows) {
+                    if (rr.kind == JJSheetRowKindAction) rr.on = NO;
+                }
+                row.on = YES;
+                [s2 refreshActiveSheet];
+            }];
+            r.on = (n.integerValue == o.thinkMs);
+            [rows addObject:r];
+        }
     }
 
     [rows addObject:[JJSheetRow action:JJCopySheetDone symbol:nil detail:nil handler:^(JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
         if (!s2) return;
         [s2.ballWindow dismissSheet];
-        [s2.ballWindow toast:[NSString stringWithFormat:@"思考时间 %ld ms",
-                              (long)[JJEngineOptions shared].thinkMs]];
+        JJEngineOptions *oo = [JJEngineOptions shared];
+        [s2.ballWindow toast:(oo.thinkDepth > 0
+            ? [NSString stringWithFormat:@"思考深度 %ld 层", (long)oo.thinkDepth]
+            : [NSString stringWithFormat:@"思考时间 %ld ms", (long)oo.thinkMs])];
+        (void)row;
     }]];
 
     [self presentSheetTitled:JJCopySheetThinkTitle
                     subtitle:[o summary]
                         rows:rows];
-    NSLog(@"[JJCheat] 打开思考时间面板");
+    NSLog(@"[JJCheat] 打开思考面板（%@）", byDepth ? @"深度模式" : @"时间模式");
 }
 
 - (void)showEngineOptionsSheet {
@@ -504,7 +587,11 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     NSMutableArray<JJSheetRow *> *rows = [NSMutableArray array];
     [rows addObject:[JJSheetRow info:@"改完立即下发；标「需重启」的项会重载权重"]];
 
-    /* ---- 思考方式：时间 / 深度二选一 ---- */
+    /* ---- 思考方式：时间 / 深度二选一 ----
+       2.0.0r15：布局调整 —— 以前是「按时间 → 时长步进 → 按深度 → 深度步进」
+       交错排列，切到深度后「时长」还在但变灰显示"关闭"，看着像功能坏了。
+       现在先给两个模式按钮，再只显示当前模式对应的那一个步进器。 */
+    [rows addObject:[JJSheetRow info:@"思考方式"]];
     JJSheetRow *byTime = [JJSheetRow action:@"按时间思考" symbol:@"clock" detail:nil
                                      handler:^(JJSheetRow *row) {
         __strong typeof(ws) s2 = ws;
@@ -532,8 +619,7 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
         [s2 afterEngineOptionsChanged:NO];
         [s2 refreshActiveSheet];
     }];
-    timeStep.enabled = (o.thinkDepth == 0);
-    [rows addObject:timeStep];
+    if (o.thinkDepth == 0) [rows addObject:timeStep];   /* 远离当前模式的那一项不再占位 */
 
     JJSheetRow *byDepth = [JJSheetRow action:@"按深度思考" symbol:@"chart.bar" detail:nil
                                       handler:^(JJSheetRow *row) {
@@ -563,10 +649,10 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
         [s2 afterEngineOptionsChanged:NO];
         [s2 refreshActiveSheet];
     }];
-    depthStep.enabled = (o.thinkDepth > 0);
-    [rows addObject:depthStep];
+    if (o.thinkDepth > 0) [rows addObject:depthStep];
 
     /* ---- 资源 ---- */
+    [rows addObject:[JJSheetRow info:@"资源"]];
     JJSheetRow *hash = [JJSheetRow stepper:@"哈希表"
                                     symbol:@"memorychip"
                                      value:[NSString stringWithFormat:@"%ld MB", (long)o.hashMb]
@@ -600,6 +686,7 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [rows addObject:mpv];
 
     /* ---- 其它（2.1.80 补齐：此前有配置键但无 UI 入口）---- */
+    [rows addObject:[JJSheetRow info:@"其它"]];
     JJSheetRow *overhead = [JJSheetRow stepper:@"落子余量"
                                         symbol:@"hourglass"
                                          value:[NSString stringWithFormat:@"%ld ms", (long)o.moveOverhead]
@@ -801,6 +888,154 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 /* 四角来自内置预设（JJConfig.h），不再做「读不出来就换另一套」的自动兜底 ——
    两套坐标各自对应一个固定场景，切换靠菜单里手动选，自动切换反而会在
    边缘情况下左右横跳。这里只负责把识别流水线拉起来。 */
+#pragma mark - 落盘日志（2.0.0r13）
+
+/* 本插件只针对原始皮肤做模板。这里把「每步着法」和「每次引擎结论」各自
+   追加到沙箱内的两个 JSONL 文件，可读可写：
+     moves.log   每行 {n,uci,zh,fen,src,gain,ts}
+     engine.log  每行 {fen,bestmove,score,depth,nodes,winrate,ts}
+   用途：复盘、悔棋时回看上一手、以及事后判断「是识别错了还是引擎判错了」。
+   读写都走这里，不要把路径散到别处。 */
+- (NSString *)jjLogPath:(NSString *)name {
+    NSArray<NSString *> *paths =
+        NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES);
+    if (paths.count == 0) return nil;
+    NSString *dir = [paths[0] stringByAppendingPathComponent:@"JJCheat"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:NULL];
+    return [dir stringByAppendingPathComponent:name];
+}
+
+/* 2.0.0r14：每局一对日志。文件名用「前缀-局时间戳」，新局换一份，
+   这样一局一个文件，复盘时不会混在一起，也不用担心长期运行越写越大。 */
+- (NSString *)gameStampNow {
+    if (self.gameLogStamp.length) return self.gameLogStamp;
+    NSDateFormatter *f = [[NSDateFormatter alloc] init];
+    f.dateFormat = @"yyyyMMdd-HHmmss";
+    self.gameLogStamp = [f stringFromDate:[NSDate date]];
+    return self.gameLogStamp;
+}
+
+- (void)startNewGameLogs {
+    self.gameLogStamp = nil;      /* 下一次写日志时生成新的时间戳 */
+}
+
+- (NSString *)logNameWithPrefix:(NSString *)prefix {
+    return [NSString stringWithFormat:@"%@-%@.log", prefix, [self gameStampNow]];
+}
+
+/* 2.0.0r15：清理本插件的日志文件（moves-*.log / engine-*.log）。
+   点菜单里的版本号触发，清完 toast 报「清了多少个、占多大」。
+   顺手把本局时间戳清空 —— 下一条日志会自动另起一个新文件。 */
+- (void)clearLogs {
+    NSArray<NSString *> *paths =
+        NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES);
+    NSString *dir = paths.count ? [paths[0] stringByAppendingPathComponent:@"JJCheat"] : nil;
+    if (!dir) {
+        [self.ballWindow toast:@"没有找到日志目录"];
+        return;
+    }
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *items = [fm contentsOfDirectoryAtPath:dir error:NULL] ?: @[];
+    NSInteger files = 0;
+    unsigned long long bytes = 0;
+    for (NSString *name in items) {
+        if (![name hasSuffix:@".log"]) continue;
+        if (!([name hasPrefix:@"moves-"] || [name hasPrefix:@"engine-"])) continue;
+        NSString *full = [dir stringByAppendingPathComponent:name];
+        NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
+        bytes += [attr[NSFileSize] unsignedLongLongValue];
+        if ([fm removeItemAtPath:full error:NULL]) files++;
+    }
+    self.gameLogStamp = nil;      /* 下一局/下一行日志另起新文件 */
+    NSString *msg = files > 0
+        ? [NSString stringWithFormat:@"已清理 %ld 个日志（%.0f KB）", (long)files, bytes / 1024.0]
+        : @"没有需要清理的日志";
+    NSLog(@"[JJCheat] 清理日志：%@（目录 %@）", msg, dir);
+    [self.ballWindow toast:msg];
+}
+
+- (void)appendLogNamed:(NSString *)name json:(NSDictionary *)obj {
+    NSString *path = [self jjLogPath:name];
+    if (!path || !obj) return;
+    NSData *d = [NSJSONSerialization dataWithJSONObject:obj
+                                                options:NSJSONWritingSortedKeys
+                                                  error:NULL];
+    if (!d.length) return;
+    NSMutableData *line = [d mutableCopy];
+    [line appendBytes:"\n" length:1];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    }
+    if (!fh) return;
+    @try {
+        [fh seekToEndOfFile];
+        [fh writeData:line];
+        [fh closeFile];
+    } @catch (NSException *e) {
+        NSLog(@"[JJCheat] 写日志失败 %@: %@", name, e.reason);
+    }
+}
+
+/** 读回全部日志行（悔棋/复盘用）：返回 JSON 字典数组 */
+- (NSArray<NSDictionary *> *)readLogNamed:(NSString *)name {
+    NSString *path = [self jjLogPath:name];
+    if (!path) return @[];
+    NSString *txt = [NSString stringWithContentsOfFile:path
+                                              encoding:NSUTF8StringEncoding
+                                                 error:NULL];
+    if (!txt.length) return @[];
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    for (NSString *ln in [txt componentsSeparatedByString:@"\n"]) {
+        if (!ln.length) continue;
+        NSData *d = [ln dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *o = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL];
+        if ([o isKindOfClass:[NSDictionary class]]) [out addObject:o];
+    }
+    return out;
+}
+
+/* 2.0.0r11：以当前画面重新同步。
+   清空 JS 锚盘 + 所有引擎结论 + 帧指纹，下一帧用当前画面重新识别并锚定。
+   这是「HUD 和棋盘对不上」的最终兜底，比杀进程快得多。 */
+- (void)resyncBoard {
+    if (!self.enabled) {
+        [[JJHUDWindow shared] showStatus:JJCopyNeedPluginOn];
+        [self.ballWindow toast:JJCopyNeedPluginOn];
+        return;
+    }
+    [[JJVisionBridge shared] resetWithFen:nil];
+    [[JJPikafish shared] notifyNewGame];
+    /* 2.0.0r13：重新同步也留一条分隔，并把已读到的着法条数打出来（验证日志可读） */
+    {
+        NSArray<NSDictionary *> *old = [self readLogNamed:[self logNameWithPrefix:@"moves"]];
+        NSLog(@"[JJCheat] 重新同步：moves.log 现有 %lu 条记录", (unsigned long)old.count);
+        [self appendLogNamed:[self logNameWithPrefix:@"moves"] json:@{
+            @"n": @0,
+            @"event": @"resync",
+            @"prevCount": @(old.count),
+            @"ts": @((long long)([[NSDate date] timeIntervalSince1970] * 1000))
+        }];
+    }
+    self.lastFrameSerial = 0;
+    self.lastFingerprint = nil;
+    self.lastSearchFen = nil;
+    self.engineResult = nil;
+    self.engineGen++;
+    self.learnFailCount = 0;
+    self.autoDetectTried = NO;       /* 重新同步后允许再试一次画面反解 */
+    self.processNotBefore = 0;
+    self.state = JJGameStateWaitingBoard;
+    [self startTimer];
+    [self presentMergedResult];          /* 立刻清掉旧箭头，不等下一帧 */
+    [self.ballWindow toast:@"已重新同步，正在重读盘面"];
+    NSLog(@"[JJCheat] 手动重新同步：清锚盘 + 清结论 + 清指纹");
+}
+
 /* 在人机 / 排位两套内置预设之间切换。两套只差棋盘纵向位置 50pt。 */
 - (void)toggleBoardScheme {
     NSInteger next = ([[JJCalibrator shared] currentCalibScheme] == 1) ? 0 : 1;
@@ -1059,6 +1294,8 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
 
 #pragma mark - 学习结果
 
+#pragma mark - 学习与识别结果
+
 - (void)handleLearnResult:(NSDictionary *)info rgba:(NSData *)rgba width:(int)w height:(int)h {
     /* ★ 2.1.97：**几何检测的网格先采纳，不等模板学习**。
      *
@@ -1195,6 +1432,48 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
             return;
         }
         if (self.learnFailCount >= JJ_LEARN_MAX_FAIL) {
+            /* ★ 2.0.0r11：放弃之前先问一次画面。
+               四角是内置预设，换皮肤 / 换对局类型 / 换机型都可能整体偏移，
+               而预设写死不会自适应。这里让识别层从当前帧反解一遍棋盘，
+               和预设差得远就用它替换、重学一次；只试一次，失败就维持原样。 */
+            if (!self.autoDetectTried) {
+                self.autoDetectTried = YES;
+                NSArray *px = [[JJVisionBridge shared] autoDetectCornersWithPixels:rgba
+                                                                             width:w height:h];
+                if (px.count == 4) {
+                    CGSize pt = [UIScreen mainScreen].bounds.size;
+                    CGFloat sx = (w > 0) ? pt.width / (CGFloat)w : 1.0;
+                    CGFloat sy = (h > 0) ? pt.height / (CGFloat)h : 1.0;
+                    NSMutableArray<NSValue *> *pts = [NSMutableArray arrayWithCapacity:4];
+                    for (NSArray *q in px) {
+                        [pts addObject:[NSValue valueWithCGPoint:
+                                        CGPointMake([q[0] doubleValue] * sx,
+                                                    [q[1] doubleValue] * sy)]];
+                    }
+                    /* 和当前四角比一下差多少，差太小就不折腾 */
+                    NSArray<NSArray<NSNumber *> *> *cur = [[JJCalibrator shared] cornersForWidth:w
+                                                                                         height:h];
+                    CGFloat maxD = 0;
+                    for (NSUInteger i = 0; i < 4 && i < cur.count; i++) {
+                        CGFloat dx = [cur[i][0] doubleValue] - [px[i][0] doubleValue];
+                        CGFloat dy = [cur[i][1] doubleValue] - [px[i][1] doubleValue];
+                        CGFloat d = sqrt(dx * dx + dy * dy);
+                        if (d > maxD) maxD = d;
+                    }
+                    NSLog(@"[JJCheat] 画面反解四角：%@ 与预设最大偏差 %.1fpx", px, maxD);
+                    if (maxD > 12.0 && [[JJCalibrator shared] adoptCorners:pts]) {
+                        NSLog(@"[JJCheat] 已采纳画面反解的四角，重新学习");
+                        self.learnFailCount = 0;
+                        self.lastFrameSerial = 0;
+                        self.lastFingerprint = nil;
+                        self.state = JJGameStateWaitingBoard;
+                        [self.ballWindow toast:@"已按画面自动校正棋盘，重新学习"];
+                        return;
+                    }
+                } else {
+                    NSLog(@"[JJCheat] 画面反解四角失败（画面里没有完整棋盘）");
+                }
+            }
             if ([[JJCalibrator shared] hasSnapshot]) {
                 [self rollbackCalibration];
             } else {
@@ -1318,6 +1597,66 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     BOOL waiting = [result[@"waitingOpponent"] boolValue];
     BOOL newGame = [result[@"newGame"] boolValue];
 
+    /* 2.0.0r12：着法链记账（双轨之一）。每新增一步打一行，
+       带「谁走的 / 中文记谱 / 靠什么判出来的 / 链是否被重锚污染」。
+       界面上不显示，出问题时从这里回溯。 */
+    /* 2.0.0r13：皮肤提示。本插件只对原始皮肤做模板，换皮肤后亮度分布会偏移，
+       识别会明显变差。这里只提示、不阻断（皮肤可能只是明暗不同），
+       5 分钟内最多提示一次。 */
+    if ([result[@"skinWarn"] integerValue] != 0) {
+        NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
+        if (nowTs - self.lastSkinWarnTs > 300) {
+            self.lastSkinWarnTs = nowTs;
+            [self.ballWindow toast:@"疑似非原始皮肤 · 识别可能不准，请换回原始皮肤"];
+            NSLog(@"[JJCheat] 皮肤提示：亮度增益=%@ 超出原始皮肤范围（0.75~1.45）",
+                  result[@"gain"] ?: @"-");
+        }
+    }
+
+    /* 2.0.0r13：悔棋事件落盘（moves.log 里用 event 行标记，复盘时据此分段） */
+    if ([result[@"undo"] integerValue] != 0) {
+        NSLog(@"[JJCheat] 悔棋：回退一步（本次会话累计 %@ 次）", result[@"undoCount"] ?: @"0");
+        [self appendLogNamed:[self logNameWithPrefix:@"moves"] json:@{
+            @"n": result[@"chainLen"] ?: @0,
+            @"event": @"undo",
+            @"count": result[@"undoCount"] ?: @0,
+            @"ts": @((long long)([[NSDate date] timeIntervalSince1970] * 1000))
+        }];
+    }
+
+    {
+        NSInteger chainLen = [result[@"chainLen"] integerValue];
+        if (chainLen > 0 && chainLen != self.lastChainLen) {
+            self.lastChainLen = chainLen;
+            NSString *uci = result[@"lastMoveUci"] ?: @"";
+            NSString *fenBefore = result[@"lastMoveFenBefore"] ?: @"";
+            /* 中文记谱必须带上走子方：FEN 只有一个盘面时，原生会默认按红方
+               编号（红从右数、黑从左数），黑方着法就会写错一路。 */
+            NSString *fenForZh = fenBefore;
+            if (fenBefore.length) {
+                BOOL byBlack = [result[@"lastMoveBy"] isEqualToString:@"black"];
+                fenForZh = [fenBefore stringByAppendingString:(byBlack ? @" b" : @" w")];
+            }
+            NSString *zh = uci.length ? (JJMoveChinese(fenForZh, uci) ?: uci) : @"";
+            NSLog(@"[JJCheat] 着法链 #%ld %@  dirty=%@ usedDiff=%@",
+                  (long)chainLen, uci.length ? uci : @"-",
+                  result[@"chainDirty"] ?: @"0",
+                  result[@"usedDiff"] ?: @"0");
+            /* 2.0.0r13：中文记谱落盘（可读可写，悔棋/复盘都用它） */
+            if (uci.length) {
+                [self appendLogNamed:[self logNameWithPrefix:@"moves"] json:@{
+                    @"n": @(chainLen),
+                    @"uci": uci,
+                    @"zh": zh ?: @"",
+                    @"fen": fenBefore ?: @"",
+                    @"src": result[@"chainDirty"] ? @"resync" : @"marker",
+                    @"gain": result[@"gain"] ?: @0,
+                    @"ts": @((long long)([[NSDate date] timeIntervalSince1970] * 1000))
+                }];
+            }
+        }
+    }
+
     /* 2.0.0r9：抓帧分档。等对方走子时把摘要轮询放宽到 0.35s —— 对手落子那半秒
        棋盘会变 3~5 次，0.15s 的门会触发 2~3 次「14MB 拷贝 + JS 识别」，
        真机表现就是「对方一落子画面顿一下」。轮到我方立刻收紧回 0.15s。 */
@@ -1341,6 +1680,13 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     }
 
     if (newGame) {
+        /* 2.0.0r14：新局另起一对日志文件（每局一文件），并留下分隔记录 */
+        [self startNewGameLogs];
+        [self appendLogNamed:[self logNameWithPrefix:@"moves"] json:@{
+            @"n": @0,
+            @"event": @"newgame",
+            @"ts": @((long long)([[NSDate date] timeIntervalSince1970] * 1000))
+        }];
         NSLog(@"[JJCheat] 识别到新对局 → ucinewgame，清空引擎缓存");
         [[JJPikafish shared] notifyNewGame];
         self.lastSearchFen = nil;
@@ -1416,6 +1762,18 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
             return;
         }
         self2.engineResult = [self2 engineDisplayDictFrom:res fen:fen];
+        /* 2.0.0r13：引擎结论落盘，事后可判断「是识别错了还是引擎判错了」 */
+        if (self2.engineResult.count) {
+            [self2 appendLogNamed:[self2 logNameWithPrefix:@"engine"] json:@{
+                @"fen": fen ?: @"",
+                @"bestmove": self2.engineResult[@"suggest"] ?: @"",
+                @"score": self2.engineResult[@"scoreText"] ?: @"",
+                @"depth": res[@"depth"] ?: @0,
+                @"nodes": res[@"nodes"] ?: @0,
+                @"winrate": res[@"winrate"] ?: @0,
+                @"ts": @((long long)([[NSDate date] timeIntervalSince1970] * 1000))
+            }];
+        }
         [self2 presentMergedResult];
     }];
 }
@@ -1450,6 +1808,8 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
 }
 
 /** 合并识别结果 + 引擎结论 → HUD（包含箭头/文案/引擎状态） */
+#pragma mark - 显示合并
+
 - (void)presentMergedResult {
     NSDictionary *rec = self.lastRecognition ?: @{};
     NSMutableDictionary *disp = [rec mutableCopy];
@@ -1470,7 +1830,9 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
         disp[@"from"] = @-1;
         disp[@"to"] = @-1;
         if (unconfirmed && !waiting && eng) {
-            disp[@"engineBlocked"] = @"棋盘有变化 · 正在确认";
+            /* 2.0.0r12：这是「已看到变化、正在等定格」的正常中间态，
+               不是故障。文案改成「走子中…」，别让它看起来像报错。 */
+            disp[@"engineBlocked"] = @"走子中…";
         }
     }
     disp[@"engineState"] = [[JJPikafish shared] stateText];
@@ -1490,6 +1852,9 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
         disp[@"engineBlocked"] = JJCopyRecogPendingKing;
     }
     disp[@"sideToMove"] = rec[@"sideToMove"] ?: (waiting ? @"black" : @"red");
+    /* 2.0.0r11：这一帧的轮次是「根据半区变化先猜的」，还没有被一步棋确认。
+       UI 上必须和「已确认」区分开 —— 否则就是把未提交的状态当成真相展示。 */
+    disp[@"turnPending"] = rec[@"optimisticTurn"] ?: @0;
 
     /* ★ 2.1.79 修「我方执黑时箭头指向对角」
      *

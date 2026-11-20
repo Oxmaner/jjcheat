@@ -199,6 +199,76 @@ var session = {
   newGame: 0               // 本帧识别到「回到标准开局」并已重锚
 };
 
+/* ==========================================================================
+ * ★ 2.0.0r12：着法记账 + 推演校验（双轨之二）
+ *
+ * 为什么需要：现在只有「锚盘 vs 当前识别」的差异检查（差 >3 格才自愈）。
+ * 中间漏一步（差 2 格）根本发现不了，会一路错下去。这里把每一步都记下来
+ * （uci、中文、谁走的、靠什么判出来的），再用「从开局重放」独立推一遍对账：
+ *   对得上 → 链正常
+ *   对不上 → 中途被重锚/漏记过 → 标记 chainDirty，后续以重锚为准
+ *
+ * 注意：着法序列**不喂引擎**（引擎只吃当前 FEN）。它只做校验与溯源 ——
+ * 一旦某步记错，喂序列会让后面每一步都基于错局面，而喂当前 FEN 只影响这一手。
+ * ========================================================================== */
+/* ==========================================================================
+ * ★ 2.0.0r14：识别/确认链路上的阈值集中在这里
+ *
+ * 以前这些数字散在各个判断里（0.06 / 10 / 3 / 12 / 15 / 1500 …），
+ * 改一个要全文搜，还容易漏掉同名不同义的。现在统一到 K，注释写清来历。
+ * 真机实测值都标在注释里，以后校准只改这一处。
+ * ========================================================================== */
+var K = {
+  RING_MIN: 0.06,        /* 白圈：环带与环外中性色差（真机有圈 0.084、普通格 ≤0.039） */
+  DOT_MIN: 10,           /* 白点：中心 9×9 白像素个数（起点 53、普通空位 0） */
+  SETTLE_FRAMES: 3,      /* 定格：连续多少帧盘面完全一致才算「走子结束」 */
+  SETTLE_MS: 1500,       /* 定格超时：距首次变化超过这么久才允许差分兜底 */
+  OPT_HIT: 2,            /* 乐观轮次：半区变化连续几帧一致才采纳 */
+  OPT_WINDOW: 15,        /* 乐观轮次：采纳后有效多少帧（≈2 秒） */
+  MARKER_DEDUP: 12,      /* 同一落点的标记去重窗口（帧） */
+  SKIN_HI: 1.45,         /* 亮度增益高于此值 → 疑似非原始皮肤 */
+  SKIN_LO: 0.75,         /* 亮度增益低于此值 → 疑似非原始皮肤 */
+  SKIN_OK_HI: 1.30,      /* 回到该区间自动解除提示（滞回，防抖） */
+  SKIN_OK_LO: 0.85,
+  UNDO_STABLE: 2         /* 悔棋：连续几帧回到旧盘面才认 */
+};
+
+function recordMove(session, from, to, piece, src, uci) {
+  if (!session.moves) session.moves = [];
+  /* 第一次记账时把「走子之前的盘面」记成推演起点（中途进对局也能重放） */
+  if (!session.chainStartFen && session.prevAnchorFen) {
+    session.chainStartFen = session.prevAnchorFen;
+  }
+  session.moves.push({
+    from: from,
+    to: to,
+    piece: piece,
+    by: (piece > 0 && piece <= 7) ? 'red' : 'black',
+    src: src,                 /* 'marker' | 'marker-ring' | 'diff' */
+    uci: uci || '',           /* UCCI 着法；中文记谱由原生 JJMoveChinese 现算 */
+    fen: session.prevAnchorFen || '',   /* 走子前的盘面：中文记谱要用 */
+    ts: Date.now()
+  });
+  session.chainLen = session.moves.length;
+  return session.chainLen;
+}
+
+/** 从本局起点重放着法序列，返回 {ok, fen} 或 null（无法推演时） */
+function replayChain(session) {
+  if (!session.chainStartFen || !session.moves || !session.moves.length) return null;
+  try {
+    var p2 = new POS.Position(session.chainStartFen + ' w - - 0 1');
+    for (var i = 0; i < session.moves.length; i++) {
+      var m = C.mv(session.moves[i].from, session.moves[i].to);
+      if (!p2.isLegal(m)) return { ok: false, fen: '', at: i };
+      p2.makeMove(m);
+    }
+    return { ok: true, fen: p2.getFen(), at: -1 };
+  } catch (e) {
+    return null;
+  }
+}
+
 var JJEngine = {
   version: '2.1.0',
   /* 2.1.58：开局匹配滤波对齐（alignGridToOpening）。标记必须变：
@@ -220,6 +290,34 @@ var JJEngine = {
 
   /** 重置到指定局面（默认开局）。keepAnchor=true 用于 process 内部首次建 tracker，
       不能把 learnBoard 刚建立的开局锚盘一起清掉。 */
+  /* ------------------------------------------------------------------
+   * 2.0.0r11：从画面自己反解棋盘四角（2.1.96 写的 autoDetectBoard，一直没接线）
+   *
+   * 为什么需要：四角现在是内置预设，一旦换皮肤/换机型/换对局类型就可能偏，
+   * 而预设是写死的，没法自适应。这里给上层一个「实在读不出来时问一次画面」的
+   * 能力：检测成功就替换四角重学，失败就保持原样。
+   * 返回：4 个 [x,y]（像素）或 null。
+   * ------------------------------------------------------------------ */
+  autoDetect: function (pixels, w, h) {
+    if (!REC.autoDetectBoard || !pixels) return null;
+    try {
+      var r = REC.autoDetectBoard(pixels, w, h);
+      if (!r) return null;
+      /* 兼容可能出现的两种返回形态：[{x,y}...] 或 [[x,y]...] */
+      var out = [];
+      for (var i = 0; i < 4; i++) {
+        var q = r[i];
+        if (!q) return null;
+        if (typeof q.x === 'number') out.push([q.x, q.y]);
+        else if (q.length >= 2) out.push([q[0], q[1]]);
+        else return null;
+      }
+      return out;
+    } catch (e) {
+      return null;
+    }
+  },
+
   reset: function (fen, keepAnchor) {
     session.tracker = new TRK.MoveTracker(fen || C.START_FEN);
     session.lastFen = session.tracker.fen;
@@ -248,6 +346,15 @@ var JJEngine = {
     session.reseatPrev = null;
     session.reseatCount = 0;
     session.reseatDone = 0;
+    /* 2.0.0r12：着法链与定格计时的初始状态 */
+    session.moves = [];
+    session.chainLen = 0;
+    session.chainStartFen = '';
+    session.chainDirty = 0;
+    session.stepKey = 0;
+    session.stepStable = 0;
+    session.pendingSince = 0;
+    session.usedDiffFallback = 0;
     session.anchorRejected = 0;
     session.prevAnchorFen = '';
     session.lastMoveText = '';
@@ -1052,6 +1159,7 @@ var JJEngine = {
       session.optMoverHit = 0;
     }
     session.turnUpdated = 0;   // 2.1.91：本帧轮次是否已更新（保证一帧只翻一次）
+    session.undoApplied = 0;   // 2.0.0r13：本帧是否发生了悔棋回退
     /* 2.1.93：帧序号。**不能拿 ply 当「标记是否已处理」的指纹** ——
        推进本身会改 ply，下一帧指纹立刻对不上，于是又推一次、再改 ply……
        死循环，真机实测 ply 一路涨到 25。用单调递增的帧号才可靠。 */
@@ -1090,52 +1198,57 @@ var JJEngine = {
       session.lastResult = null;
       session.lastDispatchedFen = '';
       session.prevAnchorFen = '';
-      session.reseatCount = 0;
-      session.reseatPrev = null;
-      session.anchorRejected = 0;
     }
 
-    if (!anchor) {
-      // 没学过开局（中途进对局）：只有数量与位置都合理的盘面才配当锚盘
-      if (codesLegal(engCodes) && codesPositionPlausible(engCodes)) {
-        anchor = Array.prototype.slice.call(engCodes);
-        session.anchorCodes = anchor;
-        session.anchorFen = codesToBoardFen(anchor);
-        session.anchorFlipped = !!session.flipped;
-        session.lastBoardFen = session.anchorFen;
-        session.lastRawFen = session.anchorFen;
-        session.lastResult = null;
-        session.lastDispatchedFen = '';
-        /* 没学过开局（中途进对局）：轮次无从得知，假设正好轮到我方，
-           让用户立刻能拿到建议；plyGuessed=1 供日志追溯。 */
-        session.movePly = session.flipped ? 1 : 0;
-        session.plyGuessed = 1;
-        session.lastMoverSide = null;    // 2.1.84：中途进局，未知走子方
-      }
-    } else if (session.anchorFlipped !== !!session.flipped) {
-      // 画面朝向变了：旧锚盘坐标失效，按当前盘面重建。
-      // 但必须先确认当前盘面本身是一盘真棋 —— 否则一帧朝向抖动就把锚盘
-      // 换成垃圾盘面（15:10 日志里 FEN 一路漂成 pnbaknb2 的帮凶之一）。
-      // 不合法时只标噪声，本帧仍用旧锚覆盖，等朝向稳定/识别干净再重建。
-      if (codesLegal(engCodes) && codesPositionPlausible(engCodes)) {
-        anchor = Array.prototype.slice.call(engCodes);
-        session.anchorCodes = anchor;
-        session.anchorFen = codesToBoardFen(anchor);
-        session.anchorFlipped = !!session.flipped;
-        session.lastBoardFen = session.anchorFen;
-        session.lastResult = null;
-        session.lastDispatchedFen = '';
-        session.reseatPrev = null;
-        session.reseatCount = 0;
-        session.movePly = session.flipped ? 1 : 0;
-        session.plyGuessed = 1;
-        session.lastMoverSide = null;    // 2.1.84：朝向变了重锚，走子方记录作废
+    /* ==================================================================
+     * ★ 2.0.0r13：悔棋检测
+     *
+     * 判据：当前识别盘面，正好等于着法链里「最后一步走子之前的盘面」。
+     * 这是最干净的判据 —— 不需要猜，盘面完全回到上一手之前就是悔棋。
+     * 要求连续 2 帧同一盘面才动作，避免某一帧偶然读成旧局面就误回退。
+     * 悔棋后：链弹出一步、锚盘以当前识别为准、ply-1、走子方回到另一方。
+     * 只弹一步；连悔两次会在后续帧里各弹一次。
+     * ================================================================== */
+    if (anchor && session.moves && session.moves.length &&
+        codesLegal(engCodes) && codesPositionPlausible(engCodes)) {
+      var undoFen = codesToBoardFen(engCodes);
+      var lastMv = session.moves[session.moves.length - 1];
+      if (lastMv.fen && lastMv.fen === undoFen) {
+        if (session.undoKey === undoFen) {
+          session.undoStable = (session.undoStable || 0) + 1;
+        } else {
+          session.undoKey = undoFen;
+          session.undoStable = 1;
+        }
+        if (session.undoStable >= K.UNDO_STABLE) {
+          session.moves.pop();
+          session.chainLen = session.moves.length;
+          anchor = Array.prototype.slice.call(engCodes);
+          session.anchorCodes = anchor;
+          session.anchorFen = undoFen;
+          session.anchorFlipped = !!session.flipped;
+          session.lastBoardFen = undoFen;
+          session.lastRawFen = undoFen;
+          session.lastResult = null;
+          session.lastDispatchedFen = '';
+          session.movePly = Math.max(0, (session.movePly || 0) - 1);
+          session.lastMoverSide = (lastMv.by === 'red') ? 'black' : 'red';
+          session.plyGuessed = 0;
+          session.ruleFail = 0;
+          session.undoKey = '';
+          session.undoStable = 0;
+          session.undoApplied = 1;
+          session.undoCount = (session.undoCount || 0) + 1;
+          session.turnUpdated = 1;
+          session.chainDirty = 0;
+        }
       } else {
-        anchorRejected = 1;
+        session.undoKey = '';
+        session.undoStable = 0;
       }
     }
 
-    if (anchor) {
+    if (anchor && !session.undoApplied) {
       /* ★ 2.0.0r10：锚盘漂移自愈 —— 防「一步错、步步错」
          锚盘一旦被错误的走法推进，后面每帧都拿错局面去比，箭头就会指向
          棋盘上不存在的子。这里每帧拿当前识别结果和锚盘比一次：差得太多
@@ -1174,7 +1287,64 @@ var JJEngine = {
         }
       }
 
-      stepInfo = analyzeStepDiff(anchor, engCodes);
+      /* ================================================================
+       * ★ 2.0.0r12：差分降级为「只提供变化量」，走法只由标记块产生
+       *
+       * 依据：2026-11-20 真机 10 轮实拍（红黑各 5 步，覆盖同列/同行/斜走、
+       * 1~6 格、九宫中心、棋盘四边、吃子），白点+白圈判读 10/10，零误判。
+       * 而差分要求「起点读空 + 落点兵种一致」同时成立，任一被高亮圈或压缩
+       * 噪声破坏就配不出，或配出一个错的 —— 一旦错的那步进了锚盘，
+       * 后面全错，且只有差异 >3 格才会自愈。
+       *
+       * 所以这一版改成：
+       *   · 先算差分，但只取 changed（诊断用），不采纳它的走法
+       *   · 走法只由下面的标记块产生
+       *   · 标记完全缺失 + 画面已稳定 3 帧 + 距首次变化 ≥1.5s → 才允许兜底
+       * 宁可慢 1~2 秒，也不让一个错的走法进锚盘。
+       * ================================================================ */
+      var stepDiffRaw = analyzeStepDiff(anchor, engCodes);
+      stepInfo = stepDiffRaw;
+
+      /* 定格计时：当前识别盘面连续多少帧完全一致（帧间隔约 250ms） */
+      var engKey = 0;
+      for (var ek = 0; ek < 90; ek++) engKey = ((engKey * 31) + (engCodes[ek] || 0)) | 0;
+      if (session.stepKey === engKey) {
+        session.stepStable = (session.stepStable || 0) + 1;
+      } else {
+        session.stepKey = engKey;
+        session.stepStable = 1;
+      }
+      /* 首次出现变化时记下时刻，给 1.5s 超时兜底用 */
+      if (stepInfo.changed > 0) {
+        if (!session.pendingSince) session.pendingSince = Date.now();
+      } else {
+        session.pendingSince = 0;
+      }
+
+      /* 这一帧全盘最大环分：≥0.06 视为「有白圈」。
+         必须在标记块之前无条件统计 —— 标记成功的那一帧正好不会进兜底闸门，
+         如果记在里面就会永远记不上（自测时踩到过这个坑）。 */
+      var ringMax = 0;
+      if (cls.rings) {
+        for (var rm = 0; rm < 90; rm++) {
+          if (cls.rings[rm] > ringMax) ringMax = cls.rings[rm];
+        }
+      }
+      if (ringMax >= K.RING_MIN) session.markerEverSeen = 1;
+
+      /* 2.0.0r13：皮肤提示。
+         本插件只针对原始皮肤做模板，换皮肤后亮度/色温分布会明显偏移。
+         这里用识别层已有的「整帧亮度增益」当判据 —— 它本来就是为了把真机
+         帧拉回模板水平而算的，原始皮肤实测 1.21，超出 0.75~1.45 说明
+         底色/棋子面已经和模板不是一回事了。
+         只提示、不阻断：皮肤可能有明暗差异，硬拦会误伤正常对局。 */
+      var gNow = (session.recognizer && session.recognizer.lastStats)
+        ? session.recognizer.lastStats.gain : 0;
+      if (gNow > 0) {
+        session.lastGain = gNow;
+        if (gNow < K.SKIN_LO || gNow > K.SKIN_HI) session.skinWarn = 1;
+        else if (gNow >= K.SKIN_OK_LO && gNow <= K.SKIN_OK_HI) session.skinWarn = 0;
+      }
 
       /* ★ 2.1.92：用游戏自己画的「上一步标记」直接定位走法
        *
@@ -1204,7 +1374,7 @@ var JJEngine = {
           var rs = cls.rings[mi] || 0;
           if (rs > mkScore) { mkScore = rs; mkT = mi; }
         }
-        if (mkScore < 0.06) mkT = -1;   // 环提升平均差，真机实测有圈 0.084 / 普通格 ≤0.039
+        if (mkScore < K.RING_MIN) mkT = -1;   // 环提升平均差，真机实测有圈 0.084 / 普通格 ≤0.039
 
         /* 防重复：同一个标记、ply 没再动过，说明这步早已推进过 */
         /* 同一个白圈在一个时间窗内只处理一次（防同一步被反复采纳）。
@@ -1215,7 +1385,7 @@ var JJEngine = {
            4.5s 太长：出手快的时候，下一手落在同一个落点会被这个窗口吞掉，
            表现为「连走两步，第二步没反应」。1.8s 已经覆盖了重复帧的范围。 */
         if (mkT >= 0 && session.markerDoneSq === mkT &&
-            (session.frameSeq - (session.markerDoneSeq || 0)) < 12) mkT = -1;
+            (session.frameSeq - (session.markerDoneSeq || 0)) < K.MARKER_DEDUP) mkT = -1;
         if (mkT >= 0 && (anchor[mkT] || 0) !== 0 &&
             (anchor[mkT] || 0) === (engCodes[mkT] || 0)) mkT = -1;
 
@@ -1230,7 +1400,7 @@ var JJEngine = {
             var cs = cls.centers[ci] || 0;
             if (cs > mkC) { mkC = cs; mkF = ci; }
           }
-          if (mkC < 10) mkF = -1;
+          if (mkC < K.DOT_MIN) mkF = -1;
         }
 
         /* ① 白点 + 白圈齐全 → 直接就是这一步 */
@@ -1255,6 +1425,8 @@ var JJEngine = {
             session.markerDoneSq = mkT;
             session.markerDoneSeq = session.frameSeq;
             session.turnUpdated = 1;
+            /* 2.0.0r12：记账（标记法·双标记） */
+            recordMove(session, mkF, mkT, pf, 'marker', session.lastMoveText);
             stepInfo = {
               changed: stepInfo.changed, noise: [],
               move: { from: mkF, to: mkT, piece: pf, captured: cap0 }
@@ -1295,6 +1467,8 @@ var JJEngine = {
               session.markerDoneSq = mkT;
               session.markerDoneSeq = session.frameSeq;
               session.turnUpdated = 1;
+              /* 2.0.0r12：记账（标记法·只有白圈） */
+              recordMove(session, pickF, mkT, mkPiece, 'marker-ring', session.lastMoveText);
               stepInfo = {
                 changed: stepInfo.changed, noise: [],
                 move: { from: pickF, to: mkT, piece: mkPiece, captured: mkCap }
@@ -1303,6 +1477,31 @@ var JJEngine = {
           }
         }
       }
+      /* ----------------------------------------------------------------
+       * ★ 2.0.0r12：diff 走法的兜底闸门
+       *
+       * 走到这里，如果 stepInfo 还是 analyzeStepDiff 给的那个对象（说明标记块
+       * 没有覆盖它），就说明「这一帧的走法是差分猜的」。按新规则，只有同时满足
+       *   ① 画面已稳定 ≥3 帧（约 750ms）
+       *   ② 距首次检测到变化 ≥1.5s
+       * 才允许采用；否则丢弃这个走法，本帧只当「走子中」。
+       * ---------------------------------------------------------------- */
+      if (stepInfo === stepDiffRaw) {
+        /* markerEverSeen 已在上面无条件统计过：见过白圈 → 严格等定格；
+           一次都没见过 → 这套皮肤没有标记，死等没有意义，退回差分
+           （否则整局都不会推进）。 */
+        var settleOk = (session.stepStable || 0) >= K.SETTLE_FRAMES &&
+                       session.pendingSince > 0 &&
+                       (Date.now() - session.pendingSince) >= K.SETTLE_MS;
+        var noMarkerSupport = !session.markerEverSeen;
+        if (!settleOk && !noMarkerSupport) {
+          stepInfo = { changed: stepDiffRaw.changed, move: null, noise: stepDiffRaw.noise };
+        } else if (stepDiffRaw.move) {
+          /* 兜底命中计数：真机上这个数应该长期为 0，一旦上涨说明标记在丢 */
+          session.usedDiffFallback = (session.usedDiffFallback || 0) + 1;
+        }
+      }
+
       var reseat = false;
 
       /* ★ 2.1.85：补一步 —— 高亮圈盖住落点导致「配不出走法」时的兜底
@@ -1392,6 +1591,9 @@ var JJEngine = {
             session.plyGuessed = 0;
             session.ruleFail = 0;
             session.turnUpdated = 1;
+            /* 2.0.0r12：记账（差分兜底，正常只在标记缺失且超时后才会走到） */
+            recordMove(session, stepInfo.move.from, stepInfo.move.to,
+                       stepInfo.move.piece, 'diff', session.lastMoveText);
             session.flipCooldown = 0;   // 识别成功时清冷却（正常走子不该被限流）
             /* 2.1.84：记下这一步是谁走的（编码 1~7 红、8~14 黑）。
                轮次判定改用它，不再依赖 movePly 奇偶，漏步可自愈。 */
@@ -1433,6 +1635,9 @@ var JJEngine = {
                  推不出才退回「假设轮到我方」。 */
               session.lastMoverSide = failMover;
               session.turnUpdated = 1;
+              /* 2.0.0r12：这里是以当前识别重锚，不是识别到的一步走子，
+                 必须把着法链标记为脏，避免拿它当「本局着法」去对账。 */
+              session.chainDirty = 1;
               if (failMover) {
                 session.movePly = (session.movePly || 0) + 1;
               } else {
@@ -1540,6 +1745,9 @@ var JJEngine = {
             session.turnUpdated = 1;
             session.plyGuessed = 1;          // 轮次是推的，日志可追溯
             session.ruleFail = 0;
+            /* 2.0.0r12：这一步是「高亮推断」出来的，不是标记读出来的 ——
+               记账时标明来源，对账时据此判断可信度。 */
+            session.chainDirty = 1;
             session.highlightInferred = (session.highlightInferred || 0) + 1;
             session.genChgStreak = 0;
             session.flipCooldown = 10;       // ~1.5s 冷却，避免连续误翻
@@ -1666,6 +1874,23 @@ var JJEngine = {
     }
     var isStable = (session.gridStable >= 1);
 
+    /* ★ 2.0.0r12：推演对账（双轨的另一半）
+       每提交一步，就从本局起点把记录的着法重放一遍，和锚盘比。
+       一致 → 链健康；不一致 → 说明中途被重锚过（或某步记漏），
+       把链就地重启到当前锚盘并记一次 chainResets，便于回溯。
+       注意：对账只影响「链」，不动锚盘，不影响本帧结论。 */
+    if (session.turnUpdated && !session.chainDirty) {
+      var rp = replayChain(session);
+      var okChain = !!(rp && rp.ok && rp.fen &&
+                       rp.fen.split(' ')[0] === codesToBoardFen(anchor));
+      if (!okChain) {
+        session.chainResets = (session.chainResets || 0) + 1;
+        session.moves = [];
+        session.chainLen = 0;
+        session.chainStartFen = session.anchorFen || '';
+      }
+    }
+
     var out = {
       grid: Array.prototype.slice.call(grid),
       fen: session.tracker.fen,
@@ -1695,8 +1920,8 @@ var JJEngine = {
        半区变化给出的「谁刚动过」比完整配对早 1~3 秒。这里先按它把轮次翻过去，
        窗口 15 帧（约 2 秒）后失效；同时写回 lastMoverSide，让后续帧的推导
        与它一致，不会来回打架。只在画面稳定帧才写，躲开落子动画。 */
-    if (isStable && session.optMoverSide && (session.optMoverHit || 0) >= 2 &&
-        (session.frameSeq - (session.optMoverSeq || 0)) <= 15) {
+    if (isStable && session.optMoverSide && (session.optMoverHit || 0) >= K.OPT_HIT &&
+        (session.frameSeq - (session.optMoverSeq || 0)) <= K.OPT_WINDOW) {
       var optTurn = (session.optMoverSide === 'red') ? 'b' : 'w';
       if (optTurn !== out.turn) {
         out.turn = optTurn;
@@ -1858,9 +2083,37 @@ var JJEngine = {
     out.anchorRejected = anchorRejected ? 1 : 0;
     out.anchorRejectedStreak = session.anchorRejected || 0;
     out.diffChanged = stepInfo.changed;
+    /* 2.0.0r12：走子确认状态对外暴露
+       settling       = 看到变化但还没确认（HUD 显示「走子中…」）
+       usedDiff       = 这一帧的走法是差分兜底来的（正常应为 0）
+       chainLen/Dirty = 着法链长度、是否被重锚污染过 */
+    out.settling =
+      (stepDiffRaw && stepDiffRaw.changed > 0 && !session.turnUpdated) ? 1 : 0;
+    out.usedDiff = session.usedDiffFallback || 0;
+    out.chainLen = session.chainLen || 0;
+    out.chainDirty = session.chainDirty ? 1 : 0;
+    out.chainResets = session.chainResets || 0;
+    /* 0=正常 1=疑似非原始皮肤 */
+    out.skinWarn = session.skinWarn ? 1 : 0;
+    out.undo = session.undoApplied ? 1 : 0;
+    out.undoCount = session.undoCount || 0;
+    out.gain = session.lastGain ? Math.round(session.lastGain * 100) / 100 : 0;
+    if (session.moves && session.moves.length) {
+      var lm = session.moves[session.moves.length - 1];
+      out.lastMoveUci = lm.uci || '';
+      out.lastMoveFenBefore = lm.fen || '';
+      out.lastMoveBy = lm.by || '';      /* red/black：中文记谱要按走子方编号 */
+    } else {
+      out.lastMoveUci = '';
+      out.lastMoveFenBefore = '';
+      out.lastMoveBy = '';
+    }
     /* 2.0.0r10：看到棋盘变了、却配不出合法一步 —— 这帧的结论不能拿来画箭头，
        否则箭头会指向一个真实棋盘上已经不存在的子。上层据此清掉箭头。 */
-    out.boardChangedUnconfirmed = (stepInfo.changed > 0 && !stepInfo.move) ? 1 : 0;
+    /* 判据改成「看到变化 且 本帧没有提交任何一步」——不再看 stepInfo.move：
+       规则校验失败、重锚逃逸等分支也会改写 stepInfo，用 move 判断会漏。 */
+    out.boardChangedUnconfirmed =
+      (stepDiffRaw && stepDiffRaw.changed > 0 && !session.turnUpdated) ? 1 : 0;
     /* 2.1.85 诊断：真机没有 log 命令，把定位轮次判定所需的三个关键量
        直接透到 HUD 第二行，肉眼就能判断「是没认出变化」还是「认错了走子方」。 */
     out.dbgMover = session.lastMoverSide || '-';
