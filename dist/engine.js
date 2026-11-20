@@ -1,7 +1,7 @@
 /* ============================================================
  *  JJ象棋 辅助引擎内核 —— 单文件打包
  *  目标运行环境: iOS JavaScriptCore / Node / 浏览器
- *  生成时间: 2026-11-20T09:12:25.971Z
+ *  生成时间: 2026-11-20T09:43:17.061Z
  *  模块数: 7
  * ============================================================ */
 (function (global) {
@@ -4547,6 +4547,7 @@ var JJEngine = {
     session.optMoverHit = 0;
     session.optMoverSeq = 0;
     session.markerDoneSq = -1;
+    session.markerDirtyAccepted = 0;
     session.markerDotMiss = 0;
     /* ★ 2.0.0r24：换局/重锚必须复位标记确认计数。
        否则上一局残留的 hits 会带进新局 —— 新局第一手若 from*90+to 恰好
@@ -5776,6 +5777,8 @@ var JJEngine = {
         } else if (frameClean) {
           session.dirtySince = 0;
         }
+        /* dirty 现在只是**诊断标签**（标记路径已不再被它阻断），
+           看到它说明「这一帧识别被标记污染了」，属正常现象。 */
         if (mkT >= 0 && mkF >= 0 && !frameClean) session.mkState = 'dirty';
         else if (mkT >= 0 && mkF >= 0 && !stepIsRuleLegal(anchor, mkF, mkT)) {
           session.mkState = 'ruleReject';
@@ -5785,7 +5788,15 @@ var JJEngine = {
            中间丢一帧不清零（标记会淡出，偶尔读不到是常态），但换成另一手就重置。
            不够帧数时 mkState='confirming'，HUD 仍显示「走子中…」，盘面一动不动。 */
         var markerConfirmOk = false;
-        if (mkT >= 0 && mkF >= 0 && frameClean && stepIsRuleLegal(anchor, mkF, mkT)) {
+        /* ★ 2.0.0r28：标记路径**不再要求 frameClean**。
+           原因（r27 真机实锤）：白点画在起点格中心、白圈画在落点外围，识别器采样格子时
+           会把它们算进去 —— 于是「走子 + 标记污染」让 changed 从 2 涨到 8~9，
+           frameClean(<=6) 恒失败，标记永远提交不了；紧接着 reseat 用这帧被污染的识别
+           重锚，锚盘彻底乱掉（日志里 anchor 变成 2bakabnr/4r4/1cn4c1 这种东西）。
+           但标记是**游戏亲手画的**、规则校验用的是**锚盘** —— 两者都不依赖这一帧的识别结果，
+           所以不该被 frameClean 拦住。frameClean 只保留给 reseat / 诊断用。 */
+        if (mkT >= 0 && mkF >= 0 && stepIsRuleLegal(anchor, mkF, mkT)) {
+          if (!frameClean) session.markerDirtyAccepted = (session.markerDirtyAccepted || 0) + 1;
           var confirmKey = mkF * 90 + mkT;
           if (session.markerConfirmKey === confirmKey) {
             session.markerConfirmHits = (session.markerConfirmHits || 0) + 1;
@@ -6391,6 +6402,8 @@ var JJEngine = {
        新圈已经被正确选中，这个数只是留证。 */
     out.ringDedupSkip = session.ringDedupSkip || 0;
     out.mkState = session.mkState || '-';
+    /* 2.0.0r28：有多少手是「识别被标记污染(changed>6)但仍靠标记提交」的 */
+    out.markerDirtyAccepted = session.markerDirtyAccepted || 0;
     /* 2.0.0r26：本帧标记是不是靠放宽阈值才读到的（>0 说明画面质量在下滑） */
     out.ringRelaxed = session.ringRelaxed || 0;
     out.dotRelaxed = session.dotRelaxed || 0;
