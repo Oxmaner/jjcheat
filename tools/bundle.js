@@ -354,6 +354,9 @@ var JJEngine = {
     session.stepKey = 0;
     session.stepStable = 0;
     session.pendingSince = 0;
+    /* 2.0.0r16：换局要清掉「待锚定」计数，否则可能拿上一局的盘面立刻锚定 */
+    session.pendingAnchorKey = 0;
+    session.pendingAnchorHits = 0;
     session.usedDiffFallback = 0;
     session.anchorRejected = 0;
     session.prevAnchorFen = '';
@@ -1245,6 +1248,67 @@ var JJEngine = {
       } else {
         session.undoKey = '';
         session.undoStable = 0;
+      }
+    }
+
+    /* ==================================================================
+     * ★ 2.0.0r16：恢复「无锚盘时建立锚盘」与「朝向变化重锚」
+     *
+     * 这两段在 2.0.0r14 的一次清理中被误删，后果很严重：新局 / 点「重新同步」
+     * 之后 anchor 永远为空 —— 锚盘建不起来，于是每帧都拿原始识别结果去组 FEN、
+     * 每帧都派一次搜索。真机日志特征就是 anchor= 一直为空、FEN 每帧都在变、
+     * go depth 连续刷屏。
+     *
+     * 同时补一道防抖：现在要求「连续 2 帧识别盘面完全一致」才肯锚定。
+     * 以前单帧就锚，噪声帧一旦被当成锚盘，后面全靠自愈去纠，很被动。
+     * ================================================================== */
+    if (!anchor) {
+      /* 没学过开局（中途进对局）：只有数量与位置都合理的盘面才配当锚盘 */
+      var anchorKey = 0;
+      for (var ak = 0; ak < 90; ak++) anchorKey = ((anchorKey * 31) + (engCodes[ak] || 0)) | 0;
+      if (session.pendingAnchorKey === anchorKey) {
+        session.pendingAnchorHits = (session.pendingAnchorHits || 0) + 1;
+      } else {
+        session.pendingAnchorKey = anchorKey;
+        session.pendingAnchorHits = 1;
+      }
+      if (session.pendingAnchorHits >= 2 &&
+          codesLegal(engCodes) && codesPositionPlausible(engCodes)) {
+        anchor = Array.prototype.slice.call(engCodes);
+        session.anchorCodes = anchor;
+        session.anchorFen = codesToBoardFen(anchor);
+        session.anchorFlipped = !!session.flipped;
+        session.lastBoardFen = session.anchorFen;
+        session.lastRawFen = session.anchorFen;
+        session.lastResult = null;
+        session.lastDispatchedFen = '';
+        /* 没学过开局（中途进对局）：轮次无从得知，假设正好轮到我方，
+           让用户立刻能拿到建议；plyGuessed=1 供日志追溯。 */
+        session.movePly = session.flipped ? 1 : 0;
+        session.plyGuessed = 1;
+        session.lastMoverSide = null;    // 2.1.84：中途进局，未知走子方
+        session.pendingAnchorHits = 0;
+        session.pendingAnchorKey = 0;
+      }
+    } else if (session.anchorFlipped !== !!session.flipped) {
+      /* 画面朝向变了：旧锚盘坐标失效，按当前盘面重建。
+         但必须先确认当前盘面本身是一盘真棋 —— 否则一帧朝向抖动就把锚盘
+         换成垃圾盘面（15:10 日志里 FEN 一路漂成 pnbaknb2 的帮凶之一）。 */
+      if (codesLegal(engCodes) && codesPositionPlausible(engCodes)) {
+        anchor = Array.prototype.slice.call(engCodes);
+        session.anchorCodes = anchor;
+        session.anchorFen = codesToBoardFen(anchor);
+        session.anchorFlipped = !!session.flipped;
+        session.lastBoardFen = session.anchorFen;
+        session.lastResult = null;
+        session.lastDispatchedFen = '';
+        session.reseatPrev = null;
+        session.reseatCount = 0;
+        session.movePly = session.flipped ? 1 : 0;
+        session.plyGuessed = 1;
+        session.lastMoverSide = null;    // 2.1.84：朝向变了重锚，走子方记录作废
+      } else {
+        anchorRejected = 1;
       }
     }
 

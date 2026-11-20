@@ -361,6 +361,34 @@ function main() {
   if (!un2.undo) throw new Error('连续两帧回到旧盘面应判定为悔棋');
   if (un2.ply !== 2) throw new Error('悔棋后 ply 应减 1（期望 2，实际 ' + un2.ply + '）');
   console.log('     悔棋回退生效 ✓（ply 3→2，着法链弹出一手）');
+
+  /* ===== W. 2.0.0r16：无锚盘时重建锚盘 =====
+     真机事故：r14 的一次清理误删了「if (!anchor) 建立锚盘」整段，后果是
+     新局/点「重新同步」后 anchor 永远为空 —— 每帧都拿裸识别结果组 FEN、
+     每帧派一次搜索（日志里 anchor= 一直为空、FEN 每帧变、go depth 刷屏）。
+     这条路此前零覆盖，所以删了也没被发现。这里守住两条：
+       W1 单帧不锚（防噪声帧被当成锚盘）
+       W2 连续两帧同一盘面 → 锚定成功，anchorFen 非空 */
+  console.log('');
+  console.log('========== W. 无锚盘重建（2.0.0r16）==========');
+  const W = makeFixture(src, false);
+  W.learnOpening(false);
+  /* 造一个合法中局盘面：红兵进一 + 黑卒进一 */
+  const wMid = W.S0.slice();
+  wMid[54] = 0; wMid[45] = 7;
+  wMid[27] = 0; wMid[36] = 14;
+  W.setCodes(wMid);
+  W.JJ.reset(null);            // 模拟「重新同步/新局」：清空锚盘
+  const w1 = W.JJ.process(new Uint8ClampedArray(4), 1, 1, { live: true });
+  if (w1.anchorFen && w1.anchorFen.length) {
+    throw new Error('W1 失败：单帧就把噪声锚成锚盘了');
+  }
+  console.log('     W1 单帧不锚 ✓（anchorFen 为空）');
+  const w2 = W.JJ.process(new Uint8ClampedArray(4), 1, 1, { live: true });
+  if (!w2.anchorFen || !w2.anchorFen.length) {
+    throw new Error('W2 失败：连续两帧同一盘面仍未建立锚盘（会一直无锚盘空转）');
+  }
+  console.log('     W2 两帧一致 → 锚定成功 ✓（anchor=%s）', w2.anchorFen);
   /* ===== R. 2.1.84：轮次判定自愈（不靠 movePly 奇偶） =====
      真机症状：对方已经走子，浮窗还显示「等待对方走子」；我方走完箭头不消失。
      根因：轮次由 session.movePly % 2 推出，只要某一步漏识别、movePly 不再增长，
