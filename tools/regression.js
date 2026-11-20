@@ -96,10 +96,13 @@ function makeFixture(src, blackBottom) {
       const r = classifyResult(blackBottom ? flip(engCodes) : engCodes);
       /* 2.1.90：可注入「上一步落点标记」，用来测标记反推。
          S.markerSq 是屏幕坐标格号；rings 只在该格给高分（模拟游戏画的圈）。 */
-      if (S.markerSq >= 0) {
+      if (S.markerSq >= 0 || S.staleMarkerSq >= 0) {
         /* 2.1.92：rings / centers 都是「白色像素个数」，阈值 15 / 10 */
         const rg = new Float32Array(90);
-        rg[S.markerSq] = 0.09;                  // 落点白圈：环提升平均差
+        if (S.markerSq >= 0) rg[S.markerSq] = 0.09;      // 落点白圈：环提升平均差
+        /* 2.0.0r17：模拟「上一手的圈还没淡出」，而且分数比新圈更高 ——
+           走子快的时候真机就是这样，旧逻辑会取到旧圈然后被去重抹掉。 */
+        if (S.staleMarkerSq >= 0) rg[S.staleMarkerSq] = 0.14;
         const ct = new Float32Array(90);
         if (S.markerFromSq >= 0) ct[S.markerFromSq] = 20;   // 起点白点
         r.rings = rg;
@@ -551,6 +554,36 @@ function main() {
     throw new Error('连续 26 帧没有白圈，应报 markerLost（否则用户不知道要重新同步）');
   }
   console.log('     锚盘全程未动 ✓ 且已报 markerLost ✓（不再越走越乱）');
+
+  /* ===== AD. 2.0.0r17：旧圈残留时不能挡住新圈 =====
+     真机日志 14:10:12 起：ring 一直 0.066~0.131（圈在），但 usedDiff 一路 1。
+     原因：走子快（两手隔约 2 秒），上一手的圈还没淡出，且分数比新圈更高；
+     旧逻辑取最高分 → 取到旧落点 → 被「同一落点 12 帧内只处理一次」抹掉
+     → 本帧等于没有标记 → 掉到差分。
+     现在按分数从高到低遍历，跳过旧落点，取第一个真正可用的圈。 */
+  console.log('');
+  console.log('========== AD. 旧圈残留不挡新圈（2.0.0r17）==========');
+  const AD = makeFixture(src, false);
+  AD.learnOpening(false);
+  AD.frame('AD0 开局轮到我', AD.S0.slice(), () => {});
+  const ad1 = AD.S0.slice(); ad1[54] = 0; ad1[45] = 7;
+  AD.S.markerSq = 45;
+  AD.S.markerFromSq = 54;
+  const adR1 = AD.frame('AD1 第一步（落点 45）', ad1, () => {});
+  if (adR1.ply !== 1) throw new Error('AD1 应提交到 ply=1，实际 ' + adR1.ply);
+  /* 第二步：黑卒 27→36；同时 45 那格还留着上一手的圈（分数 0.14 > 0.09） */
+  const ad2 = ad1.slice(); ad2[27] = 0; ad2[36] = 14;
+  AD.S.staleMarkerSq = 45;
+  AD.S.markerSq = 36;
+  AD.S.markerFromSq = 27;
+  const adR2 = AD.frame('AD2 旧圈残留 + 新圈（应选中新圈）', ad2, () => {});
+  console.log('     AD2 ply=%s usedDiff=%s mk=%s ringDedupSkip=%s',
+    adR2.ply, adR2.usedDiff, adR2.mkState, adR2.ringDedupSkip);
+  if (adR2.ply !== 2) {
+    throw new Error('旧圈挡住了新圈：ply 应为 2，实际 ' + adR2.ply + '（标记法失效会掉到差分）');
+  }
+  if (adR2.usedDiff) throw new Error('这一步本该由标记法提交，却用了差分');
+  console.log('     旧圈被跳过 ✓ 新圈正常提交 ✓（不再因为走子快就丢标记）');
   /* ===== R. 2.1.84：轮次判定自愈（不靠 movePly 奇偶） =====
      真机症状：对方已经走子，浮窗还显示「等待对方走子」；我方走完箭头不消失。
      根因：轮次由 session.movePly % 2 推出，只要某一步漏识别、movePly 不再增长，

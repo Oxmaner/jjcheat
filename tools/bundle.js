@@ -258,7 +258,14 @@ function recordMove(session, from, to, piece, src, uci) {
 function replayChain(session) {
   if (!session.chainStartFen || !session.moves || !session.moves.length) return null;
   try {
-    var p2 = new POS.Position(session.chainStartFen + ' w - - 0 1');
+    /* ★ 2.0.0r17：初始走子方必须按链上第一手来定。
+       原来这里写死 ' w '，只要链是从「黑方要走的局面」开始重放，
+       第一步 isLegal 就返回 false → 判对账失败 → 链被重启。
+       真机日志里 #1 反复出现（14:10:48、14:11:22、14:13:00）就是这个原因，
+       moves.log 的编号不断从 1 开始，悔棋也会跟着失效。 */
+    var firstBy = session.moves[0].by;
+    var startSide = (firstBy === 'black') ? 'b' : 'w';
+    var p2 = new POS.Position(session.chainStartFen + ' ' + startSide + ' - - 0 1');
     for (var i = 0; i < session.moves.length; i++) {
       var m = C.mv(session.moves[i].from, session.moves[i].to);
       if (!p2.isLegal(m)) return { ok: false, fen: '', at: i };
@@ -370,6 +377,9 @@ var JJEngine = {
        设成当前帧号 = 把「换局这一刻」当作刚见过，给 20 帧宽限。 */
     session.ringSeenSeq = session.frameSeq || 0;
     session.ringMaxNow = 0;
+    session.dotMaxNow = 0;
+    session.mkState = '-';
+    session.ringDedupSkip = 0;
     session.lastOccCount = 0;
     session.anchorRejected = 0;
     session.prevAnchorFen = '';
@@ -1459,6 +1469,18 @@ var JJEngine = {
          「圈没画出来」和「圈画了但阈值没够」—— 这两个数一看就清楚。 */
       session.ringMaxNow = ringMax;
 
+      /* ★ 2.0.0r17：白点分数也要打出来。
+         真机日志（14:10:12 起）ring 一直是 0.066~0.131（白圈在），
+         但 usedDiff 一路 1 —— 说明丢的是**白点**，不是白圈。
+         没有这个数只能靠猜「白点没画」还是「画了但阈值不够」。 */
+      var dotMax = 0;
+      if (cls.centers) {
+        for (var dm = 0; dm < 90; dm++) {
+          if (cls.centers[dm] > dotMax) dotMax = cls.centers[dm];
+        }
+      }
+      session.dotMaxNow = dotMax;
+
       /* 2.0.0r13：皮肤提示。
          本插件只针对原始皮肤做模板，换皮肤后亮度/色温分布会明显偏移。
          这里用识别层已有的「整帧亮度增益」当判据 —— 它本来就是为了把真机
@@ -1497,25 +1519,47 @@ var JJEngine = {
          现在改成标记无条件先跑：只要白点+白圈齐全且规则合法，就以它为准，
          覆盖 diff 的结果；diff 降级为「标记不完整时」的兜底。 */
       if (!reseat && cls.rings) {
-        var mkT = -1, mkScore = 0;
+        /* ★ 2.0.0r17：**取「第一个可用的白圈」，而不是「环分最高的那一个」**。
+           真机日志（14:10:12 起）：ring 一直是 0.066~0.131（圈在），但 usedDiff
+           一路 1 —— 标记法失效。原因是走子快的时候（两手间隔约 2 秒），
+           游戏还没把**上一手**的圈淡出，本步的圈和上一步的圈同时在画面上。
+           旧逻辑取环分最高的那格 → 很可能取到上一手的落点 →
+           紧接着被下面那条「同一落点 12 帧内只处理一次」的去重规则抹掉 →
+           本帧等于没有标记 → 掉到差分（要等 1.5 秒，且没有标记的双重确认）。
+           现在按分数从高到低遍历，跳过「已在去重窗口内的旧落点」和
+           「落点还是原来那颗子」的格，取第一个真正可用的。
+           这样即使旧圈分数更高也不会挡住新圈。 */
+        var ringCands = [];
         for (var mi = 0; mi < 90; mi++) {
           var rs = cls.rings[mi] || 0;
-          if (rs > mkScore) { mkScore = rs; mkT = mi; }
+          if (rs >= K.RING_MIN) ringCands.push({ sq: mi, score: rs });
         }
-        if (mkScore < K.RING_MIN) mkT = -1;   // 环提升平均差，真机实测有圈 0.084 / 普通格 ≤0.039
+        ringCands.sort(function (a, b) { return b.score - a.score; });
 
-        /* 防重复：同一个标记、ply 没再动过，说明这步早已推进过 */
-        /* 同一个白圈在一个时间窗内只处理一次（防同一步被反复采纳）。
-           游戏会一直把这个标记留着，而落点读数又常常丢失，
-           所以不能用「子是否一致」判断，只能靠时间窗 + 格子。
-
-           2.0.0r9：窗口 30 帧（≈4.5s）收到 12 帧（≈1.8s）。
-           4.5s 太长：出手快的时候，下一手落在同一个落点会被这个窗口吞掉，
-           表现为「连走两步，第二步没反应」。1.8s 已经覆盖了重复帧的范围。 */
-        if (mkT >= 0 && session.markerDoneSq === mkT &&
-            (session.frameSeq - (session.markerDoneSeq || 0)) < K.MARKER_DEDUP) mkT = -1;
-        if (mkT >= 0 && (anchor[mkT] || 0) !== 0 &&
-            (anchor[mkT] || 0) === (engCodes[mkT] || 0)) mkT = -1;
+        var mkT = -1, mkScore = 0, ringDedupHit = 0;
+        for (var rc = 0; rc < ringCands.length; rc++) {
+          var candSq = ringCands[rc].sq;
+          /* 去重：同一落点在时间窗内只处理一次（游戏会一直留着这个标记） */
+          if (candSq === session.markerDoneSq &&
+              (session.frameSeq - (session.markerDoneSeq || 0)) < K.MARKER_DEDUP) {
+            ringDedupHit++;
+            continue;
+          }
+          /* 落点还是原来那颗子 → 说明这一步早已在锚盘里了 */
+          if ((anchor[candSq] || 0) !== 0 &&
+              (anchor[candSq] || 0) === (engCodes[candSq] || 0)) {
+            ringDedupHit++;
+            continue;
+          }
+          mkT = candSq;
+          mkScore = ringCands[rc].score;
+          break;
+        }
+        session.ringDedupSkip = ringDedupHit;   // 诊断：本帧因去重跳过了几个圈
+        session.mkState = 'ringOnly';   // 先假定「有圈」，后面按实际走到哪一步改
+        if (mkT < 0) {
+          session.mkState = ringCands.length ? 'ringDedup' : 'noRing';
+        }
 
         /* 起点白点：只在「现在已空、而锚盘里还有子」的格里找 —— 那正是棋子离开的地方。
            有子格里棋子面本身就偏亮，所以不参与比较。 */
@@ -1530,6 +1574,9 @@ var JJEngine = {
           }
           if (mkC < K.DOT_MIN) mkF = -1;
         }
+        /* 诊断：本帧标记到底卡在哪一步（noRing / ringOnly / dirty / ruleReject / ok） */
+        if (mkT >= 0 && mkF < 0) session.mkState = 'ringOnly';
+        else if (mkT >= 0 && mkF >= 0) session.mkState = 'mkPair';
 
         /* ① 白点 + 白圈齐全 → 直接就是这一步
            ★ 2.0.0r17：再加一道「画面洁净度」闸门。
@@ -1553,6 +1600,10 @@ var JJEngine = {
         } else if (frameClean) {
           session.dirtySince = 0;
         }
+        if (mkT >= 0 && mkF >= 0 && !frameClean) session.mkState = 'dirty';
+        else if (mkT >= 0 && mkF >= 0 && !stepIsRuleLegal(anchor, mkF, mkT)) {
+          session.mkState = 'ruleReject';
+        }
         if (mkT >= 0 && mkF >= 0 && frameClean && stepIsRuleLegal(anchor, mkF, mkT)) {
           var pf = anchor[mkF];
           var cap0 = anchor[mkT] || 0;
@@ -1565,7 +1616,10 @@ var JJEngine = {
             session.anchorCodes = anchor;
             session.anchorFen = codesToBoardFen(anchor);
             session.lastMoveText = C.sqToUcci(mkF) + C.sqToUcci(mkT);
-            session.movePly = (session.movePly || 0) + 1;
+            /* ★ 2.0.0r17：这一手如果已经被「对称轮次翻转」猜过一次
+               （plyGuessed=1），确认时就不再 +1 —— 否则一手棋算两次 ply
+               （真机日志 14:10:41 #8 ply=8 → 14:10:48 #1 ply=10）。 */
+            if (!session.plyGuessed) session.movePly = (session.movePly || 0) + 1;
             session.plyGuessed = 0;
             session.ruleFail = 0;
             session.lastMoverSide = (pf <= 7) ? 'red' : 'black';
@@ -1574,6 +1628,7 @@ var JJEngine = {
             session.markerDoneSq = mkT;
             session.markerDoneSeq = session.frameSeq;
             session.turnUpdated = 1;
+            session.mkState = 'ok';
             /* 2.0.0r12：记账（标记法·双标记） */
             recordMove(session, mkF, mkT, pf, 'marker', session.lastMoveText);
             stepInfo = {
@@ -1608,7 +1663,8 @@ var JJEngine = {
               session.anchorCodes = anchor;
               session.anchorFen = codesToBoardFen(anchor);
               session.lastMoveText = C.sqToUcci(pickF) + C.sqToUcci(mkT);
-              session.movePly = (session.movePly || 0) + 1;
+              /* 同 18a：翻转已经给这一手记过 ply 了，确认时不再加 */
+              if (!session.plyGuessed) session.movePly = (session.movePly || 0) + 1;
               session.plyGuessed = 0;
               session.ruleFail = 0;
               session.lastMoverSide = (mkPiece <= 7) ? 'red' : 'black';
@@ -1616,6 +1672,7 @@ var JJEngine = {
               session.markerDoneSq = mkT;
               session.markerDoneSeq = session.frameSeq;
               session.turnUpdated = 1;
+              session.mkState = 'okRing';
               /* 2.0.0r12：记账（标记法·只有白圈） */
               recordMove(session, pickF, mkT, mkPiece, 'marker-ring', session.lastMoveText);
               stepInfo = {
@@ -1755,7 +1812,8 @@ var JJEngine = {
                                    C.sqToUcci(stepInfo.move.to);
             /* 红先黑后：每落地一步走子，轮次翻面。这也是「我执黑要等对面
                先手」的依据 —— 开局 ply=0 归红方，对面走完 ply=1 才轮到我。 */
-            session.movePly = (session.movePly || 0) + 1;
+            /* 同 18a：翻转已经给这一手记过 ply 了，确认时不再加 */
+            if (!session.plyGuessed) session.movePly = (session.movePly || 0) + 1;
             session.plyGuessed = 0;
             session.ruleFail = 0;
             session.turnUpdated = 1;
@@ -2043,7 +2101,12 @@ var JJEngine = {
        一致 → 链健康；不一致 → 说明中途被重锚过（或某步记漏），
        把链就地重启到当前锚盘并记一次 chainResets，便于回溯。
        注意：对账只影响「链」，不动锚盘，不影响本帧结论。 */
-    if (session.turnUpdated && !session.chainDirty) {
+    /* ★ 2.0.0r17：链为空时不跑对账。
+       replayChain 在 moves 为空时返回 null，原来的判断会把它当成「对账失败」
+       去清链并 chainResets++ —— 纯属虚增计数，日志里还会让人以为链老在坏。
+       （链为空通常发生在「对称翻转已经把这一手算掉了」的时刻，
+         此时链确实没有可重放的内容，跳过即可。） */
+    if (session.turnUpdated && !session.chainDirty && session.moves && session.moves.length) {
       var rp = replayChain(session);
       var okChain = !!(rp && rp.ok && rp.fen &&
                        rp.fen.split(' ')[0] === codesToBoardFen(anchor));
@@ -2262,6 +2325,11 @@ var JJEngine = {
     out.usedDiff = session.usedDiffFallback || 0;
     /* 标记诊断：ringMax=本帧最大环分（≥0.06 才算有白圈）、ringAge=距上次见到白圈多少帧 */
     out.ringMax = session.ringMaxNow ? Math.round(session.ringMaxNow * 1000) / 1000 : 0;
+    out.dotMax = session.dotMaxNow || 0;
+    /* 本帧因「旧标记残留」被跳过的圈数：>0 说明画面同时画了两个圈，
+       新圈已经被正确选中，这个数只是留证。 */
+    out.ringDedupSkip = session.ringDedupSkip || 0;
+    out.mkState = session.mkState || '-';
     out.ringAge = session.ringSeenSeq ? (session.frameSeq - session.ringSeenSeq) : -1;
     out.diffRejected = session.diffRejected || 0;
     /* ★ 2.0.0r17：标记丢失提示。

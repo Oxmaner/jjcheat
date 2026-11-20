@@ -1772,12 +1772,13 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
         /* 2.0.0r17：补上标记诊断 —— ringMax（本帧最大环分，≥0.06 才算有白圈）、
            ringAge（距上次见到白圈多少帧）、diffReject（差分因带噪声被拒的次数）。
            这组数一看就知道「是圈没画出来、还是画了但阈值没够」。 */
-        NSLog(@"[JJCheat] 盘面心跳 ply=%@ turn=%@ wait=%@ newGame=%@ engine=%@ rejected=%@ reseat=%@ skip=%@ ring=%@/%@ diffReject=%@ usedDiff=%@",
+        NSLog(@"[JJCheat] 盘面心跳 ply=%@ turn=%@ wait=%@ newGame=%@ engine=%@ rejected=%@ reseat=%@ skip=%@ ring=%@/%@ dot=%@ mk=%@ diffReject=%@ usedDiff=%@",
               result[@"ply"] ?: @"-", result[@"turn"] ?: @"-",
               result[@"waitingOpponent"] ?: @"-", result[@"newGame"] ?: @"-",
               [[JJPikafish shared] stateText], result[@"anchorRejected"] ?: @"-",
               result[@"reseat"] ?: @"-", result[@"skipReason"] ?: @"-",
               result[@"ringMax"] ?: @"-", result[@"ringAge"] ?: @"-",
+              result[@"dotMax"] ?: @"-", result[@"mkState"] ?: @"-",
               result[@"diffRejected"] ?: @"-", result[@"usedDiff"] ?: @"-");
     }
 
