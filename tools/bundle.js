@@ -1600,7 +1600,11 @@ var JJEngine = {
         if (mkT >= 0 && cls.centers) {
           for (var ci = 0; ci < 90; ci++) {
             if (ci === mkT) continue;
-            if ((engCodes[ci] || 0) !== 0) continue;
+            /* ★ 2.0.0r29：**不再要求「当前识别为空」**。
+               白点是亮色像素，它会把起点格照亮 —— 于是那一格被识别成「有子」，
+               下面这条 engCodes!==0 就把真正的起点跳过了，表现就是
+               mk=dotMiss（有圈无点）。白点的定义是「棋子离开的地方」，
+               判据只需：锚盘有子 + 白点分够高（取最高分，白点 53 vs 棋子中心白字更低）。 */
             if ((anchor[ci] || 0) === 0) continue;
             var cs = cls.centers[ci] || 0;
             if (cs > mkC) { mkC = cs; mkF = ci; }
