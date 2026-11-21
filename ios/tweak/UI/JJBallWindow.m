@@ -29,7 +29,6 @@ static const CGFloat kJJMenuPad    = 8.0;
 static const NSInteger kJJMenuCols = 2;
 
 /** 插件图标：优先读随 deb 落到 jbroot 的 logo.png，读不到就回退文字「象棋」。
- *  2.0.0r33：新增 dark 变体 —— 菜单展开时球换成纯黑剪影（logo-dark.png），
  *  让「打开状态」一眼可辨。找不到 dark 图时回退普通图，不影响显示。 */
 static UIImage *JJLoadLogoImageForName(NSString *fileName) {
     NSString *rel = [@"/" stringByAppendingString:JJ_LOGO_REL_PATH];
@@ -68,7 +67,6 @@ static UIImage *JJLoadLogoImageForName(NSString *fileName) {
 }
 
 static UIImage *JJLoadLogoImage(void) { return JJLoadLogoImageForName(@"logo.png"); }
-static UIImage *JJLoadLogoDarkImage(void) { return JJLoadLogoImageForName(@"logo-dark.png"); }
 
 #pragma mark - JJMenuEntry
 
@@ -96,9 +94,6 @@ static UIImage *JJLoadLogoDarkImage(void) { return JJLoadLogoImageForName(@"logo
 @property (nonatomic, strong) UIView *sheetContainer;
 @property (nonatomic, assign, readwrite) BOOL sheetVisible;
 @property (nonatomic, assign) BOOL usesLogo;
-@property (nonatomic, strong) UIImage *logoNormal;
-@property (nonatomic, strong) UIImage *logoDark;
-@property (nonatomic, assign) BOOL menuExpanded;
 @property (nonatomic, assign, readwrite) BOOL menuVisible;
 @property (nonatomic, assign) NSInteger entryCount;
 /* 2.1.80：与 entries 一一对应的 action 标识（0 = 用位置下标） */
@@ -156,10 +151,6 @@ static UIImage *JJLoadLogoDarkImage(void) { return JJLoadLogoImageForName(@"logo
             self.usesLogo = YES;
             [_ball setTitle:nil forState:UIControlStateNormal];
             [_ball setImage:logo forState:UIControlStateNormal];
-            /* 2.0.0r33：菜单展开时换成纯黑剪影 */
-            UIImage *logoDark = JJLoadLogoDarkImage();
-            self.logoNormal = logo;
-            self.logoDark = logoDark ?: logo;
             _ball.imageView.contentMode = UIViewContentModeScaleAspectFit;
             _ball.imageEdgeInsets = UIEdgeInsetsMake(3, 3, 3, 3);
             _ball.backgroundColor = [UIColor colorWithWhite:0.98 alpha:0.94];
@@ -239,19 +230,9 @@ static UIImage *JJLoadLogoDarkImage(void) { return JJLoadLogoImageForName(@"logo
     [self showMenuWithEntries:arr];
 }
 
-/** 2.0.0r33：菜单展开 → 球图标换成纯黑剪影；收起 → 还原。
-    只在真正有 logo 时切换（回退文字态不动），并且避免重复 set（省一次重绘）。 */
-- (void)applyMenuExpanded:(BOOL)expanded {
-    if (_menuExpanded == expanded) return;
-    _menuExpanded = expanded;
-    if (!self.usesLogo || !self.logoNormal) return;
-    UIImage *img = expanded ? self.logoDark : self.logoNormal;
-    if (img) [_ball setImage:img forState:UIControlStateNormal];
-}
 
 - (void)showMenuWithEntries:(NSArray<JJMenuEntry *> *)entries {
     if (!entries.count) return;
-    [self applyMenuExpanded:YES];
     for (UIView *v in [self.menuView.subviews copy]) {
         if (v != self.menuBlur) [v removeFromSuperview];
     }
@@ -407,7 +388,6 @@ static UIImage *JJLoadLogoDarkImage(void) { return JJLoadLogoImageForName(@"logo
 }
 
 - (void)hideMenu {
-    [self applyMenuExpanded:NO];   /* 2.0.0r33：收起菜单 → 球恢复原色图标 */
     if (!self.menuVisible) {
         self.backdrop.hidden = YES;
         self.menuView.hidden = YES;
