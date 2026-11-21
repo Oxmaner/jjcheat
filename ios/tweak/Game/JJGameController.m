@@ -1520,7 +1520,12 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
                     @"uci": uci,
                     @"zh": zh ?: @"",
                     @"fen": fenBefore ?: @"",
-                    @"src": result[@"chainDirty"] ? @"resync" : @"enum",
+                    /* ★ 2.0.0r35：这里原来写的是 
+esult[@"chainDirty"] ? ... : ...。
+                   JS 传过来的是 @0 / @1（NSNumber），**@0 在 ObjC 里是非 nil 对象**，
+                   三元判断恒为真 → 每一条着法都被记成 resync，日志里看不出走子来源。
+                   必须用 integerValue 判值。 */
+                    @"src": [result[@"chainDirty"] integerValue] ? @"resync" : @"enum",
                     @"gain": result[@"gain"] ?: @0,
                     @"ts": @((long long)([[NSDate date] timeIntervalSince1970] * 1000))
                 }];
@@ -1566,7 +1571,9 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     }
 
     /* 轮到我方且盘面可信 → 需要搜索 */
-    NSString *fen = result[@"needSearch"] ? result[@"searchFen"] : nil;
+    /* 2.0.0r35：needSearch 是 @0/@1（NSNumber），@0 在 ObjC 里非 nil，
+               三元判断恒为真 → 不该搜索时也会去取 searchFen。必须判值。 */
+            NSString *fen = [result[@"needSearch"] integerValue] ? result[@"searchFen"] : nil;
     if (waiting || stalled) {
         /* 轮到对方 / 盘面不可信：不出箭头，丢掉旧结论 */
         self.engineResult = nil;
