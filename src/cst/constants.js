@@ -41,14 +41,21 @@ function mvTo(m) { return m >> 7; }
 
 // UCCI 走法串 <-> 内部走法
 function sqToUcci(sq) {
+  /* ★ 2.0.0r32：**rank 必须用 9 - row**。
+     内部 sq 的 row0 = FEN 第一行 = 黑方底线（见 Position.setFen 的 this.board[r*9+c]），
+     而标准 UCCI 的 rank 0 = **红方底线**。原来写成 `+ r` 等于给黑方底线贴 rank 0，
+     整串 UCCI 上下颠倒：红炮初始位 sq=70 会输出 'h7'（正确是 'h2'）。
+     原生 JJMoveCodec 的 JJSqFromICCS 一直是 (9-rank)*9+col，所以两边此前一直不一致 ——
+     引擎/箭头走的是原生那条（正确），只有本文件这条（日志里的着法文本）是反的。
+     修正后日志里的 UCCI 与 Pikafish / 原生完全对齐，可以直接对照。 */
   const r = (sq / 9) | 0, c = sq % 9;
-  return String.fromCharCode(97 + c) + r;
+  return String.fromCharCode(97 + c) + (9 - r);
 }
 function ucciToSq(s) {
   const c = s.charCodeAt(0) - 97;
-  const r = s.charCodeAt(1) - 48;
-  if (c < 0 || c > 8 || r < 0 || r > 9) return -1;
-  return r * 9 + c;
+  const rank = s.charCodeAt(1) - 48;
+  if (c < 0 || c > 8 || rank < 0 || rank > 9) return -1;
+  return (9 - rank) * 9 + c;
 }
 function mvToUcci(m) { return sqToUcci(mvFrom(m)) + sqToUcci(mvTo(m)); }
 function ucciToMv(s) {

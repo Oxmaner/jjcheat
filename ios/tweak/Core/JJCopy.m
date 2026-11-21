@@ -20,7 +20,6 @@ NSString *const JJCopyRecogPendingLowConf = @"识别待确认 · 画面不清";
 
 NSString *const JJCopyResetDone            = @"已重置 · 请停在开局棋盘画面";
 
-NSString *const JJCopySheetThinkTitle   = @"思考时间";
 NSString *const JJCopySheetEngineTitle  = @"引擎参数";
 NSString *const JJCopySheetThreadsTitle = @"改线程数？";
 NSString *const JJCopySheetDone         = @"完成";

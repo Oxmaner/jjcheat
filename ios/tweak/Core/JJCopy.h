@@ -45,7 +45,6 @@ extern NSString *const JJCopyRecogPendingLowConf;   // 识别待确认 · 画面
 extern NSString *const JJCopyResetDone;             // 已重置 · 请停在开局棋盘画面
 
 /* ---- 二级菜单（2.1.80） ---- */
-extern NSString *const JJCopySheetThinkTitle;       // 思考时间
 extern NSString *const JJCopySheetEngineTitle;      // 引擎参数
 extern NSString *const JJCopySheetThreadsTitle;     // 改线程数？
 extern NSString *const JJCopySheetDone;             // 完成

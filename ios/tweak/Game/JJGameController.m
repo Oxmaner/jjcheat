@@ -42,12 +42,9 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     JJMenuActionBoardScheme,      /* 2.0.0r6：人机 / 排位 棋盘切换 */
     JJMenuActionResync,           /* 2.0.0r11：以当前画面重新同步（兜底） */
     JJMenuActionClearLogs,        /* 2.0.0r15：清理着法/引擎日志（点版本号触发） */
-    JJMenuActionManualCalibrate,
     JJMenuActionHUD,
     JJMenuActionResetBoard,
-    JJMenuActionThink,
     JJMenuActionEngineOptions,
-    JJMenuActionMarkerFrames,   /* 2.0.0r23：标记确认帧数（白点+白圈连续几帧一致才提交） */
     JJMenuActionEngineStatus,
 };
 
@@ -87,8 +84,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 @property (nonatomic, assign) NSInteger lastChainLen;
 /* 2.0.0r13：上次皮肤提示的时刻（5 分钟内只提示一次，别刷屏） */
 @property (nonatomic, assign) NSTimeInterval lastSkinWarnTs;
-/* 2.0.0r17：上次「走子标记丢失」提示的时刻（1 分钟冷却） */
-@property (nonatomic, assign) NSTimeInterval lastMarkerLostTs;
 /* 2.0.0r14：本局的日志时间戳（每局一对 moves-<时间>.log / engine-<时间>.log） */
 @property (nonatomic, copy, nullable) NSString *gameLogStamp;
 
@@ -116,12 +111,9 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 - (void)clearLogs;
 - (void)toggleHUD;
 - (void)showEngineStatus;
-- (void)applyThinkMs:(NSInteger)v;
 /* 2.1.80：二级面板 */
-- (void)showThinkSheet;
 - (void)showEngineOptionsSheet;
 - (void)showThreadsConfirmSheet;
-- (void)applyThinkMs:(NSInteger)v announce:(BOOL)announce;
 - (void)presentSheetTitled:(NSString *)title
                   subtitle:(nullable NSString *)subtitle
                       rows:(NSArray<JJSheetRow *> *)rows;
@@ -183,7 +175,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     [[JJScreenGrabber shared] start];
     [[JJVisionBridge shared] loadEngine];
     /* 引擎加载成功后，把菜单里持久化的确认帧数下发进 engine.js */
-    [self applyPersistedMarkerFrames];
     /* 2.1.0：引擎独立进程，激活就开始拉起（首次要把 45MB 复制进容器 + NNUE 初始化） */
     [[JJPikafish shared] start];
     [[JJHUDWindow shared] attach];
@@ -269,27 +260,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
             case JJMenuActionResetBoard:
                 [self2 resetToStartPosition];
                 break;
-            case JJMenuActionThink:
-                [self2 showThinkSheet];
-                break;
-            case JJMenuActionMarkerFrames: {
-            /* 循环 1 → 2 → 3 → 5 → 8 → 12 → 16 → 20 → 30 → 1。
-               真机标记持久显示，调大只会更稳；用户自己权衡延迟与准确度。 */
-            static const int steps[] = {1, 2, 3, 5, 8, 12, 16, 20, 30};
-            int cur = [[NSUserDefaults standardUserDefaults] integerForKey:JJ_KEY_MARKER_CONFIRM];
-            if (cur <= 0) cur = JJ_MARKER_CONFIRM_DEFAULT;
-            int nxt = steps[0];
-            for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
-                if (steps[i] == cur) { nxt = steps[(i + 1) % (sizeof(steps) / sizeof(steps[0]))]; break; }
-                if (steps[i] > cur) { nxt = steps[i]; break; }
-            }
-            int applied = [[JJVisionBridge shared] setMarkerConfirmFrames:nxt];
-            [[NSUserDefaults standardUserDefaults] setInteger:applied forKey:JJ_KEY_MARKER_CONFIRM];
-            NSLog(@"[JJCheat] 标记确认帧数 = %d 帧（约 %.2f 秒）", applied, applied * 0.25);
-            [[JJHUDWindow shared] showStatus:
-                [NSString stringWithFormat:@"标记确认 %d 帧（约 %.2f 秒）", applied, applied * 0.25]];
-            break;
-        }
         case JJMenuActionEngineOptions:
                 [self2 showEngineOptionsSheet];
                 break;
@@ -384,29 +354,9 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     eReset.action = JJMenuActionResetBoard;
     [arr addObject:eReset];
 
-    JJMenuEntry *e4 = [JJMenuEntry title:@"思考" symbol:@"timer"];
-    e4.action = JJMenuActionThink;
-    {
-        JJEngineOptions *o = [JJEngineOptions shared];
-        e4.value = o.thinkDepth > 0
-            ? [NSString stringWithFormat:@"D%ld", (long)o.thinkDepth]
-            : [NSString stringWithFormat:@"%ldms", (long)o.thinkMs];
-    }
-    [arr addObject:e4];
-
     /* 2.1.79：引擎可调参数统一入口。
        菜单项与 JJEngineOptions 的配置键一一对应，加新参数只改那一层 + 这里的弹窗，
        不动搜索主流程。 */
-    /* 2.0.0r23：标记确认帧数。
-       真机白点白圈是**持久显示**的（对方走完停在对方那步，直到我方走完才移动），
-       所以「连续 N 帧同一手」天然可靠，N 调大只会更稳。点击循环 1→2→3→5→8→12→16→20→30。 */
-    int mf = (int)[[NSUserDefaults standardUserDefaults] integerForKey:JJ_KEY_MARKER_CONFIRM];
-    if (mf <= 0) mf = JJ_MARKER_CONFIRM_DEFAULT;
-    JJMenuEntry *eMarkerFrames = [JJMenuEntry title:@"标记确认帧数" symbol:@"checkmark.circle"];
-    eMarkerFrames.action = JJMenuActionMarkerFrames;
-    eMarkerFrames.value = [NSString stringWithFormat:@"%d 帧 · %.2f 秒", mf, mf * 0.25];
-    [arr addObject:eMarkerFrames];
-
     JJMenuEntry *eOpts = [JJMenuEntry title:@"引擎参数" symbol:@"slider.horizontal.3"];
     eOpts.action = JJMenuActionEngineOptions;
     [arr addObject:eOpts];
@@ -423,15 +373,6 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 
     [self.ballWindow showMenuWithEntries:arr];
     [self refreshEngineDot];
-}
-
-/* 2.0.0r23：把菜单里持久化的确认帧数下发给 engine.js。
-   必须在 loadEngine 成功之后调用 —— 早于引擎加载时 JSValue 还不存在。 */
-- (void)applyPersistedMarkerFrames {
-    int mf = (int)[[NSUserDefaults standardUserDefaults] integerForKey:JJ_KEY_MARKER_CONFIRM];
-    if (mf <= 0) mf = JJ_MARKER_CONFIRM_DEFAULT;
-    int applied = [[JJVisionBridge shared] setMarkerConfirmFrames:mf];
-    NSLog(@"[JJCheat] 标记确认帧数已下发: %d 帧（配置 %d）", applied, mf);
 }
 
 - (void)setPluginEnabled:(BOOL)on {
@@ -481,149 +422,7 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 
 #pragma mark - 思考时间（二级面板）
 
-- (void)applyThinkMs:(NSInteger)v {
-    [self applyThinkMs:v announce:YES];
-}
-
-- (void)applyThinkMs:(NSInteger)v announce:(BOOL)announce {
-    /* 夹区间与持久化都在配置层，这里只同步内存值 + 反馈 */
-    [[JJEngineOptions shared] setThinkMs:v];
-    self.thinkMs = [JJEngineOptions shared].thinkMs;
-    v = self.thinkMs;
-    [[JJHUDWindow shared] showStatus:[NSString stringWithFormat:@"思考时间 %ld ms", (long)v]];
-    if (announce) {
-        [self.ballWindow toast:[NSString stringWithFormat:@"思考时间 %ld ms（下一步生效）", (long)v]];
-    }
-    NSLog(@"[JJCheat] 思考时间=%ld ms", (long)v);
-}
-
 /** 二级面板：思考时间。步进器 + 预设行，全程不弹系统键盘（键盘会盖住棋盘）。 */
-- (void)showThinkSheet {
-    if (!self.enabled) {
-        [self.ballWindow toast:JJCopyNeedPluginOn];
-        return;
-    }
-    JJEngineOptions *o = [JJEngineOptions shared];
-    __weak typeof(self) ws = self;
-
-    /* 2.0.0r15：这个面板必须跟着「引擎参数 → 思考方式」走。
-       以前不管选了按时间还是按深度，这里永远只调 ms —— 用户在引擎参数里
-       切到「按深度」后，思考面板仍在改一个根本不会用的值（真机反馈的问题）。 */
-    BOOL byDepth = (o.thinkDepth > 0);
-
-    NSMutableArray<JJSheetRow *> *rows = [NSMutableArray array];
-    [rows addObject:[JJSheetRow info:(byDepth
-        ? [NSString stringWithFormat:@"按深度思考 · 范围 %d~%d 层，下一步生效",
-           JJ_OPT_THINK_DEPTH_MIN + 1, JJ_OPT_THINK_DEPTH_MAX]
-        : [NSString stringWithFormat:@"按时间思考 · 范围 %d~%d ms，下一步生效",
-           JJ_OPT_THINK_MS_MIN, JJ_OPT_THINK_MS_MAX])]];
-
-    if (byDepth) {
-        /* ---- 深度模式 ---- */
-        JJSheetRow *step = [JJSheetRow stepper:@"深度"
-                                        symbol:@"arrow.down.to.line"
-                                         value:[NSString stringWithFormat:@"%ld 层", (long)o.thinkDepth]
-                                      onChange:^(NSInteger delta, JJSheetRow *row) {
-            __strong typeof(ws) s2 = ws;
-            if (!s2) return;
-            NSInteger v = [JJEngineOptions shared].thinkDepth + delta;
-            v = MAX(1, MIN(JJ_OPT_THINK_DEPTH_MAX, v));
-            [[JJEngineOptions shared] setThinkDepth:v];
-            s2.thinkMs = [JJEngineOptions shared].thinkMs;
-            row.detail = [NSString stringWithFormat:@"%ld 层", (long)v];
-            [s2 afterEngineOptionsChanged:NO];
-            [s2 refreshActiveSheet];
-        }];
-        [rows addObject:step];
-
-        NSMutableArray<NSNumber *> *presets =
-            [NSMutableArray arrayWithArray:@[@10, @14, @18, @22]];
-        if (![presets containsObject:@(o.thinkDepth)]) [presets insertObject:@(o.thinkDepth) atIndex:0];
-        for (NSNumber *n in presets) {
-            JJSheetRow *r = [JJSheetRow action:[NSString stringWithFormat:@"%ld 层", (long)n.integerValue]
-                                            symbol:@"list.number"
-                                            detail:nil
-                                           handler:^(JJSheetRow *row) {
-                __strong typeof(ws) s2 = ws;
-                if (!s2) return;
-                [[JJEngineOptions shared] setThinkDepth:n.integerValue];
-                step.detail = [NSString stringWithFormat:@"%ld 层",
-                               (long)[JJEngineOptions shared].thinkDepth];
-                for (JJSheetRow *rr in rows) {
-                    if (rr.kind == JJSheetRowKindAction) rr.on = NO;
-                }
-                row.on = YES;
-                [s2 afterEngineOptionsChanged:NO];
-                [s2 refreshActiveSheet];
-            }];
-            r.on = (n.integerValue == o.thinkDepth);
-            [rows addObject:r];
-        }
-    } else {
-        /* ---- 时间模式（原逻辑保持不变） ---- */
-        /* 步进器：每档 50ms。为什么用步进而不是键盘 —— 键盘会盖住棋盘，
-           而且这个值调一次就长期不动，微调比重新输入更顺手。
-           回调里的 row 就是本行（2.1.81 起由面板传入），不要再反向捕获自己：
-           「刚创建、还没强持有者」的对象赋给 __weak 会立刻变 nil，
-           随后 addObject 抛 NSInvalidArgumentException（真机 07:49:42 崩在这）。 */
-        JJSheetRow *step = [JJSheetRow stepper:@"时长"
-                                        symbol:@"timer"
-                                         value:[NSString stringWithFormat:@"%ld ms", (long)o.thinkMs]
-                                      onChange:^(NSInteger delta, JJSheetRow *row) {
-            __strong typeof(ws) s2 = ws;
-            if (!s2) return;
-            NSInteger v = [JJEngineOptions shared].thinkMs + delta * 50;
-            if (v < JJ_OPT_THINK_MS_MIN) v = JJ_OPT_THINK_MS_MIN;
-            if (v > JJ_OPT_THINK_MS_MAX) v = JJ_OPT_THINK_MS_MAX;
-            [s2 applyThinkMs:v announce:NO];
-            row.detail = [NSString stringWithFormat:@"%ld ms", (long)v];
-            [s2 refreshActiveSheet];
-        }];
-        [rows addObject:step];
-
-        /* 预设：包含「当前值」并打勾，一键选回默认 */
-        NSMutableArray<NSNumber *> *presets =
-            [NSMutableArray arrayWithArray:@[@(350), @(650), @(1000), @(2000)]];
-        if (![presets containsObject:@(o.thinkMs)]) [presets insertObject:@(o.thinkMs) atIndex:0];
-        for (NSNumber *n in presets) {
-            JJSheetRow *r = [JJSheetRow action:[NSString stringWithFormat:@"%@ ms", n]
-                                            symbol:@"bolt.horizontal"
-                                            detail:nil
-                                           handler:^(JJSheetRow *row) {
-                __strong typeof(ws) s2 = ws;
-                if (!s2) return;
-                [s2 applyThinkMs:n.integerValue announce:YES];
-                /* 预设点完同步步进器的显示值，避免同屏两个数字不一致 */
-                step.detail = [NSString stringWithFormat:@"%ld ms",
-                               (long)[JJEngineOptions shared].thinkMs];
-                for (JJSheetRow *rr in rows) {
-                    if (rr.kind == JJSheetRowKindAction) rr.on = NO;
-                }
-                row.on = YES;
-                [s2 refreshActiveSheet];
-            }];
-            r.on = (n.integerValue == o.thinkMs);
-            [rows addObject:r];
-        }
-    }
-
-    [rows addObject:[JJSheetRow action:JJCopySheetDone symbol:nil detail:nil handler:^(JJSheetRow *row) {
-        __strong typeof(ws) s2 = ws;
-        if (!s2) return;
-        [s2.ballWindow dismissSheet];
-        JJEngineOptions *oo = [JJEngineOptions shared];
-        [s2.ballWindow toast:(oo.thinkDepth > 0
-            ? [NSString stringWithFormat:@"思考深度 %ld 层", (long)oo.thinkDepth]
-            : [NSString stringWithFormat:@"思考时间 %ld ms", (long)oo.thinkMs])];
-        (void)row;
-    }]];
-
-    [self presentSheetTitled:JJCopySheetThinkTitle
-                    subtitle:[o summary]
-                        rows:rows];
-    NSLog(@"[JJCheat] 打开思考面板（%@）", byDepth ? @"深度模式" : @"时间模式");
-}
-
 - (void)showEngineOptionsSheet {
     if (!self.enabled) {
         [self.ballWindow toast:JJCopyNeedPluginOn];
@@ -1668,20 +1467,6 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
     /* 2.0.0r12：着法链记账（双轨之一）。每新增一步打一行，
        带「谁走的 / 中文记谱 / 靠什么判出来的 / 链是否被重锚污染」。
        界面上不显示，出问题时从这里回溯。 */
-    /* ★ 2.0.0r17：走子标记丢失提示。
-       差分闸门收紧后，如果这套皮肤彻底不画白点白圈，整局都不会推进
-       （这是刻意的：宁可停，也不拿脏帧推锚盘）。必须让用户知道该怎么做。 */
-    if ([result[@"markerLost"] integerValue] != 0) {
-        NSTimeInterval mNow = [[NSDate date] timeIntervalSince1970];
-        if (mNow - self.lastMarkerLostTs > 60) {
-            self.lastMarkerLostTs = mNow;
-            [self.ballWindow toast:@"读不到走子标记 · 请点菜单「重新同步」"];
-            NSLog(@"[JJCheat] 走子标记丢失：ringAge=%@ ringMax=%@ diffReject=%@",
-                  result[@"ringAge"] ?: @"-", result[@"ringMax"] ?: @"-",
-                  result[@"diffRejected"] ?: @"-");
-        }
-    }
-
     /* 2.0.0r13：皮肤提示。本插件只对原始皮肤做模板，换皮肤后亮度分布会偏移，
        识别会明显变差。这里只提示、不阻断（皮肤可能只是明暗不同），
        5 分钟内最多提示一次。 */
@@ -1735,7 +1520,7 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
                     @"uci": uci,
                     @"zh": zh ?: @"",
                     @"fen": fenBefore ?: @"",
-                    @"src": result[@"chainDirty"] ? @"resync" : @"marker",
+                    @"src": result[@"chainDirty"] ? @"resync" : @"enum",
                     @"gain": result[@"gain"] ?: @0,
                     @"ts": @((long long)([[NSDate date] timeIntervalSince1970] * 1000))
                 }];

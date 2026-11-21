@@ -274,37 +274,103 @@ function boardFenToCodes(fen) {
  *
  * @returns {{changed:number, move:object|null, noise:Array}}
  */
-function analyzeStepDiff(prev, cur) {
-  var changed = [];
-  for (var i = 0; i < 90; i++) {
-    if ((prev[i] || 0) !== (cur[i] || 0)) changed.push(i);
-  }
-  if (changed.length === 0) return { changed: 0, move: null, noise: [] };
-  var none = { changed: changed.length, move: null, noise: changed };
-  if (changed.length > 3) return none;   // 2.0.0r8：阈值 6→3（一步棋只改 2 格）
+/* ============================================================
+ *  枚举式走子检测
+ *
+ *  移植自原项目 lichengyang51/jjcheat 的 src/vision/tracker.js -> MoveTracker.tryAdvance()。
+ *  原项目 README 的原话解释了它为什么可靠：
+ *    「它不认字。程序只需要判断每个交叉点是空 / 有红子 / 有黑子三种情况之一，
+ *      兵种身份全部由规则反推出来 —— 规则本身就把身份锁死了。」
+ *
+ *  做法：拿锚盘枚举**全部合法走法**（通常 40 个左右），逐个模拟，
+ *        压成三分类图（0 空 / 1 红 / 2 黑）跟本帧对比；
+ *        起点与终点是「签名格」，对不上重罚（权重 10 倍），其余格算噪声。
+ *        硬门槛：签名格最多错 1 个、噪声格最多错 4 个。
+ *
+ *  与「差分」的本质区别：
+ *    候选空间是**全部合法走法**，不是从「一格变空 + 一格有差异」推出来的**一个**猜测。
+ *    所以它自带追赶能力 —— 锚盘落后几步就连续调几次，每次都被规则约束住，
+ *    不会像标记法那样「落后一步就永远追不上」。
+ *
+ *  @param {Array|Int8Array} anchorCodes 锚盘（15 类编码）
+ *  @param {Int8Array} gridNow           本帧三分类图（0/1/2）
+ *  @param {string} side                 该谁走：'w' 红 / 'b' 黑
+ *  @param {number} [maxNoise=4]         噪声格容限
+ *  @returns {{noChange:true,diff:number}|{move:number,sig:number,noise:number,candidates:number,diff:number}|null}
+ *           null = 没有任何合法走法能匹配（识别不可信）
+ * ============================================================ */
+function enumerateAdvance(anchorCodes, gridNow, side, maxNoise) {
+  const tol = (typeof maxNoise === 'number') ? maxNoise : 4;
 
-  var best = null;
-  for (var a = 0; a < changed.length; a++) {
-    var from = changed[a];
-    var piece = prev[from] || 0;
-    if (!piece || (cur[from] || 0) !== 0) continue;
-    for (var b = 0; b < changed.length; b++) {
-      if (b === a) continue;
-      var to = changed[b];
-      if ((cur[to] || 0) !== piece) continue;
-      var captured = prev[to] || 0;
-      if (captured === piece) continue;
-      // 不能吃己方棋子
-      if (captured && ((captured <= 7) === (piece <= 7))) continue;
-      var noise = changed.filter(function (x) { return x !== from && x !== to; });
-      var cand = { from: from, to: to, piece: piece, captured: captured, noise: noise };
-      if (!best || noise.length < best.noise.length) best = cand;
+  /* ★ 坐标系（2.0.0r32 实测确认，别再动）：
+     POS.Position 的 setFen 是 `this.board[r * 9 + c]`，r 直接就是 FEN 的行号，
+     所以 **pos.board 与 codes / boardFenToCodes 完全同序**（row0 = FEN 第一行 = 黑方底线）。
+     实测：开局时两者 90 格零差异。
+     genLegalMoves 也一样——开局（'w' 红先）第一条是 row6→row5 的红兵进一，完全正确。
+     结论：这里**不需要任何翻转**，三分类图直接用原下标跟 pos.board 比。 */
+  const cur = new Int8Array(90);
+  for (let i = 0; i < 90; i++) {
+    const v = anchorCodes[i] || 0;
+    cur[i] = v ? (v <= 7 ? 1 : 2) : 0;
+  }
+
+  // ① 结构分类：没有「有子→空 且 空→有子」的移动结构，就不是走子
+  let emptied = 0, filled = 0, chg = 0;
+  for (let sq = 0; sq < 90; sq++) {
+    const a = cur[sq], b = gridNow[sq];
+    if (a === b) continue;
+    if (a === 0) filled++;
+    else if (b === 0) emptied++;
+    else chg++;
+  }
+  const totalDiff = emptied + filled + chg;
+  if (totalDiff === 0) return { noChange: true, diff: 0 };
+  if (emptied === 0 && filled === 0) return { noChange: true, diff: totalDiff };
+
+  // ② 枚举全部合法走法，逐个模拟比对
+  let pos, moves;
+  try {
+    pos = new POS.Position(codesToBoardFen(anchorCodes) + ' ' + (side || 'w') + ' - - 0 1');
+    moves = pos.genLegalMoves();
+  } catch (e) {
+    return null;
+  }
+  if (!moves || !moves.length) return null;
+
+  let best = 0, bestScore = 1e9, bestSig = 99, bestNoise = 99, bestCount = 0;
+  const g2 = new Int8Array(90);
+  for (let mi = 0; mi < moves.length; mi++) {
+    const m = moves[mi];
+    const from = C.mvFrom(m), to = C.mvTo(m);
+    const cap = pos.makeMove(m);
+    const bd = pos.board;
+    for (let q = 0; q < 90; q++) {
+      const pv = bd[q] || 0;
+      g2[q] = pv ? (pv <= 7 ? 1 : 2) : 0;
+    }
+    pos.unmakeMove(m, cap);
+
+    let sig = 0, noise = 0;
+    for (let sq2 = 0; sq2 < 90; sq2++) {
+      if (g2[sq2] === gridNow[sq2]) continue;
+      if (sq2 === from || sq2 === to) sig++;
+      else noise++;
+    }
+    if (sig > 1 || noise > tol) continue;      // 硬门槛
+    const score = sig * 10 + noise;            // 签名格权重 10 倍
+    if (score < bestScore) {
+      bestScore = score; best = m;
+      bestSig = sig; bestNoise = noise; bestCount = 1;
+    } else if (score === bestScore) {
+      bestCount++;
     }
   }
-  if (!best) return none;
-  return { changed: changed.length, move: best, noise: best.noise };
+  if (!best) return null;
+  return { move: best, sig: bestSig, noise: bestNoise, candidates: bestCount, diff: totalDiff };
 }
 
+/* 2.0.0r34：analyzeStepDiff 已删除。走子判定只认 enumerateAdvance；
+   帧差异统计改用 countCodesDiff，不再需要「配对出一手棋」这套副作用。 */
 /**
  * 两帧 codes 的差异格数（换局重锚用）。
  * 真机模板每帧抖 3~8 格，逐格签名「完全相同」几乎不可能凑齐连续 3 帧；
@@ -407,7 +473,7 @@ module.exports = {
   codesPositionPlausible,
   codesEngineSafe,
   stepIsRuleLegal,
-  analyzeStepDiff,
+  enumerateAdvance,
   countCodesDiff,
   countOccupancyDiff,
   repairCodesQuota

@@ -482,11 +482,17 @@ function findPeaks1D(proj, len, minGap, relTh) {
  *  由「棋子圆盘全格对齐搜索」在多张真实截图上反解，再用逐格真值验证
  *  （450 格只错 1 格），是所有样本共同收敛到的同一组值。
  *  用它当定位起点：命中数够就直接采用，避免被遮挡物带偏。 */
+/* 归一化先验（棋盘四角相对整帧的比例）—— 采用原项目 lichengyang51/jjcheat
+ * 从 5 张真实截图反解出来的值：
+ *     x0/W=0.0666  cw/W=0.1078  y0/H=0.2773  ch/H=0.0484
+ * 它只是 refineByPieces 的**搜索起点**，后面还有三级搜索
+ * （粗 → 中 → 超细，格距 ±0.4%、起点 ±0.02 格）会收敛到本机真实位置，
+ * 所以机型差异会被修正，不必按机器各存一套。 */
 const BOARD_PRIOR = {
-  x0: 0.065731,
-  cw: 0.108391,
-  y0: 0.277100,
-  ch: 0.048350
+  x0: 0.0666,
+  cw: 0.1078,
+  y0: 0.2773,
+  ch: 0.0484
 };
 
 /** 棋子圆盘掩码 + 积分图（用来 O(1) 求任意方框内的圆盘密度） */
@@ -1361,104 +1367,6 @@ class BoardRecognizer {
   }
 
   /**
-   * ★ 2.1.90：检测「上一步标记」外环 —— 移植 XiangqiCoach 的核心思路。
-   *
-   * JJ 象棋会在**最后一步的落点**（部分皮肤连起点一起）画一个高亮圈。
-   * 这个圈正好落在半径 0.36~0.52 cell 处，而主采样只覆盖 ±0.34 cell，
-   * 所以过去一直"看不见"它，只能当干扰去滤。其实它是全画面里**最有用的信号**：
-   * 圈画在哪一格，就说明哪一格刚刚落子 —— 落点、走子方、轮次全都能直接得到，
-   * 不必再靠"差分配对 + 规则校验"去猜，也就不会因为某一格读错而永久卡死。
-   *
-   * 只认「高饱和红 / 亮金」两种典型标记色：木色盘面（低饱和暖色）和
-   * 棋子底色都够不上这两个判据。实测有圈 ≈ 0.6，空位/普通棋子 < 0.1。
-   *
-   * 返回该格外环的高亮像素占比（0~1）。
-   */
-  sampleRing(pixels, w, h, cx, cy, cell, gain) {
-    /* ★ 2.1.95：改用「环提升对比」，参考 XiangqiCoach 的 LastMoveRecognizer。
-     *
-     * 它不数"白色像素"，而是比较**环带（0.44~0.53 cell）与圈外（0.60~0.70）的中性色**：
-     * 有白圈时环上明显更"白"，没圈时两者差不多。这样对整体亮度/色温不敏感 ——
-     * 真机抓帧要过 H.264，白圈会被压缩削弱，绝对白色阈值（L>200）在真机上根本抓不到。
-     *
-     * 中性色 = min(R,G,B)/max(R,G,B)，衡量"灰白程度"而不是亮度，
-     * 木色盘面（暖色、饱和度不低）和红黑字都不会被误判。
-     *
-     * 返回 24 个方向平均的「环上 - 环外」中性色差（-1~1）。
-     * 真机实测：有白圈 0.084、普通格最高 0.039、负值居多 —— 取 0.06 作阈值。
-     */
-    let total = 0;
-    for (let i = 0; i < 24; i++) {
-      const a = i * Math.PI / 12;
-      const ca = Math.cos(a), sa = Math.sin(a);
-      let pIn = 0, pOut = 0;
-      for (let k = 0; k < 4; k++) {
-        let rr = cell * (0.44 + 0.03 * k);
-        let x = Math.round(cx + ca * rr), y = Math.round(cy + sa * rr);
-        if (x >= 1 && y >= 1 && x < w - 1 && y < h - 1) {
-          const q = (y * w + x) * 4;
-          let R = pixels[q], G = pixels[q + 1], B = pixels[q + 2];
-          if (gain !== 1) {
-            R = R * gain > 255 ? 255 : (R * gain) | 0;
-            G = G * gain > 255 ? 255 : (G * gain) | 0;
-            B = B * gain > 255 ? 255 : (B * gain) | 0;
-          }
-          const mx = Math.max(R, G, B);
-          const nv = mx ? (Math.min(R, G, B) / mx) : 0;
-          if (nv > pIn) pIn = nv;
-        }
-        rr = cell * (0.60 + 0.0333 * k);
-        x = Math.round(cx + ca * rr); y = Math.round(cy + sa * rr);
-        if (x >= 1 && y >= 1 && x < w - 1 && y < h - 1) {
-          const q = (y * w + x) * 4;
-          let R = pixels[q], G = pixels[q + 1], B = pixels[q + 2];
-          if (gain !== 1) {
-            R = R * gain > 255 ? 255 : (R * gain) | 0;
-            G = G * gain > 255 ? 255 : (G * gain) | 0;
-            B = B * gain > 255 ? 255 : (B * gain) | 0;
-          }
-          const mx = Math.max(R, G, B);
-          const nv = mx ? (Math.min(R, G, B) / mx) : 0;
-          if (nv > pOut) pOut = nv;
-        }
-      }
-      total += (pIn - pOut);
-    }
-    return total / 24;
-  }
-
-  /**
-   * ★ 2.1.92：检测「起点白点」。
-   *
-   * 游戏除了在落点画白圈，还会在**起点那一格（此时已空）的中心**点一个小白点。
-   * 两者凑齐就是一条完整的「上一步」：白点 = from，白圈 = to —— 不用反推。
-   * 空格中心本来是木色（不白），所以这个判据在空位上格外干净：
-   * 实测起点 53、普通空位 0、有子格 9~43（有子格会因为棋子面偏亮而虚高，但那些格有子，直接跳过）。
-   *
-   * 返回中心区白色像素个数。
-   */
-  sampleCenterWhite(pixels, w, h, cx, cy, gain) {
-    let cnt = 0;
-    for (let dy = -8; dy <= 8; dy += 2) {
-      for (let dx = -8; dx <= 8; dx += 2) {
-        const x = cx + dx, y = cy + dy;
-        if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) continue;
-        const p = (y * w + x) * 4;
-        let R = pixels[p], G = pixels[p + 1], B = pixels[p + 2];
-        if (gain !== 1) {
-          R = R * gain > 255 ? 255 : (R * gain) | 0;
-          G = G * gain > 255 ? 255 : (G * gain) | 0;
-          B = B * gain > 255 ? 255 : (B * gain) | 0;
-        }
-        const L = 0.299 * R + 0.587 * G + 0.114 * B;
-        const sat = Math.max(R, G, B) - Math.min(R, G, B);
-        if (L > 200 && sat < 60) cnt++;
-      }
-    }
-    return cnt;
-  }
-
-  /**
    * ★ 2.1.96：**真正的自动标定** —— 直接从画面反解棋盘网格。
    *
    * 为什么需要：原来的「自动标定」其实是「学模板」，网格沿用上一次手动点的四角，
@@ -1531,15 +1439,7 @@ class BoardRecognizer {
 
     /* 2.1.90：顺手把每格的「上一步标记」外环占比算出来。
        90 格 × 24 角度 × 3 半径 = 6480 次采样，比模板匹配便宜得多。 */
-    const rings = new Float32Array(90);
-    const centers = new Float32Array(90);
-    for (let rq = 0; rq < 90; rq++) {
-      const px = pts[rq * 2], py = pts[rq * 2 + 1];
-      rings[rq] = this.sampleRing(pixels, w, h, px, py, cell, gain);
-      centers[rq] = this.sampleCenterWhite(pixels, w, h, px, py, gain);
-    }
-    this.lastRings = rings;
-    this.lastCenters = centers;
+    /* 2.0.0r33：白圈/白点采样已删除（走子只用枚举法） */
     // 浮窗（画中画）会一起被截进截图里，盖住的那几格读出来一定是浮窗自己的画面，
     // 所以整格作废（保留上一帧的值），而不是拿去识别。
     this.pipRect = findPipRect(pixels, w, h, pts);
@@ -2250,7 +2150,7 @@ class BoardRecognizer {
     this.lastConf = Array.prototype.slice.call(conf);
     this.lastRanked = rankedCodes.map(function (a) { return a ? a.slice(0, 3) : []; });
     return { grid, conf, codes, tplFail, repaired: repaired, hidden: hidden,
-             hiddenCount: hiddenCount, rings: this.lastRings, centers: this.lastCenters };
+             hiddenCount: hiddenCount };
   }
 
   /**

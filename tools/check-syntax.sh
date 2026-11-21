@@ -156,10 +156,8 @@ if [ -f "$CTRL" ]; then
     check_case JJMenuActionResync           resyncBoard
     check_case JJMenuActionHUD             toggleHUD
     check_case JJMenuActionResetBoard      resetToStartPosition
-    check_case JJMenuActionThink           showThinkSheet
     check_case JJMenuActionEngineOptions   showEngineOptionsSheet
     check_case JJMenuActionEngineStatus    showEngineStatus
-    check_case JJMenuActionMarkerFrames    setMarkerConfirmFrames
 
     # 禁止按下标分派（case 0..9 这种）
     if grep -qE 'case [0-9]+:' "$CTRL"; then

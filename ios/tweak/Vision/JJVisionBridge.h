@@ -31,9 +31,6 @@ typedef void (^JJVisionResultBlock)(NSDictionary * _Nullable result, NSError * _
 
 /** 四点标定 [[x,y] x4]，顺序 左上/右上/右下/左下，屏幕像素坐标 */
 - (void)setCorners:(NSArray<NSArray<NSNumber *> *> *)corners;
-/** 标记确认帧数（1~30）。透传给 engine.js 的 JJEngine.setMarkerConfirmFrames，
-    真机白点白圈持久显示，调大只会更稳。返回实际生效值。 */
-- (int)setMarkerConfirmFrames:(int)frames;
 
 /** 重置到指定局面（nil = 标准开局） */
 - (void)resetWithFen:(nullable NSString *)fen;
