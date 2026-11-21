@@ -1,7 +1,7 @@
 /* ============================================================
  *  JJ象棋 辅助引擎内核 —— 单文件打包
  *  目标运行环境: iOS JavaScriptCore / Node / 浏览器
- *  生成时间: 2026-11-20T23:53:54.993Z
+ *  生成时间: 2026-11-21T07:51:50.968Z
  *  模块数: 7
  * ============================================================ */
 (function (global) {
@@ -4547,6 +4547,7 @@ var JJEngine = {
     session.optMoverHit = 0;
     session.optMoverSeq = 0;
     session.markerDoneSq = -1;
+    session.markerRelock = 0;
     session.markerDirtyAccepted = 0;
     session.markerDotMiss = 0;
     /* ★ 2.0.0r24：换局/重锚必须复位标记确认计数。
@@ -5838,6 +5839,29 @@ var JJEngine = {
            重锚，锚盘彻底乱掉（日志里 anchor 变成 2bakabnr/4r4/1cn4c1 这种东西）。
            但标记是**游戏亲手画的**、规则校验用的是**锚盘** —— 两者都不依赖这一帧的识别结果，
            所以不该被 frameClean 拦住。frameClean 只保留给 reseat / 诊断用。 */
+        /* ★ 2.0.0r31：**确认期间沿用上一次的落点**。
+           真机日志（r30, 2026-11-21 15:49:55 → 15:50:25）：
+             ring 在同一局里从 0.17 掉到 0.04、几帧后又跳回 0.17，
+             于是 mkT（按环分取最高的格）在不同格之间跳，
+             confirmKey = mkF*90+mkT 每帧都变 → hits 每次归零，
+             用户设 16 帧 / 20 帧永远凑不满，mk 卡在 confirming。
+           但标记是**持久显示**的（用户明确确认过），分数掉的不是标记消失，
+           而是识别侧波动（动画帧 / 遮挡 / 增益浮动）。
+           所以：本轮已经在确认某一手时，优先沿用它的落点 ——
+           只要那个格上还有一丁点圈分（≥ 阈值 40%），就认它。 */
+        if ((mkT < 0 || mkF < 0) && (session.markerConfirmKey || -1) > 0) {
+          var prevT2 = session.markerConfirmKey % 90;
+          var prevF2 = (session.markerConfirmKey / 90) | 0;
+          if (mkT < 0 && ringsUse && (ringsUse[prevT2] || 0) >= K.RING_MIN * 0.4) {
+            mkT = prevT2;
+            session.markerRelock = (session.markerRelock || 0) + 1;
+          }
+          if (mkF < 0 && mkT === prevT2 && centersUse
+              && (centersUse[prevF2] || 0) >= K.DOT_MIN * 0.4) {
+            mkF = prevF2;
+            session.markerRelock = (session.markerRelock || 0) + 1;
+          }
+        }
         if (mkT >= 0 && mkF >= 0 && stepIsRuleLegal(anchor, mkF, mkT)) {
           if (!frameClean) session.markerDirtyAccepted = (session.markerDirtyAccepted || 0) + 1;
           var confirmKey = mkF * 90 + mkT;
@@ -6465,6 +6489,8 @@ var JJEngine = {
        新圈已经被正确选中，这个数只是留证。 */
     out.ringDedupSkip = session.ringDedupSkip || 0;
     out.mkState = session.mkState || '-';
+    /* 2.0.0r31：本帧靠「沿用上次落点」救回来几次（圈分抖动时会出现） */
+    out.markerRelock = session.markerRelock || 0;
     /* 2.0.0r30：朝向被翻转的次数（0 = 开局锁定后从未变过，正常） */
     out.orientFlip = session.orientFlip || 0;
     out.orientLocked = session.orientLocked ? 1 : 0;
