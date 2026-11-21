@@ -108,6 +108,17 @@ command -v python3 >/dev/null || die "找不到 python3（应用源码补丁需�
 log "应用引擎补丁"
 python3 "$ROOT/engine/patch-engine.py" "$SRC/src" || die "引擎补丁没打上（源码结构与预期不符，拒绝产出坏包）"
 
+# ★ 2.0.0r34：**补丁后强制刷新 mtime**。
+#   patch-engine.py 是幂等的：源码已是目标状态时它直接跳过、不写文件，
+#   于是源码 mtime 保持"旧"于缓存里的 .o → make 认为 .o 最新、跳过重编 →
+#   链接的还是未打补丁的旧 .o → 下面「库里找不到 JJ-NNUE FAIL」的自检失败。
+#   这里统一 touch 一遍被打过补丁的源文件，让 make 必须重新编译它们。
+if [ -d "$SRC/src" ]; then
+    find "$SRC/src" -type f \( -name '*.cpp' -o -name '*.h' \) -newermt '1970-01-01' \
+        -exec touch {} + 2>/dev/null || true
+    log "已刷新引擎源码 mtime（确保补丁被重新编译）"
+fi
+
 # ---------- 编译静态库 ----------
 # 关键 flag：
 #  -fno-exceptions   Pikafish 全库按无异常编译（官方 Makefile 同款）

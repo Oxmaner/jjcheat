@@ -66,7 +66,11 @@ jobs:
         with:
           path: engine/.build
           # 补丁脚本也算缓存键：改了补丁就必须重编，不能复用旧的目标文件
-          key: pikafish-${{ env.PIKA_COMMIT }}-${{ hashFiles('engine/build-ios.sh', 'engine/patch-engine.py') }}
+          # v2 (2.0.0r34)：补丁脚本「已是目标状态」时不写文件 → 源码 mtime 不变 →
+          # make 误判 .o 最新而跳过重编，链接到缓存里未打补丁的旧 .o，
+          # 于是 build-ios.sh 的自检（库里找不到 'JJ-NNUE FAIL'）失败。
+          # 这里强制换一次 key 让缓存 miss、全量重编；build-ios.sh 里也已加了 touch。
+          key: pikafish-${{ env.PIKA_COMMIT }}-${{ hashFiles('engine/build-ios.sh', 'engine/patch-engine.py') }}-v2
           restore-keys: |
             pikafish-${{ env.PIKA_COMMIT }}-
 
