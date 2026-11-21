@@ -1571,9 +1571,16 @@ esult[@"chainDirty"] ? ... : ...。
     }
 
     /* 轮到我方且盘面可信 → 需要搜索 */
-    /* 2.0.0r35：needSearch 是 @0/@1（NSNumber），@0 在 ObjC 里非 nil，
-               三元判断恒为真 → 不该搜索时也会去取 searchFen。必须判值。 */
-            NSString *fen = [result[@"needSearch"] integerValue] ? result[@"searchFen"] : nil;
+    /* ★ 2.0.0r36：**不要**把 fen 和 needSearch 绑在一起。
+               JS 侧是 `out.searchFen = analyzeFen`（无条件赋当前局面），
+               `out.needSearch = (analyzeFen !== lastDispatchedFen) ? 1 : 0`（只在局面变化时为 1）。
+               所以 searchFen 任何时刻都是有效局面，而 needSearch 只表示「要不要重新搜」。
+               这里 fen 有两个用途：① 喂 Pikafish ② 给 HUD 显示局面。
+               r35 曾改成 `[needSearch integerValue] ? searchFen : nil` —— 局面没变时
+               fen 变成 nil，HUD 于是走兜底分支显示「未取到局面 · 请停在开局画面」（真机回归）。
+               正解：fen 无条件取 searchFen，是否开搜由下面单独用 needSearch 判断。 */
+            NSString *fen = result[@"searchFen"];
+            if (fen.length == 0) fen = nil;
     if (waiting || stalled) {
         /* 轮到对方 / 盘面不可信：不出箭头，丢掉旧结论 */
         self.engineResult = nil;
