@@ -1971,12 +1971,22 @@ var JJEngine = {
        而 lastMoverSide 在真机上被观察到会与盘面脱节（2026-11-22 12:16：
        日志 n=10 是黑方炮７进４、ply=10 也是偶数 → 该轮到红方，
        但 HUD 却显示「等待对方走子」）。单一真相优于两套互证。 */
-    var turnChar = ((session.movePly || 0) % 2 === 0) ? 'w' : 'b';
+    /* ★ 2.0.0r51：**完全回到上游模型 —— 走子方永远写「我方」**。
+       上游原文（lichengyang51/jjcheat · tools/bundle.js:885）：
+         「FEN 的走子方一律取「我方」。……你的诉求是「告诉我我该走哪步」，
+           所以引擎永远站在我方算。」
+       我们这一版曾改成「按真实轮次（红先黑后）」，于是必须维护
+       movePly / lastMoverSide / waitingOpponent 三套状态去猜"轮到谁"。
+       真机上这三者不断失步，今天那一串问题全部来自这里：
+         ply 冻结、幽灵翻面、「走子中」永久停留、执黑卡死、静止帧凑不满确认。
+       上游根本没有这个状态 —— 它不判断轮次，任何时刻都直接算"我方最佳着法"。
+       代价（与上游一致）：对手回合也会给箭头，用户自行忽略即可。 */
+    var turnChar = myTurnChar;
     var lastMoverChar = session.lastMoverSide === 'red' ? 'w'
                       : (session.lastMoverSide === 'black' ? 'b' : '');
-    var waitingOpponent = (turnChar !== myTurnChar);
-    /* prevTurnChar = 「刚才那一步」的走子方，给中文记谱用。 */
-    var prevTurnChar = ((session.movePly || 0) % 2 === 0) ? 'b' : 'w';
+    var waitingOpponent = false;
+    /* prevTurnChar = 「刚才那一步」的走子方（= 我方对面），给中文记谱用。 */
+    var prevTurnChar = (myTurnChar === 'w') ? 'b' : 'w';
 
     // 1) 尝试推进一步棋
     // ★ 画面稳定性检测
@@ -2087,7 +2097,11 @@ var JJEngine = {
     /* ★ 2.0.0r42：识别失联 → 整帧不出建议（宁可没箭头，不给错箭头）。
        真机事故：河带丢子使锚盘缺两枚兵，插件仍拿它算出「车七进五」，
        而真实盘面上那条竖线被自己的兵堵死 —— 错误箭头比没有箭头更糟。 */
-    if ((session.unexplained || 0) >= 3) {
+    /* ★ 2.0.0r51：这一条只在**识别没给出合法盘面**时才生效。
+       r42 时它是给「锚盘被误读污染」兜底的；现在主路径已经回到上游的
+       「识别定盘（settled + 合法 + 限流）」，只要本帧落地了合法盘面，
+       就不该因为锚盘的陈旧差异去拦搜索 —— 那会退化成「永远识别未收敛」。 */
+    if ((session.unexplained || 0) >= 3 && !out.recognized) {
       out.skipAnalyze = 1;
       out.skipReason = 'visionLost';
       out.needSearch = 0;
