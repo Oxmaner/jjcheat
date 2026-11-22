@@ -1292,7 +1292,7 @@ var JJEngine = {
       session.movePly = 0;
       session.plyGuessed = 0;
       session.lastMoverSide = null;    // 2.1.84：新局重锚，清空走子方记录
-      session.lastBoardFen = session.anchorFen;
+      /* r52: 上游模型 —— 盘面只由识别定盘，锚盘不再抢写 lastBoardFen */
       session.lastRawFen = session.anchorFen;
       session.lastDispatchedFen = '';
       session.prevAnchorFen = '';
@@ -1325,7 +1325,7 @@ var JJEngine = {
           session.anchorCodes = anchor;
           session.anchorFen = undoFen;
           session.anchorFlipped = !!session.flipped;
-          session.lastBoardFen = undoFen;
+          /* r52: 悔棋不再抢写 lastBoardFen（识别定盘会自动跟上） */
           session.lastRawFen = undoFen;
           session.lastDispatchedFen = '';
           session.movePly = Math.max(0, (session.movePly || 0) - 1);
@@ -1372,7 +1372,7 @@ var JJEngine = {
         session.anchorCodes = anchor;
         session.anchorFen = codesToBoardFen(anchor);
         session.anchorFlipped = !!session.flipped;
-        session.lastBoardFen = session.anchorFen;
+        /* r52: 上游模型 —— 盘面只由识别定盘，锚盘不再抢写 lastBoardFen */
         session.lastRawFen = session.anchorFen;
         session.lastDispatchedFen = '';
         /* 没学过开局（中途进对局）：轮次无从得知，假设正好轮到我方，
@@ -1392,7 +1392,7 @@ var JJEngine = {
         session.anchorCodes = anchor;
         session.anchorFen = codesToBoardFen(anchor);
         session.anchorFlipped = !!session.flipped;
-        session.lastBoardFen = session.anchorFen;
+        /* r52: 上游模型 —— 盘面只由识别定盘，锚盘不再抢写 lastBoardFen */
         session.lastDispatchedFen = '';
         session.reseatPrev = null;
         session.reseatCount = 0;
@@ -1436,7 +1436,7 @@ var JJEngine = {
             session.anchorCodes = anchor;
             session.anchorFen = codesToBoardFen(anchor);
             session.anchorFlipped = !!session.flipped;
-            session.lastBoardFen = session.anchorFen;
+            /* r52: 上游模型 —— 盘面只由识别定盘，锚盘不再抢写 lastBoardFen */
             session.lastRawFen = session.anchorFen;
             session.lastDispatchedFen = '';
             session.driftStable = 0;
@@ -1835,7 +1835,7 @@ var JJEngine = {
               session.anchorCodes = anchor;
               session.anchorFen = codesToBoardFen(anchor);
               session.prevAnchorFen = '';
-              session.lastBoardFen = session.anchorFen;
+              /* r52: 上游模型 —— 盘面只由识别定盘，锚盘不再抢写 lastBoardFen */
               session.lastDispatchedFen = '';
               session.ruleFail = 0;
               session.reseatDone = 1;
