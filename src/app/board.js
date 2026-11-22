@@ -350,12 +350,23 @@ function enumerateAdvance(anchorCodes, gridNow, side, maxNoise) {
     }
     pos.unmakeMove(m, cap);
 
-    let sig = 0, noise = 0;
+    let sig = 0, noise = 0, extraEmp = 0, extraFil = 0;
+    /* ★ 2.0.0r37：**不允许把「一整步棋」当成噪声吞掉**。
+       真机证据（2026-11-22 09:53）：用户走马、AI 回卒，盘面与锚盘差两步。
+       单步枚举把「卒」认对了，把「马那两格」（一格清空 + 一格凭空多子）
+       算成 2 格噪声 —— noise<=4 照单全收 → 只提交了卒。锚盘从此缺一匹马，
+       之后每一步建议都是错的（实测喂给引擎的 FEN 里红马还在原位，
+       却照样给出「相七进九」）。
+       判据：噪声里若恰好出现「一格被清空 + 一格凭空多子」，那就是**另一步棋**
+       的形状，单步解释不完整 → 丢弃该候选，交给两步枚举，或这帧不下结论。 */
     for (let sq2 = 0; sq2 < 90; sq2++) {
       if (g2[sq2] === gridNow[sq2]) continue;
-      if (sq2 === from || sq2 === to) sig++;
-      else noise++;
+      if (sq2 === from || sq2 === to) { sig++; continue; }
+      noise++;
+      if (cur[sq2] !== 0 && gridNow[sq2] === 0) extraEmp++;
+      else if (cur[sq2] === 0 && gridNow[sq2] !== 0) extraFil++;
     }
+    if (extraEmp === 1 && extraFil === 1) continue;   // 噪声里另有一步棋 → 不是单步
     if (sig > 1 || noise > tol) continue;      // 硬门槛
     const score = sig * 10 + noise;            // 签名格权重 10 倍
     if (score < bestScore) {
@@ -369,9 +380,107 @@ function enumerateAdvance(anchorCodes, gridNow, side, maxNoise) {
   return { move: best, sig: bestSig, noise: bestNoise, candidates: bestCount, diff: totalDiff };
 }
 
-/* 2.0.0r34：analyzeStepDiff 已删除。走子判定只认 enumerateAdvance；
-   帧差异统计改用 countCodesDiff，不再需要「配对出一手棋」这套副作用。 */
 /**
+ * ============================================================
+ *  两步枚举式走子检测（2.0.0r37）
+ *
+ *  为什么需要它：人机对战里 AI 回子极快（引擎 650ms，落子动画不到 1s），
+ *  而 enumerateAdvance 的「同一走法连续 3 帧」确认要 3 帧。等确认凑满，
+ *  盘面已经同时包含「我方这一步 + 对方回应」，与锚盘差 **两步**，
+ *  任何单步合法走法都不可能匹配 → 枚举必然返回 null
+ *  → 上层走「整盘吸收」把锚盘换掉 → ply / 走子方 / 锚盘三者脱节 → 死锁。
+ *  真机证据（2026-11-22 09:09:42）：日志里没有任何一条「检测到走法」，
+ *  但 HUD 的 ply 从 0 变成 1，之后永久「等待对方走子 / 未取到局面」。
+ *
+ *  这不是「猜」，仍然是原项目的枚举法，只是把候选空间从「一步」扩到
+ *  「两步合法走法组合」（约 40×40 组），每组都真的模拟出来跟本帧比对：
+ *     · 签名格 = 两步的 from/to 共四格，权重 10 倍，最多错 1 个；
+ *     · 其余格算噪声，最多错 4 个（与单步版同阈值）；
+ *     · 最优分必须**唯一**（candidates === 1），并列一律放弃 ——
+ *       宁可这一帧不给结论，也绝不落一个可能错的走法。
+ *
+ *  @returns {{move1:number,move2:number,sig:number,noise:number,candidates:number}|null}
+ * ============================================================ */
+function enumerateAdvance2(anchorCodes, gridNow, side, maxNoise) {
+  const tol = (typeof maxNoise === 'number') ? maxNoise : 4;
+
+  var diffN = 0;
+  for (var dq = 0; dq < 90; dq++) {
+    var av = (anchorCodes[dq] || 0) ? ((anchorCodes[dq] <= 7) ? 1 : 2) : 0;
+    if (av !== gridNow[dq]) diffN++;
+  }
+  if (diffN === 0) return null;
+
+  /* 锚盘的三分类图（占位严格性判据用） */
+  var cur = new Int8Array(90);
+  for (var cq = 0; cq < 90; cq++) {
+    var cv0 = (anchorCodes[cq] || 0);
+    cur[cq] = cv0 ? (cv0 <= 7 ? 1 : 2) : 0;
+  }
+
+  var pos, moves;
+  try {
+    pos = new POS.Position(codesToBoardFen(anchorCodes) + ' ' + (side || 'w') + ' - - 0 1');
+    moves = pos.genLegalMoves();
+  } catch (e) {
+    return null;
+  }
+  if (!moves || !moves.length) return null;
+
+  var best = null, bestScore = 1e9, bestCount = 0, bestSig = 99, bestNoise = 99;
+  var g2 = new Int8Array(90);
+
+  for (var i = 0; i < moves.length; i++) {
+    var m1 = moves[i];
+    var f1 = C.mvFrom(m1), t1 = C.mvTo(m1);
+    var c1 = pos.makeMove(m1);
+    var moves2 = null;
+    try { moves2 = pos.genLegalMoves(); } catch (e2) { moves2 = null; }
+    if (moves2 && moves2.length) {
+      for (var j = 0; j < moves2.length; j++) {
+        var m2 = moves2[j];
+        var f2 = C.mvFrom(m2), t2 = C.mvTo(m2);
+        var c2 = pos.makeMove(m2);
+        var bd = pos.board;
+        for (var q = 0; q < 90; q++) {
+          var pv = bd[q] || 0;
+          g2[q] = pv ? (pv <= 7 ? 1 : 2) : 0;
+        }
+        pos.unmakeMove(m2, c2);
+
+        var sig = 0, noise = 0, extraOcc = 0;
+        for (var sq = 0; sq < 90; sq++) {
+          if (g2[sq] === gridNow[sq]) continue;
+          if (sq === f1 || sq === t1 || sq === f2 || sq === t2) { sig++; continue; }
+          noise++;
+          /* ★ 占位严格性：两步棋只可能让「两个起点变空、两个落点变有子」。
+             这四格之外再出现任何「候选说空 / 本帧说有子」的矛盾，就说明盘面上
+             不止两步变化（多为模板把某格读丢/读多），两步解释不成立 —— 放弃该候选。
+             注意：兵种/颜色认错（两边都有子，只是颜色不同）仍算 noise，不算 extraOcc，
+             因为那才是模板抖动的常态，不该因此否掉整帧。 */
+          if ((g2[sq] === 0) !== (gridNow[sq] === 0)) extraOcc++;
+        }
+        if (extraOcc > 0) continue;
+        if (sig > 1 || noise > tol) continue;      // 与单步版同样的硬门槛
+        var score = sig * 10 + noise;
+        if (score < bestScore) {
+          bestScore = score;
+          best = { move1: m1, move2: m2 };
+          bestSig = sig; bestNoise = noise; bestCount = 1;
+        } else if (score === bestScore) {
+          bestCount++;
+        }
+      }
+    }
+    pos.unmakeMove(m1, c1);
+  }
+  if (!best) return null;
+  return { move1: best.move1, move2: best.move2, sig: bestSig,
+           noise: bestNoise, candidates: bestCount };
+}
+
+/* 2.0.0r34：analyzeStepDiff 已删除。走子判定只认 enumerateAdvance；
+   帧差异统计改用 countCodesDiff，不再需要「配对出一手棋」这套副作用。 *//**
  * 两帧 codes 的差异格数（换局重锚用）。
  * 真机模板每帧抖 3~8 格，逐格签名「完全相同」几乎不可能凑齐连续 3 帧；
  * 改用差异格数阈值，既能让稳定局面收敛，又不会把单帧垃圾当新局。
@@ -474,6 +583,7 @@ module.exports = {
   codesEngineSafe,
   stepIsRuleLegal,
   enumerateAdvance,
+  enumerateAdvance2,
   countCodesDiff,
   countOccupancyDiff,
   repairCodesQuota

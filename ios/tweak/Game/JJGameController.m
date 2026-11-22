@@ -220,19 +220,25 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     self.ballWindow.onTap = ^{
         __strong typeof(weakSelf) self2 = weakSelf;
         if (!self2) return;
+        /* ★ 2.0.0r38：**点球 = 插件开 / 关**（等价于原来菜单里的「插件」那一项）。
+           原因：点球原本会弹出菜单，而菜单是压在整个棋盘上的半透明面板，
+           弹出的那一下会挡住棋子、把识别打断（用户明确要求改掉）。
+           现在点一下只切开关、不弹任何面板，开局前的棋盘识别不会被打断。
+           菜单开着时点球只负责收起菜单，避免误触把插件关掉。 */
         if (self2.ballWindow.menuVisible) {
             [self2.ballWindow hideMenu];
             return;
         }
-        if (!self2.activated && self2.enabled) [self2 activate];
-        [self2 showMenu];
+        [self2 setPluginEnabled:!self2.enabled];
     };
     self.ballWindow.onLongPress = ^{
         __strong typeof(weakSelf) self2 = weakSelf;
-        if (!self2 || !self2.enabled) return;
-        if (!self2.activated) [self2 activate];
-        /* 2.0.0r5：长按不再进四点标定，改为「换一套预设重新识别」 */
-        [self2 restartRecognition];
+        if (!self2) return;
+        /* ★ 2.0.0r38：**长按 = 打开一级菜单**。
+           原来长按是「重新识别」，那个动作菜单里已经有「重新同步」，
+           而菜单本身此前只能靠点球弹出 —— 现在两者互换，点球不再挡棋盘。 */
+        if (self2.enabled && !self2.activated) [self2 activate];
+        [self2 showMenu];
     };
     self.ballWindow.onMenuItem = ^(NSInteger action) {
         __strong typeof(weakSelf) self2 = weakSelf;
@@ -312,13 +318,9 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
        旧版每行一句「① 插件开关：开」压在棋盘上，既挡视线又要读半天。 */
     NSMutableArray<JJMenuEntry *> *arr = [NSMutableArray arrayWithCapacity:6];
 
-    /* 每项都显式带 action，不再依赖数组顺序（顺序随便排也不会错位） */
-    JJMenuEntry *e0 = [JJMenuEntry title:@"插件" symbol:@"power"];
-    e0.action = JJMenuActionPlugin;
-    e0.value = self.enabled ? @"开" : @"关";
-    e0.on = self.enabled;
-    [arr addObject:e0];
-
+    /* ★ 2.0.0r38：菜单里的「插件」开关项**已移除** —— 开关移到点球上，
+       菜单不再承担开/关职责。理由：菜单会盖住棋盘，而开/关是最常用的动作，
+       不该逼用户去开面板。 */
     /* 2.1.105：自动标定已整体移除（在你的棋盘皮肤上首尾横线被木框遮住，
        任何"自动找线"都不可靠）。原位置改为只读的插件版本号。 */
     /* 2.0.0r15：点版本号 = 清理日志。每局会生成一对 moves-/engine- 日志，

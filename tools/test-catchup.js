@@ -2,7 +2,7 @@
 /* 关键验证：锚盘落后多步时，枚举能不能连续追上来
    —— 这正是白点白圈死锁的那一环（标记一次只能证一手，枚举每步独立可分） */
 const path = require('path');
-const ROOT = 'F:/MacLin/Documents/jjcheat-patch/src';
+const ROOT = path.join(__dirname, '..', 'src');
 const B = require(path.join(ROOT, 'app/board.js'));
 const C = require(path.join(ROOT, 'cst/constants.js'));
 const POS = require(path.join(ROOT, 'cst/position.js'));

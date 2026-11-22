@@ -2,7 +2,7 @@
 /* 验证 enumerateAdvance —— 用「真实 move 编码」而不是手写 UCCI，
    因为项目里 C.sqToUcci 的 rank 是反的（见测试末尾的专项检查）。 */
 const path = require('path');
-const ROOT = 'F:/MacLin/Documents/jjcheat-patch/src';
+const ROOT = path.join(__dirname, '..', 'src');
 const B = require(path.join(ROOT, 'app/board.js'));
 const C = require(path.join(ROOT, 'cst/constants.js'));
 const POS = require(path.join(ROOT, 'cst/position.js'));

@@ -1,7 +1,7 @@
 /* ============================================================
  *  JJ象棋 辅助引擎内核 —— 单文件打包
  *  目标运行环境: iOS JavaScriptCore / Node / 浏览器
- *  生成时间: 2026-11-21T09:05:22.745Z
+ *  生成时间: 2026-11-22T01:58:02.921Z
  *  模块数: 7
  * ============================================================ */
 (function (global) {
@@ -4068,12 +4068,23 @@ function enumerateAdvance(anchorCodes, gridNow, side, maxNoise) {
     }
     pos.unmakeMove(m, cap);
 
-    let sig = 0, noise = 0;
+    let sig = 0, noise = 0, extraEmp = 0, extraFil = 0;
+    /* ★ 2.0.0r37：**不允许把「一整步棋」当成噪声吞掉**。
+       真机证据（2026-11-22 09:53）：用户走马、AI 回卒，盘面与锚盘差两步。
+       单步枚举把「卒」认对了，把「马那两格」（一格清空 + 一格凭空多子）
+       算成 2 格噪声 —— noise<=4 照单全收 → 只提交了卒。锚盘从此缺一匹马，
+       之后每一步建议都是错的（实测喂给引擎的 FEN 里红马还在原位，
+       却照样给出「相七进九」）。
+       判据：噪声里若恰好出现「一格被清空 + 一格凭空多子」，那就是**另一步棋**
+       的形状，单步解释不完整 → 丢弃该候选，交给两步枚举，或这帧不下结论。 */
     for (let sq2 = 0; sq2 < 90; sq2++) {
       if (g2[sq2] === gridNow[sq2]) continue;
-      if (sq2 === from || sq2 === to) sig++;
-      else noise++;
+      if (sq2 === from || sq2 === to) { sig++; continue; }
+      noise++;
+      if (cur[sq2] !== 0 && gridNow[sq2] === 0) extraEmp++;
+      else if (cur[sq2] === 0 && gridNow[sq2] !== 0) extraFil++;
     }
+    if (extraEmp === 1 && extraFil === 1) continue;   // 噪声里另有一步棋 → 不是单步
     if (sig > 1 || noise > tol) continue;      // 硬门槛
     const score = sig * 10 + noise;            // 签名格权重 10 倍
     if (score < bestScore) {
@@ -4087,9 +4098,107 @@ function enumerateAdvance(anchorCodes, gridNow, side, maxNoise) {
   return { move: best, sig: bestSig, noise: bestNoise, candidates: bestCount, diff: totalDiff };
 }
 
-/* 2.0.0r34：analyzeStepDiff 已删除。走子判定只认 enumerateAdvance；
-   帧差异统计改用 countCodesDiff，不再需要「配对出一手棋」这套副作用。 */
 /**
+ * ============================================================
+ *  两步枚举式走子检测（2.0.0r37）
+ *
+ *  为什么需要它：人机对战里 AI 回子极快（引擎 650ms，落子动画不到 1s），
+ *  而 enumerateAdvance 的「同一走法连续 3 帧」确认要 3 帧。等确认凑满，
+ *  盘面已经同时包含「我方这一步 + 对方回应」，与锚盘差 **两步**，
+ *  任何单步合法走法都不可能匹配 → 枚举必然返回 null
+ *  → 上层走「整盘吸收」把锚盘换掉 → ply / 走子方 / 锚盘三者脱节 → 死锁。
+ *  真机证据（2026-11-22 09:09:42）：日志里没有任何一条「检测到走法」，
+ *  但 HUD 的 ply 从 0 变成 1，之后永久「等待对方走子 / 未取到局面」。
+ *
+ *  这不是「猜」，仍然是原项目的枚举法，只是把候选空间从「一步」扩到
+ *  「两步合法走法组合」（约 40×40 组），每组都真的模拟出来跟本帧比对：
+ *     · 签名格 = 两步的 from/to 共四格，权重 10 倍，最多错 1 个；
+ *     · 其余格算噪声，最多错 4 个（与单步版同阈值）；
+ *     · 最优分必须**唯一**（candidates === 1），并列一律放弃 ——
+ *       宁可这一帧不给结论，也绝不落一个可能错的走法。
+ *
+ *  @returns {{move1:number,move2:number,sig:number,noise:number,candidates:number}|null}
+ * ============================================================ */
+function enumerateAdvance2(anchorCodes, gridNow, side, maxNoise) {
+  const tol = (typeof maxNoise === 'number') ? maxNoise : 4;
+
+  var diffN = 0;
+  for (var dq = 0; dq < 90; dq++) {
+    var av = (anchorCodes[dq] || 0) ? ((anchorCodes[dq] <= 7) ? 1 : 2) : 0;
+    if (av !== gridNow[dq]) diffN++;
+  }
+  if (diffN === 0) return null;
+
+  /* 锚盘的三分类图（占位严格性判据用） */
+  var cur = new Int8Array(90);
+  for (var cq = 0; cq < 90; cq++) {
+    var cv0 = (anchorCodes[cq] || 0);
+    cur[cq] = cv0 ? (cv0 <= 7 ? 1 : 2) : 0;
+  }
+
+  var pos, moves;
+  try {
+    pos = new POS.Position(codesToBoardFen(anchorCodes) + ' ' + (side || 'w') + ' - - 0 1');
+    moves = pos.genLegalMoves();
+  } catch (e) {
+    return null;
+  }
+  if (!moves || !moves.length) return null;
+
+  var best = null, bestScore = 1e9, bestCount = 0, bestSig = 99, bestNoise = 99;
+  var g2 = new Int8Array(90);
+
+  for (var i = 0; i < moves.length; i++) {
+    var m1 = moves[i];
+    var f1 = C.mvFrom(m1), t1 = C.mvTo(m1);
+    var c1 = pos.makeMove(m1);
+    var moves2 = null;
+    try { moves2 = pos.genLegalMoves(); } catch (e2) { moves2 = null; }
+    if (moves2 && moves2.length) {
+      for (var j = 0; j < moves2.length; j++) {
+        var m2 = moves2[j];
+        var f2 = C.mvFrom(m2), t2 = C.mvTo(m2);
+        var c2 = pos.makeMove(m2);
+        var bd = pos.board;
+        for (var q = 0; q < 90; q++) {
+          var pv = bd[q] || 0;
+          g2[q] = pv ? (pv <= 7 ? 1 : 2) : 0;
+        }
+        pos.unmakeMove(m2, c2);
+
+        var sig = 0, noise = 0, extraOcc = 0;
+        for (var sq = 0; sq < 90; sq++) {
+          if (g2[sq] === gridNow[sq]) continue;
+          if (sq === f1 || sq === t1 || sq === f2 || sq === t2) { sig++; continue; }
+          noise++;
+          /* ★ 占位严格性：两步棋只可能让「两个起点变空、两个落点变有子」。
+             这四格之外再出现任何「候选说空 / 本帧说有子」的矛盾，就说明盘面上
+             不止两步变化（多为模板把某格读丢/读多），两步解释不成立 —— 放弃该候选。
+             注意：兵种/颜色认错（两边都有子，只是颜色不同）仍算 noise，不算 extraOcc，
+             因为那才是模板抖动的常态，不该因此否掉整帧。 */
+          if ((g2[sq] === 0) !== (gridNow[sq] === 0)) extraOcc++;
+        }
+        if (extraOcc > 0) continue;
+        if (sig > 1 || noise > tol) continue;      // 与单步版同样的硬门槛
+        var score = sig * 10 + noise;
+        if (score < bestScore) {
+          bestScore = score;
+          best = { move1: m1, move2: m2 };
+          bestSig = sig; bestNoise = noise; bestCount = 1;
+        } else if (score === bestScore) {
+          bestCount++;
+        }
+      }
+    }
+    pos.unmakeMove(m1, c1);
+  }
+  if (!best) return null;
+  return { move1: best.move1, move2: best.move2, sig: bestSig,
+           noise: bestNoise, candidates: bestCount };
+}
+
+/* 2.0.0r34：analyzeStepDiff 已删除。走子判定只认 enumerateAdvance；
+   帧差异统计改用 countCodesDiff，不再需要「配对出一手棋」这套副作用。 *//**
  * 两帧 codes 的差异格数（换局重锚用）。
  * 真机模板每帧抖 3~8 格，逐格签名「完全相同」几乎不可能凑齐连续 3 帧；
  * 改用差异格数阈值，既能让稳定局面收敛，又不会把单帧垃圾当新局。
@@ -4192,6 +4301,7 @@ module.exports = {
   codesEngineSafe,
   stepIsRuleLegal,
   enumerateAdvance,
+  enumerateAdvance2,
   countCodesDiff,
   countOccupancyDiff,
   repairCodesQuota
@@ -4250,6 +4360,7 @@ var codesPositionPlausible = B.codesPositionPlausible;
 var codesEngineSafe = B.codesEngineSafe;
 var stepIsRuleLegal = B.stepIsRuleLegal;
 var enumerateAdvance = B.enumerateAdvance;
+var enumerateAdvance2 = B.enumerateAdvance2;
 var countCodesDiff = B.countCodesDiff;
 var countOccupancyDiff = B.countOccupancyDiff;
 var repairCodesQuota = B.repairCodesQuota;
@@ -5518,7 +5629,17 @@ var JJEngine = {
           for (var dq = 0; dq < 90; dq++) driftKey = ((driftKey * 31) + (engCodes[dq] || 0)) | 0;
           if (session.driftKey === driftKey) session.driftStable = (session.driftStable || 0) + 1;
           else { session.driftStable = 1; session.driftKey = driftKey; }
-          if (session.driftStable >= 3) {
+          /* ★ 2.0.0r37：**整盘吸收已停用**（用户定下的原则：不能靠猜）。
+             这一段原本在「差 4~7 格 + 连续 3 帧一致」时把锚盘整体换成当前识别。
+             问题是：一次识别抖动叠上一步真走子，正好落在 4~7 格区间，
+             于是真走子被当成"漂移"吞进锚盘 —— 锚盘看起来对了，但
+             ply / 走子方一个都没记（HUD 的 d 归 0、p 不动，就是这个状态）。
+             证据：2026-11-22 09:31~09:34，AI 走了一步「退砲」，插件再没跟上，
+             d=0、p=11 冻结，moves.log 里没有对应记录。
+             现在只保留计数用于诊断，不采纳：锚盘只能由「枚举出的合法走法」
+             推进（一步或两步）；追不上就一直保持旧锚盘并等下一帧 ——
+             按最坏情况标准，宁可暂时没箭头，也不要一个错的锚盘。 */
+          if (false && session.driftStable >= 3) {
             anchor = Array.prototype.slice.call(engCodes);
             session.anchorCodes = anchor;
             session.anchorFen = codesToBoardFen(anchor);
@@ -5663,47 +5784,141 @@ var JJEngine = {
          （sig<=1、noise<=4、签名格权重 10 倍），找不到就返回 null，什么都不做。
          它自带追赶能力 —— 锚盘落后几步就连续调几次，每次都被规则约束住。 */
       if (!stepInfo.move && !reseat && grid) {
-        var sideNow = ((session.movePly || 0) % 2 === 0) ? 'w' : 'b';
-        var ea = null;
+        /* ★ 2.0.0r37 结论（真机验证后修正）：
+           走子方**必须**回到 ply 奇偶，不能跟 lastMoverSide。
+           理由：lastMoverSide 会被「乐观轮次」写（那是个猜，不是已提交的一步），
+           而乐观翻转只看某一半区有没有像素变化 —— 红半区一次重绘就能把它写脏，
+           于是枚举会去找**错误一方**的合法走法，我方的棋永远匹配不上（现场实测：
+           09:09:39 心跳还是 ply=0 turn=w wait=0，10 秒后自己变成「等待对方走子」）。
+           ply 只在「一步/两步被正式提交」时 +1/+2，所以它的奇偶才是可靠真相。
+           对手那步认不出来的问题，改由 enumerateAdvance2 的「两步解释」解决，
+           而不是靠改走子方。 */
+        /* ★ 2.0.0r37：走子方**优先用 lastMoverSide**（只由已提交的一步写入），
+           ply 只在完全没有走子记录时兜底。
+           真机证据（09:47）：HUD 显示 p5 / 等待对方走子，但游戏里红方还能走子 ——
+           说明"5 手"比真实手数多了一步，ply 奇偶于是指向了错误的一方，
+           枚举永远不会匹配。ply 是计数器、会累积误差；lastMoverSide 是
+           "最近一次真实提交的执行者"，不会累积。 */
+        var lastMoverCharE = session.lastMoverSide === 'red' ? 'w'
+                           : (session.lastMoverSide === 'black' ? 'b' : '');
+        var sideNow = lastMoverCharE
+          ? (lastMoverCharE === 'w' ? 'b' : 'w')
+          : (((session.movePly || 0) % 2 === 0) ? 'w' : 'b');
+        var ea = null, ea2 = null;
         try { ea = enumerateAdvance(anchor, grid, sideNow); } catch (eEA) { ea = null; }
-        /* 空图保护：整帧没有识别出任何东西时不参与判定 */
-        if (ea && !ea.noChange && ea.move) {
-          var enumKey = ea.move;
+        /* ★ 2.0.0r37：同时算「两步解释」。
+           人机 AI 回子只要 ~1 秒，而确认要 3 帧 —— 等凑满，盘面已经同时包含
+           我方一步 + 对方回应，单步枚举必然匹配不上（真机 09:09:42 的
+           「未取到局面 / p1 d0」就是这么来的）。两步枚举把候选空间扩到
+           40×40 组合法走法，仍要求签名格与占位严格吻合。 */
+        try { ea2 = enumerateAdvance2(anchor, grid, sideNow); } catch (eEA2) { ea2 = null; }
+
+        var d1Score = (ea && !ea.noChange && ea.move) ? (ea.sig * 10 + ea.noise) : 1e9;
+        var d2Ok = !!(ea2 && ea2.move1 && ea2.move2 && ea2.candidates === 1);
+        var d2Score = d2Ok ? (ea2.sig * 10 + ea2.noise) : 1e9;
+        /* 只有两步解释**严格更优**才采用；打平时保守选单步（少一个假设）。 */
+        var useTwo = d2Ok && (d2Score < d1Score);
+
+        var d1Usable = (d1Score < 1e9) && (ea && ea.candidates === 1);
+        var enumKey = null;
+        if (useTwo) enumKey = 'e2:' + ea2.move1 + ':' + ea2.move2;
+        else if (d1Usable) enumKey = 'e1:' + ea.move;
+
+        /* ★ 2.0.0r37：**唯一解一帧即提交，不再等 3 帧**。
+           真机证据（2026-11-22 09:31~09:34）：11 手连续跟对之后，AI 走了一步
+           「退砲」，插件再没跟上，d 归 0（锚盘被整盘吸收）、p 冻在 11。
+           syslog 只有「画面静止 · 跳过本帧」—— 走完棋画面立刻静止，
+           **JS 根本不会再被调用**，enumHits 永远凑不到 3，确认机制等于失效。
+           3 帧确认的前提是"帧会持续来"，这个前提在真机上不成立。
+           现在改为：只要这一步是**唯一**的合法解释（candidates===1）且满足
+           签名格/噪声门槛，就当帧提交 —— 宁可依赖"唯一性"，也不再依赖帧数。
+           不唯一的帧仍然一律放弃（并列 = 无法确定，绝不硬选）。 */
+        var enumNeedHits = 1;
+        /* ★ 2.0.0r37 诊断版：把枚举内部数值塞进 HUD 的 d / r 两个字段，
+           真机截图就能读出「单步找到没 / sig / noise / 两步成不成 / 有没有 key」，
+           不用再靠推理。测完这一段要删掉（见 r37-final 注释）。 */
+        var d1Has = (d1Score < 1e9);
+        session.dbgD = d1Has ? (Math.min(ea.sig, 9) * 10 + Math.min(ea.noise, 9)) : 99;
+        session.dbgR = (useTwo ? 4 : 0) + (d2Ok ? 2 : 0) + (enumKey !== null ? 1 : 0);
+        if (enumKey !== null) {
           if (session.enumKey === enumKey) {
             session.enumHits = (session.enumHits || 0) + 1;
           } else {
             session.enumKey = enumKey;
             session.enumHits = 1;
           }
-          /* 原项目 confirmFrames = 3：同一走法连续 3 帧才落子 */
-          if (session.enumHits >= 3) {
-            var ef = C.mvFrom(ea.move), et = C.mvTo(ea.move);
-            var epf = anchor[ef] || 0;
-            var capE = anchor[et] || 0;
-            var nxE = anchor.slice();
-            nxE[ef] = 0;
-            nxE[et] = epf;
-            if (epf && codesLegal(nxE) && codesPositionPlausible(nxE)) {
-              session.prevAnchorFen = session.anchorFen;
-              anchor = nxE;
-              session.anchorCodes = anchor;
-              session.anchorFen = codesToBoardFen(anchor);
-              session.lastMoveText = C.sqToUcci(ef) + C.sqToUcci(et);
-              if (!session.plyGuessed) session.movePly = (session.movePly || 0) + 1;
-              session.plyGuessed = 0;
-              session.ruleFail = 0;
-              session.lastMoverSide = (epf <= 7) ? 'red' : 'black';
-              session.turnUpdated = 1;
-              session.enumAccepted = (session.enumAccepted || 0) + 1;
-              session.enumSig = ea.sig;
-              session.enumNoise = ea.noise;
-              recordMove(session, ef, et, epf, 'enum', session.lastMoveText);
-              stepInfo = {
-                changed: stepInfo.changed, noise: [],
-                move: { from: ef, to: et, piece: epf, captured: capE }
-              };
-              session.enumKey = 0;
-              session.enumHits = 0;
+          session.enumFast = 1;
+          /* 原项目 confirmFrames = 3：有余量时仍要求连续 3 帧同一走法 */
+          if (session.enumHits >= enumNeedHits) {
+            if (useTwo) {
+              /* ---- 两步一起提交：我方一步 + 对方回应 ---- */
+              var f1e = C.mvFrom(ea2.move1), t1e = C.mvTo(ea2.move1);
+              var p1e = anchor[f1e] || 0;
+              var midE = anchor.slice();
+              midE[f1e] = 0; midE[t1e] = p1e;
+              var f2e = C.mvFrom(ea2.move2), t2e = C.mvTo(ea2.move2);
+              var p2e = midE[f2e] || 0;
+              var cap2e = midE[t2e] || 0;
+              var nx2 = midE.slice();
+              nx2[f2e] = 0; nx2[t2e] = p2e;
+              if (p1e && p2e && codesLegal(nx2) && codesPositionPlausible(nx2)) {
+                var fenBefore2 = session.anchorFen;
+                anchor = nx2;
+                session.anchorCodes = anchor;
+                session.anchorFen = codesToBoardFen(anchor);
+                session.prevAnchorFen = fenBefore2;
+                session.lastMoveText = C.sqToUcci(f2e) + C.sqToUcci(t2e);
+                session.lastMove1Text = C.sqToUcci(f1e) + C.sqToUcci(t1e);
+                session.movePly = (session.movePly || 0) + 2;
+                session.plyGuessed = 0;
+                session.ruleFail = 0;
+                /* 走子方取**最后一步**的执行者：下一步就轮到另一方 */
+                session.lastMoverSide = (p2e <= 7) ? 'red' : 'black';
+                session.turnUpdated = 1;
+                session.enumAccepted = (session.enumAccepted || 0) + 1;
+                session.enumTwo = (session.enumTwo || 0) + 1;
+                session.enumSig = ea2.sig;
+                session.enumNoise = ea2.noise;
+                recordMove(session, f1e, t1e, p1e, 'enum2a',
+                           session.lastMove1Text);
+                recordMove(session, f2e, t2e, p2e, 'enum2b',
+                           session.lastMoveText);
+                stepInfo = {
+                  changed: stepInfo.changed, noise: [],
+                  move: { from: f2e, to: t2e, piece: p2e, captured: cap2e }
+                };
+                session.enumKey = 0;
+                session.enumHits = 0;
+              }
+            } else {
+              var ef = C.mvFrom(ea.move), et = C.mvTo(ea.move);
+              var epf = anchor[ef] || 0;
+              var capE = anchor[et] || 0;
+              var nxE = anchor.slice();
+              nxE[ef] = 0;
+              nxE[et] = epf;
+              if (epf && codesLegal(nxE) && codesPositionPlausible(nxE)) {
+                session.prevAnchorFen = session.anchorFen;
+                anchor = nxE;
+                session.anchorCodes = anchor;
+                session.anchorFen = codesToBoardFen(anchor);
+                session.lastMoveText = C.sqToUcci(ef) + C.sqToUcci(et);
+                if (!session.plyGuessed) session.movePly = (session.movePly || 0) + 1;
+                session.plyGuessed = 0;
+                session.ruleFail = 0;
+                session.lastMoverSide = (epf <= 7) ? 'red' : 'black';
+                session.turnUpdated = 1;
+                session.enumAccepted = (session.enumAccepted || 0) + 1;
+                session.enumSig = ea.sig;
+                session.enumNoise = ea.noise;
+                recordMove(session, ef, et, epf, 'enum', session.lastMoveText);
+                stepInfo = {
+                  changed: stepInfo.changed, noise: [],
+                  move: { from: ef, to: et, piece: epf, captured: capE }
+                };
+                session.enumKey = 0;
+                session.enumHits = 0;
+              }
             }
           }
         } else {
@@ -5896,7 +6111,16 @@ var JJEngine = {
         if (session.lastMoverSide && !session.turnUpdated &&
             session.flipCooldown <= 0 && dirOk) {
           session.genChgStreak = (session.genChgStreak || 0) + 1;
-          if (session.genChgStreak >= 2) {
+          /* ★ 2.0.0r37：**这一段也停用**（猜的路径不许写状态机字段）。
+             它靠"半区变化"猜谁刚走完，然后写 lastMoverSide、ply++、清着法链。
+             真机证据（2026-11-22 09:56）：用户走第一手后，
+             moves.log 里**一条着法都没有**（只有 newgame），但 HUD 已经是 p1 ——
+             就是这一段把 ply 和 lastMoverSide 推出来的。
+             而枚举现在按 lastMoverSide 定走子方，于是被这个猜带反，
+             之后永远匹配不上，卡死。
+             结论：轮次只能由「枚举提交的一步」翻面。猜出来的信号最多用于
+             显示层（乐观轮次那段，2 秒自然失效），绝不进状态机。 */
+          if (false && session.genChgStreak >= 2) {
             session.lastMoverSide = waitingOppX
               ? (session.flipped ? 'red' : 'black')
               : mySideNowX;
@@ -6034,6 +6258,9 @@ var JJEngine = {
       replacedCount: quotaFix.replaced || 0,
       droppedCount: quotaFix.dropped || 0
     };
+    /* r37 诊断：覆盖 HUD 的 d / r 显示（测完删除） */
+    if (session.dbgD !== undefined) out.diffChanged = session.dbgD;
+    if (session.dbgR !== undefined) out.anchorRejected = session.dbgR;
 
     /* 2.0.0r10：乐观轮次覆盖。
        半区变化给出的「谁刚动过」比完整配对早 1~3 秒。这里先按它把轮次翻过去，
@@ -6053,7 +6280,15 @@ var JJEngine = {
            skip=waitingOpponent 同时出现，就是这么来的）。 */
         waitingOpponent = (out.waitingOpponent == 1);
       }
-      session.lastMoverSide = session.optMoverSide;
+      /* ★ 2.0.0r37：**不再把猜出来的走子方写回 lastMoverSide**。
+         这一段是"乐观轮次"：靠半区像素变化猜谁刚动过，比完整配对早 1~3 秒。
+         它原本顺手写回 lastMoverSide，结果把"猜"混进了"事实"：
+         引擎里唯一可信的走子方记录只应该来自**已提交的一步**。
+         现场代价（2026-11-22 09:09）：心跳还是 ply=0 turn=w wait=0，
+         10 秒后 HUD 自己变成「等待对方走子」，中间没有任何走子提交 ——
+         红半区一次重绘就把轮次骗翻了，之后枚举朝错误一方去找，永不匹配。
+         现在乐观信号只作用于 out.turn / out.waitingOpponent（显示层，2 秒后自然失效），
+         不污染任何状态机字段。 */
     }
 
     session.reseatDone = 0;
@@ -6334,7 +6569,12 @@ var JJEngine = {
     if (waitingOpponent) {
       session.lastDispatchedFen = '';
       out.skipReason = 'waitingOpponent';
-      out.sideToMove = turnChar === 'w' ? 'red' : 'black';
+      /* ★ 2.0.0r37：sideToMove 在整条链路上固定语义 = **我执哪一方**，
+         轮次由 waitingOpponent 单独表达（HUD 也是这么用的，见 JJHUDWindow.m:357）。
+         旧写法在这里塞「turnChar === 'w' ? 'red' : 'black'」（改成「轮到谁走」），
+         于是 HUD 就把「黑方」显示成「你执黑」—— 真机实测用户执红时看到「黑方」，
+         误以为自己是黑方。同一个字段两种语义是纯 bug，不是设计。 */
+      out.sideToMove = mySideDetected;
       out.needSearch = 0;
       out.searchFen = '';
       return out;
