@@ -405,12 +405,19 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
         self.busy = NO;
         [[JJScreenGrabber shared] stop];
         JJMetalSetCaptureEnabled(NO);
-        [[JJPikafish shared] shutdown];
+        /* ★ 2.0.0r43：**关插件不再 shutdown 引擎，只停搜索**。
+           真机事故（2026-11-22 12:44）：点球关 → 再点球开之后，HUD 一直报
+           「引擎不可用」。原因是 shutdown 把引擎线程 quit 掉了，而重新 start
+           之后握手没能恢复（jjpika 是进程内全局流，起停一次不一定能干净重来）。
+           而这条路径本来就不该拆引擎 —— 关插件要停的是「抓帧 / 识别 / HUD」，
+           引擎留着预热，重开时才能立刻出着法（也省掉 50MB 权重的重新加载）。
+           真正要停引擎的地方是 App 退出，不是这个开关。 */
+        [[JJPikafish shared] stopSearch];
         [[JJHUDWindow shared] setHUDHidden:YES];
         [self.ballWindow setActive:NO];
         [self.ballWindow setEngineDotColor:nil];
-        [self.ballWindow toast:@"插件已关闭 · 抓帧与引擎都已停"];
-        NSLog(@"[JJCheat] 插件开关 → 关（停止抓帧 / 识别 / 引擎）");
+        [self.ballWindow toast:@"插件已关闭 · 抓帧与识别已停（引擎保活）"];
+        NSLog(@"[JJCheat] 插件开关 → 关（停止抓帧 / 识别；引擎保活，不拆权重）");
     }
 }
 
