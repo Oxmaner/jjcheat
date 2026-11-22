@@ -2359,7 +2359,12 @@ var JJEngine = {
      *   - 6 格约占 32 枚棋子的 19%，超过这个比例说明整帧整体不可信。
      * 不退避：下一帧正常就立刻恢复，不要像旧的 illegalStreak 那样歇几秒。 */
     var unsureCount = session.lowConfCount || 0;
-    if (unsureCount > JJ_MAX_UNSURE_CELLS) {
+    /* ★ 2.0.0r53：**停用「低置信度格子 > 6 就不出建议」这道闸**。
+       上游没有这道闸：它只看盘面是否合法（legalNow）。这道闸是 fork 后加的，
+       真机上反复变成死锁 —— 盘面合法、连续稳定，却因为模板分低被永久拦下
+       （执黑那局：legalNow=1 codesValid=1，skipReason=lowconf 卡到死）。
+       识别质量交给「合法盘面 + 700ms 限流 + 上游的 illegalStreak 清盘」就够了。 */
+    if (false && unsureCount > JJ_MAX_UNSURE_CELLS) {
       out.skipAnalyze = 1;
       out.skipReason = 'lowconf';
       out.unsureCount = unsureCount;
