@@ -1,7 +1,7 @@
 /* ============================================================
  *  JJ象棋 辅助引擎内核 —— 单文件打包
  *  目标运行环境: iOS JavaScriptCore / Node / 浏览器
- *  生成时间: 2026-11-22T15:55:34.911Z
+ *  生成时间: 2026-11-22T16:00:46.761Z
  *  模块数: 7
  * ============================================================ */
 (function (global) {
@@ -6671,7 +6671,19 @@ var JJEngine = {
        2.1.76 起引擎侧补丁已改为「不 exit、拒绝搜索」，但那次思考就白费了，
        所以识别侧也要自己拦住：这一帧干脆不发搜索，下一帧再来。
        注意这里只拦「喂引擎」，不影响浮窗继续显示上一帧合法盘面。 */
-    var engCheck = session.anchorCodes || null;
+    /* ★ 2.0.0r54：**这道闸必须检查"真正要喂给引擎的那个盘面"**。
+       原来检查的是 session.anchorCodes（锚盘）—— 但 r52 之后盘面由识别定盘
+       （analyzeFen 来自 session.lastBoardFen），两者可能不是同一个局面。
+       用陈旧锚盘去判「将军/王安全」，会漏拦或误拦：
+         · 漏拦 → Pikafish 拿到非法 FEN（王可被吃），整次搜索白费；
+         · 误拦 → 明明是一盘合法棋却被判 skipReason=king，HUD 直接不出箭头。
+       现在按 analyzeFen 的棋盘部分重建盘面再检查。 */
+    var engCheck = null;
+    try {
+      var boardPart = String(analyzeFen || '').split(' ')[0];
+      if (boardPart) engCheck = boardFenToCodes(boardPart);
+    } catch (eEC) { engCheck = null; }
+    if (!engCheck) engCheck = session.anchorCodes || null;
     if (engCheck && !codesEngineSafe(engCheck, turnChar === 'b' ? 'black' : 'red')) {
       out.skipReason = 'king';
       out.needSearch = 0;
