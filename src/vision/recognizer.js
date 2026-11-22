@@ -1945,6 +1945,8 @@ class BoardRecognizer {
 
       const inkR = (typeof s.inkR === 'number') ? s.inkR : 0;
       const warmR = (typeof s.warmR === 'number') ? s.warmR : 0;
+      const redInkR = (typeof s.redInkR === 'number') ? s.redInkR : 0;
+      const darkInkR = (typeof s.darkInkR === 'number') ? s.darkInkR : 0;
 
       // 【已删除「被画中画盖住的格子判未知」那段逻辑】
       //   它按「暖色占比 > 93% 且几乎无墨」+「落在浮窗矩形内」两条判据把格子抹成空。
@@ -1952,7 +1954,15 @@ class BoardRecognizer {
       //   于是半盘格子被抹空、还因为浮窗矩形框偏弹出「浮窗挡棋盘」的假提示。
       //   这条路走不通，直接去掉：格子一律按正常流程识别。
 
-      const hasInk = (inkR >= inkTh);
+      /* ★ 2.0.0r42：**河带不能用「总墨迹」判有子**（与 classifyByColor 同一处实测）。
+         「楚河 / 汉界」水纹字在空格里能造出 ≤0.108 的假墨，而站在河沿的真棋子
+         总墨迹可被水纹冲淡到 0.11~0.18 —— 区间重叠，抬高门槛必然杀掉真子
+         （真机事故：row5 两枚红兵整格丢失 → 引擎给出「车七进五」这种走不通的着法）。
+         实测红/黑墨分量干净分离：红子 redInkR 0.115~0.182（空格恒 0）；
+         黑子 darkInkR 0.177~0.209（水纹假墨 ≤0.108）。河带改为红/黑墨各自兜底。 */
+      const hasInk = isRiverRow
+        ? (inkR >= inkTh || redInkR >= 0.06 || darkInkR >= 0.15)
+        : (inkR >= inkTh);
       /* 2.1.57：盘面判据换成「偏离棋盘底色亮度」。
          原来 hasFace = warmR >= 0.28，而木色棋盘 warmR≈0.8 —— 空格全过这一关，
          只能靠下面 score<0.10 兜底；一旦模板与真机像素不同源（当前正是如此），
@@ -1969,8 +1979,7 @@ class BoardRecognizer {
       // 2) 墨迹颜色定红黑；字被遮住时退回「红色占比」
       //    优先用中心 8x8 的墨迹：外圈是「上一步」的高亮圈，
       //    圈的深色描边会被算成黑墨，把刚走过的红仕判成黑兵（实测）。
-      const redInkR = (typeof s.redInkR === 'number') ? s.redInkR : 0;
-      const darkInkR = (typeof s.darkInkR === 'number') ? s.darkInkR : 0;
+      /* redInkR / darkInkR 已在上方（河带判据）声明，这里直接复用 */
       const coreInkR = (typeof s.inkCoreR === 'number') ? s.inkCoreR : 0;
       const coreRedR = (typeof s.redInkCoreR === 'number') ? s.redInkCoreR : 0;
       const coreDarkR = (typeof s.darkInkCoreR === 'number') ? s.darkInkCoreR : 0;
@@ -2215,7 +2224,7 @@ class BoardRecognizer {
       const inkThOcc = (bg && typeof bg.inkThOcc === 'number' && bg.inkThOcc > 0)
         ? bg.inkThOcc : 0.13;
       const isRiverSq = (sq >= 4 * 9 && sq < 6 * 9);
-      const inkGate = isRiverSq ? Math.max(0.16, inkThOcc + 0.05) : inkThOcc;
+      const inkGate = inkThOcc;
       let devL = -1;
       if (lvOK) {
         const dHi = (s.meanL - bg.hiTh) / Math.max(1, bg.hiTh - bg.boardL);
@@ -2224,8 +2233,26 @@ class BoardRecognizer {
       }
       let occupied;
       if (lvOK) {
-        occupied = (inkR >= inkGate) || (devL > 0.25);
-        conf[sq] = Math.max(inkR / inkGate, devL);
+        if (isRiverSq) {
+          /* ★ 2.0.0r42：**河带不能用「总墨迹」判有子**。
+             真机实测（2026-11-22 12:24，截图 bad3）：
+               「楚河 / 汉界」水纹文字会在**空格**里产生假墨，最高 0.094（灰）；
+               而站在河沿上的真棋子，总墨迹可以被水纹冲淡到 0.108~0.18。
+               两者区间重叠 —— 旧代码为此把河带门槛抬到 0.16，结果把真棋子也判成空格
+               （那一帧 row5 的两枚红兵整格丢失，引擎据此给出「车七进五」这种
+                在真实盘面上根本走不通的着法）。
+             实测红/黑墨分量是干净分离的（同一批格子）：
+               红子 redInkR = 0.115 ~ 0.182 ；空格 redInkR 恒为 0
+               黑子 darkInkR = 0.177 ~ 0.209 ；水纹假墨 darkInkR ≤ 0.108
+             所以河带改为「红墨 / 黑墨分别判」，而不是把总墨迹门槛抬高。 */
+          var RIVER_RED_OCC = 0.06;
+          var RIVER_DARK_OCC = 0.15;
+          occupied = (redInkR >= RIVER_RED_OCC) || (darkInkR >= RIVER_DARK_OCC) ||
+                     (devL > 0.25);
+        } else {
+          occupied = (inkR >= inkGate) || (devL > 0.25);
+        }
+        conf[sq] = Math.max(inkR / Math.max(0.01, inkGate), devL);
         if (conf[sq] < 0) conf[sq] = 0;
       } else {
         occupied = (warmR >= warmTh || darkR >= o.darkFace) &&

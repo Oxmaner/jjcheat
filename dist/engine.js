@@ -1,7 +1,7 @@
 /* ============================================================
  *  JJ象棋 辅助引擎内核 —— 单文件打包
  *  目标运行环境: iOS JavaScriptCore / Node / 浏览器
- *  生成时间: 2026-11-22T01:58:02.921Z
+ *  生成时间: 2026-11-22T04:35:56.468Z
  *  模块数: 7
  * ============================================================ */
 (function (global) {
@@ -2824,6 +2824,8 @@ class BoardRecognizer {
 
       const inkR = (typeof s.inkR === 'number') ? s.inkR : 0;
       const warmR = (typeof s.warmR === 'number') ? s.warmR : 0;
+      const redInkR = (typeof s.redInkR === 'number') ? s.redInkR : 0;
+      const darkInkR = (typeof s.darkInkR === 'number') ? s.darkInkR : 0;
 
       // 【已删除「被画中画盖住的格子判未知」那段逻辑】
       //   它按「暖色占比 > 93% 且几乎无墨」+「落在浮窗矩形内」两条判据把格子抹成空。
@@ -2831,7 +2833,15 @@ class BoardRecognizer {
       //   于是半盘格子被抹空、还因为浮窗矩形框偏弹出「浮窗挡棋盘」的假提示。
       //   这条路走不通，直接去掉：格子一律按正常流程识别。
 
-      const hasInk = (inkR >= inkTh);
+      /* ★ 2.0.0r42：**河带不能用「总墨迹」判有子**（与 classifyByColor 同一处实测）。
+         「楚河 / 汉界」水纹字在空格里能造出 ≤0.108 的假墨，而站在河沿的真棋子
+         总墨迹可被水纹冲淡到 0.11~0.18 —— 区间重叠，抬高门槛必然杀掉真子
+         （真机事故：row5 两枚红兵整格丢失 → 引擎给出「车七进五」这种走不通的着法）。
+         实测红/黑墨分量干净分离：红子 redInkR 0.115~0.182（空格恒 0）；
+         黑子 darkInkR 0.177~0.209（水纹假墨 ≤0.108）。河带改为红/黑墨各自兜底。 */
+      const hasInk = isRiverRow
+        ? (inkR >= inkTh || redInkR >= 0.06 || darkInkR >= 0.15)
+        : (inkR >= inkTh);
       /* 2.1.57：盘面判据换成「偏离棋盘底色亮度」。
          原来 hasFace = warmR >= 0.28，而木色棋盘 warmR≈0.8 —— 空格全过这一关，
          只能靠下面 score<0.10 兜底；一旦模板与真机像素不同源（当前正是如此），
@@ -2848,8 +2858,7 @@ class BoardRecognizer {
       // 2) 墨迹颜色定红黑；字被遮住时退回「红色占比」
       //    优先用中心 8x8 的墨迹：外圈是「上一步」的高亮圈，
       //    圈的深色描边会被算成黑墨，把刚走过的红仕判成黑兵（实测）。
-      const redInkR = (typeof s.redInkR === 'number') ? s.redInkR : 0;
-      const darkInkR = (typeof s.darkInkR === 'number') ? s.darkInkR : 0;
+      /* redInkR / darkInkR 已在上方（河带判据）声明，这里直接复用 */
       const coreInkR = (typeof s.inkCoreR === 'number') ? s.inkCoreR : 0;
       const coreRedR = (typeof s.redInkCoreR === 'number') ? s.redInkCoreR : 0;
       const coreDarkR = (typeof s.darkInkCoreR === 'number') ? s.darkInkCoreR : 0;
@@ -3094,7 +3103,7 @@ class BoardRecognizer {
       const inkThOcc = (bg && typeof bg.inkThOcc === 'number' && bg.inkThOcc > 0)
         ? bg.inkThOcc : 0.13;
       const isRiverSq = (sq >= 4 * 9 && sq < 6 * 9);
-      const inkGate = isRiverSq ? Math.max(0.16, inkThOcc + 0.05) : inkThOcc;
+      const inkGate = inkThOcc;
       let devL = -1;
       if (lvOK) {
         const dHi = (s.meanL - bg.hiTh) / Math.max(1, bg.hiTh - bg.boardL);
@@ -3103,8 +3112,26 @@ class BoardRecognizer {
       }
       let occupied;
       if (lvOK) {
-        occupied = (inkR >= inkGate) || (devL > 0.25);
-        conf[sq] = Math.max(inkR / inkGate, devL);
+        if (isRiverSq) {
+          /* ★ 2.0.0r42：**河带不能用「总墨迹」判有子**。
+             真机实测（2026-11-22 12:24，截图 bad3）：
+               「楚河 / 汉界」水纹文字会在**空格**里产生假墨，最高 0.094（灰）；
+               而站在河沿上的真棋子，总墨迹可以被水纹冲淡到 0.108~0.18。
+               两者区间重叠 —— 旧代码为此把河带门槛抬到 0.16，结果把真棋子也判成空格
+               （那一帧 row5 的两枚红兵整格丢失，引擎据此给出「车七进五」这种
+                在真实盘面上根本走不通的着法）。
+             实测红/黑墨分量是干净分离的（同一批格子）：
+               红子 redInkR = 0.115 ~ 0.182 ；空格 redInkR 恒为 0
+               黑子 darkInkR = 0.177 ~ 0.209 ；水纹假墨 darkInkR ≤ 0.108
+             所以河带改为「红墨 / 黑墨分别判」，而不是把总墨迹门槛抬高。 */
+          var RIVER_RED_OCC = 0.06;
+          var RIVER_DARK_OCC = 0.15;
+          occupied = (redInkR >= RIVER_RED_OCC) || (darkInkR >= RIVER_DARK_OCC) ||
+                     (devL > 0.25);
+        } else {
+          occupied = (inkR >= inkGate) || (devL > 0.25);
+        }
+        conf[sq] = Math.max(inkR / Math.max(0.01, inkGate), devL);
         if (conf[sq] < 0) conf[sq] = 0;
       } else {
         occupied = (warmR >= warmTh || darkR >= o.darkFace) &&
@@ -5467,6 +5494,24 @@ var JJEngine = {
       session.optMoverHit = (session.optMoverHit || 0) + 1;
     }
     session.turnUpdated = 0;   // 2.1.91：本帧轮次是否已更新（保证一帧只翻一次）
+    /* ★ 2.0.0r41：诊断位**每帧先置未知**。
+       反例（2026-11-22 12:20）：HUD 一直显示 d0/r0，看起来"锚盘与识别完全一致"，
+       实际盘面已经差了一步马 + 一步兵。原因是这两个值是会话级变量：
+       某一帧枚举没跑（stepInfo.move 已填 / grid 为空）就沿用上一帧旧值，
+       于是「看起来全对」。现在先用 98/9 表示"本帧枚举没跑"，杜绝这种假一致。 */
+    session.dbgD = 98;
+    session.dbgR = 9;
+    /* ★ 2.0.0r42：**识别失联计数器**。
+       画面变了、但枚举给不出任何合法解释 —— 连续 3 帧还这样，说明识别结果
+       与锚盘已经对不上（真机事故：河带丢子 → 锚盘缺两枚兵 → 却继续算，
+       给出「车七进五」这种在真实盘面上根本走不通的着法）。
+       达到阈值就整帧不出建议，HUD 显示「识别未收敛·请点重来」。
+       按用户定的底线：宁可没有箭头，也绝不给错箭头。 */
+    if (stepInfo.changed > 0 && !stepInfo.move) {
+      session.unexplained = (session.unexplained || 0) + 1;
+    } else if (stepInfo.move) {
+      session.unexplained = 0;
+    }
     session.undoApplied = 0;   // 2.0.0r13：本帧是否发生了悔棋回退
     /* 2.1.93：帧序号。**不能拿 ply 当「标记是否已处理」的指纹** ——
        推进本身会改 ply，下一帧指纹立刻对不上，于是又推一次、再改 ply……
@@ -5793,17 +5838,10 @@ var JJEngine = {
            ply 只在「一步/两步被正式提交」时 +1/+2，所以它的奇偶才是可靠真相。
            对手那步认不出来的问题，改由 enumerateAdvance2 的「两步解释」解决，
            而不是靠改走子方。 */
-        /* ★ 2.0.0r37：走子方**优先用 lastMoverSide**（只由已提交的一步写入），
-           ply 只在完全没有走子记录时兜底。
-           真机证据（09:47）：HUD 显示 p5 / 等待对方走子，但游戏里红方还能走子 ——
-           说明"5 手"比真实手数多了一步，ply 奇偶于是指向了错误的一方，
-           枚举永远不会匹配。ply 是计数器、会累积误差；lastMoverSide 是
-           "最近一次真实提交的执行者"，不会累积。 */
-        var lastMoverCharE = session.lastMoverSide === 'red' ? 'w'
-                           : (session.lastMoverSide === 'black' ? 'b' : '');
-        var sideNow = lastMoverCharE
-          ? (lastMoverCharE === 'w' ? 'b' : 'w')
-          : (((session.movePly || 0) % 2 === 0) ? 'w' : 'b');
+        /* ★ 2.0.0r40：走子方与轮次判定统一用 **ply 奇偶**（单一真相）。
+           ply 现在只在「一步/两步被正式提交」时 +1/+2（猜的路径已全部停用），
+           所以它的奇偶必然等于"轮到谁"。lastMoverSide 只留作中文记谱用。 */
+        var sideNow = ((session.movePly || 0) % 2 === 0) ? 'w' : 'b';
         var ea = null, ea2 = null;
         try { ea = enumerateAdvance(anchor, grid, sideNow); } catch (eEA) { ea = null; }
         /* ★ 2.0.0r37：同时算「两步解释」。
@@ -5903,7 +5941,7 @@ var JJEngine = {
                 session.anchorCodes = anchor;
                 session.anchorFen = codesToBoardFen(anchor);
                 session.lastMoveText = C.sqToUcci(ef) + C.sqToUcci(et);
-                if (!session.plyGuessed) session.movePly = (session.movePly || 0) + 1;
+                session.movePly = (session.movePly || 0) + 1;   /* r40：ply 只由提交推进，始终 +1 */
                 session.plyGuessed = 0;
                 session.ruleFail = 0;
                 session.lastMoverSide = (epf <= 7) ? 'red' : 'black';
@@ -6011,7 +6049,7 @@ var JJEngine = {
             /* 红先黑后：每落地一步走子，轮次翻面。这也是「我执黑要等对面
                先手」的依据 —— 开局 ply=0 归红方，对面走完 ply=1 才轮到我。 */
             /* 同 18a：翻转已经给这一手记过 ply 了，确认时不再加 */
-            if (!session.plyGuessed) session.movePly = (session.movePly || 0) + 1;
+            session.movePly = (session.movePly || 0) + 1;   /* r40：ply 只由提交推进，始终 +1 */
             session.plyGuessed = 0;
             session.ruleFail = 0;
             session.turnUpdated = 1;
@@ -6180,19 +6218,18 @@ var JJEngine = {
        谁刚走完，下一步就轮到另一方。漏识别也能在下一步自愈。
        只有在完全没有走子记录时（开局 / 刚重锚），才退回 movePly 兜底。 */
     var myTurnChar = mySideDetected === 'red' ? 'w' : 'b';
-    var turnChar;
+    /* ★ 2.0.0r40：**轮次只认 ply 奇偶**。
+       理由：所有"猜"的路径（乐观轮次 / 对称翻转 / 漂移吸收）都已停用，
+       ply 现在**只在一步/两步被正式提交时** +1 / +2，奇偶必然等于"轮到谁"。
+       而 lastMoverSide 在真机上被观察到会与盘面脱节（2026-11-22 12:16：
+       日志 n=10 是黑方炮７进４、ply=10 也是偶数 → 该轮到红方，
+       但 HUD 却显示「等待对方走子」）。单一真相优于两套互证。 */
+    var turnChar = ((session.movePly || 0) % 2 === 0) ? 'w' : 'b';
     var lastMoverChar = session.lastMoverSide === 'red' ? 'w'
                       : (session.lastMoverSide === 'black' ? 'b' : '');
-    if (lastMoverChar) {
-      /* 谁刚走完，下一步就轮到另一方 —— 直接翻面，不依赖 movePly 计数。 */
-      turnChar = (lastMoverChar === 'w') ? 'b' : 'w';
-    } else {
-      turnChar = (session.movePly % 2 === 0) ? 'w' : 'b';   // 无记录时兜底
-    }
     var waitingOpponent = (turnChar !== myTurnChar);
-    /* prevTurnChar = 「刚才那一步」的走子方，给中文记谱用。
-       有真实记录就照它，否则沿用旧的 movePly-1 推导。 */
-    var prevTurnChar = lastMoverChar || (((session.movePly - 1) % 2 === 0) ? 'w' : 'b');
+    /* prevTurnChar = 「刚才那一步」的走子方，给中文记谱用。 */
+    var prevTurnChar = ((session.movePly || 0) % 2 === 0) ? 'b' : 'w';
 
     // 1) 尝试推进一步棋
     // ★ 画面稳定性检测
@@ -6266,7 +6303,14 @@ var JJEngine = {
        半区变化给出的「谁刚动过」比完整配对早 1~3 秒。这里先按它把轮次翻过去，
        窗口 15 帧（约 2 秒）后失效；同时写回 lastMoverSide，让后续帧的推导
        与它一致，不会来回打架。只在画面稳定帧才写，躲开落子动画。 */
-    if (isStable && session.optMoverSide && (session.optMoverHit || 0) >= K.OPT_HIT &&
+    /* ★ 2.0.0r40：**乐观轮次显示整体停用**。
+       它只改 out.turn / out.waitingOpponent（显示层，15 帧后自然失效）——
+       但真机上是致命坑：走完一手后画面立刻静止，上层开始「跳过本帧」，
+       **JS 不再被调用，frameSeq 不再增长** → 那个"15 帧后失效"永远不会到期
+       → HUD 冻结在"待定/等待对方走子"上（2026-11-22 12:16 实测：
+       p10 + 待定 + d0，15 秒纹丝不动，而盘面已经轮到红方）。
+       现在轮次只由「已提交的一步」决定，HUD 永远显示真实状态。 */
+    if (false && isStable && session.optMoverSide && (session.optMoverHit || 0) >= K.OPT_HIT &&
         (session.frameSeq - (session.optMoverSeq || 0)) <= K.OPT_WINDOW) {
       var optTurn = (session.optMoverSide === 'red') ? 'b' : 'w';
       if (optTurn !== out.turn) {
@@ -6292,6 +6336,19 @@ var JJEngine = {
     }
 
     session.reseatDone = 0;
+
+    /* ★ 2.0.0r42：识别失联 → 整帧不出建议（宁可没箭头，不给错箭头）。
+       真机事故：河带丢子使锚盘缺两枚兵，插件仍拿它算出「车七进五」，
+       而真实盘面上那条竖线被自己的兵堵死 —— 错误箭头比没有箭头更糟。 */
+    if ((session.unexplained || 0) >= 3) {
+      out.skipAnalyze = 1;
+      out.skipReason = 'visionLost';
+      out.needSearch = 0;
+      out.searchFen = '';
+      out.suggestChinese = '';
+      session.lastDispatchedFen = '';
+    }
+
     // 日志里 15:11 起一直打「检测到走法 (null) (null)」：旧代码只在
     // tracker.tryAdvance 分支填 move，主路径从来没填过。现在由锚定状态机直接给出。
     if (stepInfo.move) {
