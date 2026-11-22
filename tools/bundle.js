@@ -2171,8 +2171,22 @@ var JJEngine = {
     //   你看到的永远是「一盘真棋」，不会是乱码盘。
     // 1.1.44：数量上限之外再加「位置合理性」，拦住 pnbaknb2 这类数量合法、
     // 但黑卒蹲在自己底线 / 红相过河的荒谬盘面
-    var engForLegal = session.flipped ? flipCodes(cls.codes) : cls.codes;
-    var legalNow = cls.codes && codesLegal(engForLegal) && codesPositionPlausible(engForLegal);
+    /* ★ 2.0.0r48：**合法性以「锚盘」为准，不以「本帧原始识别」为准**。
+       真机事故（2026-11-22 13:53，执黑残局）：
+         legalNow=0 codesValid=0 repaired=2 illegalStreak=7
+       残局里一次误读（相/仕被读到非法格）就让整盘判非法，于是永远不出建议，
+       HUD 停在「识别未收敛」，用户只能重开。
+       架构上本来就不该这样：锚盘是**由一步合法走法一步步推出来**的，天然合法；
+       原始识别只是"观测"，用来发现走法（枚举），不是权威。
+       现在：有锚盘就用锚盘判合法性并作为搜索局面；本帧识别只参与枚举匹配。
+       追不上（连续误读）时由 visionLost 兜底，宁可不出箭头。 */
+    var anchorForLegal = session.anchorCodes || null;
+    var engForLegal = anchorForLegal;
+    var legalNow = !!(anchorForLegal && codesLegal(anchorForLegal) && codesPositionPlausible(anchorForLegal));
+    if (!anchorForLegal) {
+      var engRawLegal = session.flipped ? flipCodes(cls.codes) : cls.codes;
+      legalNow = !!(cls.codes && codesLegal(engRawLegal) && codesPositionPlausible(engRawLegal));
+    }
     if (!legalNow) {
       session.legalStreak = 0;
       session.illegalStreak = (session.illegalStreak || 0) + 1;
@@ -2436,7 +2450,7 @@ var JJEngine = {
        - 同一局面只发一次（lastDispatchedFen 去重），上层原生缓存结论；
          换局 / 等待对方 / 重锚都会清 lastDispatchedFen，保证必发新请求。 */
     var analyzeFen = directFen ||
-        ((session.lastBoardFen || session.tracker.fen.split(' ')[0]) + ' ' +
+        ((session.anchorFen || session.lastBoardFen || session.tracker.fen.split(' ')[0]) + ' ' +
          turnChar + ' - - 0 1');
 
     /* 2.1.76：喂引擎前的最后一道闸。

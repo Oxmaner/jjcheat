@@ -1106,7 +1106,11 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
                          · HUD 会永久冻结在最后一次结果上（比如一直显示「识别未收敛」）。
                        现在：画面没变也每 2 秒放一帧进识别流程。
                        代价是静止时多一点点 CPU（每 2 秒一次），换来状态机始终能自愈。 */
-                    if (now - self.lastForcedProcess >= 2.0) {
+                    /* ★ 2.0.0r49：强制重评估降频到 **5 秒一次**。
+                       2 秒一次在真机上代价太大：每轮都要拷 14MB 画面 + 跑整套识别，
+                       用户实测「整个游戏卡成 PPT」。5 秒足够让状态机自愈
+                       （凑帧确认 / 重新学习 / 冻结的 HUD），体感上没有负担。 */
+                    if (now - self.lastForcedProcess >= 5.0) {
                         self.lastForcedProcess = now;
                         NSLog(@"[JJCheat] 画面静止 · 每 2 秒强制重评估一帧");
                         /* 不 return，落到下面的识别流程 */
