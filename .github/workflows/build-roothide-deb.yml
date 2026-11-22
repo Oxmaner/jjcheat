@@ -6,6 +6,8 @@ name: build-roothide-deb
 # 产物 iphoneos-arm64e，内含 engine.js（识别）+ 引擎静态库（棋力）+ NNUE 权重。
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
