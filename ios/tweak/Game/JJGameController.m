@@ -136,7 +136,11 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
     if (self) {
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         _state = JJGameStateIdle;
-        _enabled = [ud objectForKey:JJ_KEY_ENABLED] ? [ud boolForKey:JJ_KEY_ENABLED] : YES;
+        /* ★ 2.0.0r39：**每次启动都从「关闭」开始**（用户要求）。
+           不再从 NSUserDefaults 恢复上次的开/关状态：插件一开就在后台抓帧、
+           跑识别、起引擎，用户希望「我自己点一下才干活」。
+           现在交互固定为：点球 = 开 / 关切换，长按 = 一级菜单。 */
+        _enabled = NO;
         _hudVisible = [ud objectForKey:JJ_KEY_HUD_VISIBLE] ? [ud boolForKey:JJ_KEY_HUD_VISIBLE] : YES;
         /* 2.1.79：思考时长与其它引擎参数的读取/迁移/夹区间统一在
            JJEngineOptions 里做，这里只取一次值，不再重复一遍迁移逻辑
@@ -379,8 +383,7 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 
 - (void)setPluginEnabled:(BOOL)on {
     self.enabled = on;
-    [[NSUserDefaults standardUserDefaults] setBool:on forKey:JJ_KEY_ENABLED];
-    [[NSUserDefaults standardUserDefaults] synchronize];
+    /* ★ 2.0.0r39：不再持久化开/关状态（启动恒定关闭，见 init 里的说明）。 */
 
     if (on) {
         [self.ballWindow setActive:YES];
