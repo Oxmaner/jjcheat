@@ -63,6 +63,8 @@ typedef NS_ENUM(NSInteger, JJMenuAction) {
 /* 画面指纹：90 个交叉点的 RGB 快照。新帧但画面没变时整轮跳过 JS */
 @property (nonatomic, strong) NSData *lastFingerprint;
 @property (nonatomic, assign) NSTimeInterval lastLearnAttempt;
+/* 2.0.0r47：静止画面的强制重评估时间戳（见 frame 处理里的「每 2 秒强制重评估一帧」） */
+@property (nonatomic, assign) NSTimeInterval lastForcedProcess;
 @property (nonatomic, assign) NSInteger learnFailCount;
 /* 插件总开关 */
 @property (nonatomic, assign) BOOL enabled;
@@ -1097,11 +1099,24 @@ static int JJFrameFingerprintDiff(const int32_t *a, const int32_t *b) {
                     JJFrameFingerprintDiff(prevFP, sample) < JJ_FRAME_DIFF_THRESHOLD &&
                     JJFrameFingerprintMaxPointDiff(prevFP, sample) < JJ_FP_POINT_DELTA;
                 if (unchanged) {
-                    if (now - self.lastHeartbeatTs >= JJ_HEARTBEAT_GAP) {
-                        self.lastHeartbeatTs = now;
-                        NSLog(@"[JJCheat] 画面静止 · 跳过本帧（静态零开销）");
+                    /* ★ 2.0.0r47：**静止帧不再无限跳过 —— 每 2 秒强制重评估一帧**。
+                       这条「静态零开销」是省 CPU 的优化，但在真机上变成了反复发作的死锁源：
+                         · 「同一走法连续 3 帧确认」永远凑不满（JS 不被调用）；
+                         · 「重新同步 / 换局后重新学习」永远等不到帧；
+                         · HUD 会永久冻结在最后一次结果上（比如一直显示「识别未收敛」）。
+                       现在：画面没变也每 2 秒放一帧进识别流程。
+                       代价是静止时多一点点 CPU（每 2 秒一次），换来状态机始终能自愈。 */
+                    if (now - self.lastForcedProcess >= 2.0) {
+                        self.lastForcedProcess = now;
+                        NSLog(@"[JJCheat] 画面静止 · 每 2 秒强制重评估一帧");
+                        /* 不 return，落到下面的识别流程 */
+                    } else {
+                        if (now - self.lastHeartbeatTs >= JJ_HEARTBEAT_GAP) {
+                            self.lastHeartbeatTs = now;
+                            NSLog(@"[JJCheat] 画面静止 · 跳过本帧（静态零开销）");
+                        }
+                        return;
                     }
-                    return;
                 }
                 self.lastFingerprint = [NSData dataWithBytes:sample length:sizeof(sample)];
             }

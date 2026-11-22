@@ -1712,6 +1712,31 @@ var JJEngine = {
         }
       }
 
+      /* ★ 2.0.0r45：**轮次自愈**（用物理事实取代猜测）。
+         场景：对局不会等我们把插件开好 —— 点球开启时对方往往已经走了一两步，
+         甚至已经轮到我方。开启那一刻"轮到谁"无从得知，旧代码只能按
+         ply = flipped?1:0 猜一次，猜错就一直错（要么不出箭头，要么给了箭头却走不动）。
+
+         可用的物理事实很简单：
+           盘面变了、而我方这一步没被提交 → 那一手是**对方**走的 → 现在轮到我。
+         连续两帧稳定成立才采纳（躲开落子动画中间态）。
+         这条只在"没有提交"时生效；一旦我方走子被提交，计数清零，交回正常流程。 */
+      if (stepInfo.changed > 0 && !stepInfo.move && (session.codesStable || 0) >= 2) {
+        session.turnFixHits = (session.turnFixHits || 0) + 1;
+      } else if (stepInfo.move) {
+        session.turnFixHits = 0;
+      }
+      if ((session.turnFixHits || 0) >= 2) {
+        var myCharFix = session.flipped ? 'b' : 'w';
+        /* turnChar = (ply 偶 ? 'w' : 'b')，要让它等于我方 → 调整奇偶即可 */
+        var wantOdd = (myCharFix === 'b');
+        if ((((session.movePly || 0) % 2) === 1) !== wantOdd) {
+          session.movePly = (session.movePly || 0) + 1;
+          session.turnFixed = (session.turnFixed || 0) + 1;
+        }
+        session.turnFixHits = 0;
+      }
+
       var confirmingNow = (session.markerConfirmHits || 0) > 0;
       if (!stepInfo.move && !confirmingNow && stepInfo.changed >= JJ_RESEAT_MIN_DIFF) {
         // 2.0.0：只有「大变化」才可能是换局 / 中途进对局。
@@ -2345,7 +2370,29 @@ var JJEngine = {
      *   - 6 格约占 32 枚棋子的 19%，超过这个比例说明整帧整体不可信。
      * 不退避：下一帧正常就立刻恢复，不要像旧的 illegalStreak 那样歇几秒。 */
     var unsureCount = session.lowConfCount || 0;
-    if (unsureCount > JJ_MAX_UNSURE_CELLS) {
+    /* ★ 2.0.0r44：**盘面已经稳定就不再拿置信度卡它**。
+       真机事故（2026-11-22 13:22，执黑对局）：
+         legalNow=1 codesValid=1 codesStable=7 illegalStreak=0 skipReason=lowconf
+       盘面连续 7 帧完全一致、且判为合法，却因为「低置信度格子 > 6」被永久拦下，
+       HUD 一直显示「识别未收敛」，一局都拿不到着法。
+       置信度门槛本来是用来挡**落子动画那一两帧**的（棋子放大 1.25 倍 + 高亮圈，
+       模板分会掉到 0.2 左右）。稳定 3 帧以上说明动画早结束了，
+       此时低分只反映「这一版模板与当前皮肤/水纹背景的匹配度不高」，
+       不是「盘面不可信」—— 继续拦下去等于把这个皮肤判死刑。
+       所以：稳定 >= 3 帧且合法 → 放行；不稳定时才按原阈值拦。 */
+    var boardSettled = ((session.codesStable || 0) >= 1);
+    /* ★ 2.0.0r46：判据从"稳定帧数"改成**合法盘面**（真机教训见下）。
+       r45 用 codesStable>=3，实测卡死在 codesStable=2：这台机器**画面静止时不处理帧**，
+       JS 根本不会被调用，稳定计数涨不上去 —— 依赖帧数累积的门槛在这里等于永久拦截。
+       而"是不是动画中间态"其实有更直接的判据：**盘面是否合法**。
+       落子动画/高亮圈造成的错读几乎必然产出非法盘面（子凭空多/少、将帅对脸），
+       而 candsLegal 已经在别处把关。所以：只要当前识别是一盘合法棋，就不再拿
+       低置信度格子去拦它 —— 置信度低只说明模板与皮肤匹配度一般，不代表盘面不可信。 */
+    var settledLegal = false;
+    try {
+      settledLegal = !!(engCodes && codesLegal(engCodes) && codesPositionPlausible(engCodes));
+    } catch (eSL) { settledLegal = false; }
+    if (unsureCount > JJ_MAX_UNSURE_CELLS && !boardSettled && !settledLegal) {
       out.skipAnalyze = 1;
       out.skipReason = 'lowconf';
       out.unsureCount = unsureCount;
@@ -2353,6 +2400,7 @@ var JJEngine = {
       out.searchFen = '';
       return out;
     }
+    out.unsureCount = unsureCount;
     /* ★ 2.0.0r17：离开棋盘 / 对局结束检测。
        真机日志（11:52:54 起）：对局结束进结算画面，识别在一个完全不是棋盘的
        画面上硬读，diff=40、repaired=6，还照样派搜索 —— HUD 就会乱跳。
