@@ -1,158 +1,113 @@
-# JJCheat 交接（r36）
+# JJCheat 交接（2026-11-22 · r43 稳定版 + r50 同码高版本）
 
 ## 当前状态
 
 | 项 | 值 |
 |---|---|
-| 包 | `com.maclin.jjcheat_2.0.0r36+b125_iphoneos-arm64e.deb` |
-| MD5 | `49a9046c52e1563ff5d4b23e772c72e9` |
-| 仓库 | `Oxmaner/jjcheat`（私有） |
-| 设备 | 已装 r36+b125，真机验证通过 |
-| 引擎 | 纯枚举法（移植原项目 `MoveTracker.tryAdvance`），`src=enum` 已验证 |
+| 设备实装 | `com.maclin.jjcheat 2.0.0r43+b130` |
+| 设备 dylib | r43：点球=开关 / 长按=菜单 / 启动默认关闭 / 关插件不杀引擎 |
+| 设备 engine.js | **r42 脚本**（365289 B，从 r43 包内嵌副本释放） |
+| 仓库 HEAD | `c6ece25`（其中 `5bb83eb` = r50，**代码与 r43 完全相同**，仅版本号前进） |
+| 已验证能力 | **执红可完整对局**：23 手全程 `src=enum`，引擎算出 `+杀 1` 并绝杀 |
+| 已知不可用 | **执黑**、**残局**（见下） |
 
-已删除：白点白圈标记整层、`analyzeStepDiff`、`logo-dark` 变黑逻辑、HUD 死文案、菜单精简至 8 项。
+## 交互（用户定的，勿改）
 
----
+- **点鲸鱼球 = 插件开 / 关**（不弹面板，避免面板盖住棋盘打断识别）
+- **长按球 = 一级菜单**（菜单里**没有**「插件」开关项）
+- **启动默认关闭**（不记忆上次状态）
 
-## 唯一待办：对手的走子没被识别
+## 今天修好并验证的（r42 这一层，全部真机数据驱动）
 
-### 症状（真机实测，用户执红）
-
-1. 用户按箭头走 `马八进七` → `ply` 0→1，**识别成功**
-2. 对手走中炮（`炮8平5`）→ **没识别**，`ply` 停在 **1**（应为 2）
-3. HUD 一直显示「等待对方走子」，**永不给 bestmove**
-
-### 为什么卡住
-
-`tools/bundle.js:1842-1852`：
-
-```js
-var myTurnChar = mySideDetected === 'red' ? 'w' : 'b';
-var lastMoverChar = session.lastMoverSide === 'red' ? 'w' : (…'black' ? 'b' : '');
-if (lastMoverChar) turnChar = (lastMoverChar === 'w') ? 'b' : 'w';
-var waitingOpponent = (turnChar !== myTurnChar);
-```
-
-`lastMoverSide` 停在 `'red'` → `turnChar='b'` → `waitingOpponent=1` → 跳过搜索、不出箭头。
-对手明明走了，但 `lastMoverSide` 没更新成 `'black'`。
-
-### 排查入口
-
-**日志**（设备上）：
-```
-/var/mobile/Containers/Data/Application/141CCCF6-0FE0-4492-8E22-5EDFAC205EF5/
-  Library/Application Support/JJCheat/
-    moves-*.log     ← n / uci / zh / src / fen
-    engine-*.log    ← 引擎搜索记录
-```
-
-**要看的字段**（心跳 + 枚举诊断）：
-- `enumSig` / `enumNoise` / `enumHits` —— 黑炮那几步的匹配得分
-- `skipReason` —— 是否被 `stepIsLegal` / `codesLegal` 拦下
-- `lastMoverSide` 的变化轨迹
-- **`flipped` 是否中途翻转**（若锚盘坐标系与画面朝向不一致，枚举会全盘匹配失败）
-
-### 初步怀疑
-
-中炮是「炮8平5」，横移 **3 格**。签名格只有起点 + 落点两格，中间 2 个空格的采样差异可能把 `noise` 推过硬门槛（`noise ≤ 4`）；也可能 3 帧确认没凑满。
-
-**需要真实数值确认，不要盲改阈值。**
-
-### 相关代码
-
-| 位置 | 作用 |
-|---|---|
-| `src/app/board.js` → `enumerateAdvance` | 枚举全部合法走法 + 三分类比对 |
-| `tools/bundle.js` ~1526 起 | 集成块：`enumHits >= 3` 才提交 |
-| `tools/bundle.js:1842-1852` | 轮次推导（上面的代码） |
-| 硬门槛 | `sig ≤ 1 && noise ≤ 4`，签名格权重 ×10 |
-
----
-
-## 次要待办：HUD 显示歧义
-
-`sideToMove` 一个字段两种语义：
-
-```js
-// bundle.js:2066（正常分支）= 我执哪方
-out.sideToMove = mySideDetected;                     // 'red'
-// bundle.js:2221（waitingOpponent 分支）= 轮到谁走  ← 语义变了
-out.sideToMove = turnChar === 'w' ? 'red' : 'black'; // 'black'
-```
-
-HUD 统一当「我执哪方」显示（`JJHUDWindow.m:357`）→ 等对方时看到「黑方」会误以为自己是黑方。
-
-**修法**：HUD 改用 `mySide`（`bundle.js:1901` 已有），轮次由 `waitingOpponent` 单独表达。
-
----
-
-## 改完必须全绿
+### 1. 河带丢子 —— 错箭头的根因
+`classifyByColor` / `classifyByTemplate` 两处原本对 row4/row5（楚河汉界）抬高"判有子"门槛到
+`max(0.16, inkThOcc+0.05)`，用来压水纹文字造成的假墨。真机截图实测（`tools/diag-vision.js`）：
 
 ```
-node --check tools/bundle.js
-node tools/test-enum.js       → 7 通过 / 0 失败
-node tools/test-catchup.js    → 连续追上 3/3 步
-bash tools/check-syntax.sh    → 15/15
+空格的假墨：ink ≤0.094 / dark ≤0.108
+河沿真棋子：ink 0.108~0.180      ← 区间重叠，抬门槛必然杀掉真子
+红子 redInkR 0.115~0.182（空格恒 0）
+黑子 darkInkR 0.177~0.209（水纹假墨 ≤0.108）
 ```
 
-改完 `bundle.js` 后记得同步：
-```
-node tools/bundle.js
-Copy-Item dist\engine.js 'ios\tweak\layout\Library\Application Support\JJCheat\engine.js'
-```
+改为**红墨/黑墨分别判**（红 ≥0.06、黑 ≥0.15）。修前：row5 两枚红兵整格丢失 →
+引擎据此给出「车七进五」，而真实盘面上那条竖线被自己的兵堵死。
 
----
+### 2. 两步枚举 `enumerateAdvance2`
+人机 AI 回子约 1 秒，一次比对常含「我方一步 + 对方一步」，单步枚举必然匹配不上。
+新增两步枚举（40×40 组合法走法），要求签名格零误差、**占位严格**（四格之外不许有
+有子/空矛盾）、**最优解唯一**。与单步按分数择优，打平选单步。
 
-## 关键坐标链（不要重新推导）
+### 3. 单步枚举不许吞掉整步棋
+噪声里若恰好出现「一格清空 + 一格凭空多子」，判定为另一步棋 → 该单步候选作废。
 
-- `corners[0]` = 屏幕左上（`JJCalibrator.m:147`「左上 → 右上 → 右下 → 左下」）
-- `gridPoints` / `cls.codes` / `anchor` / `JJSqFromICCS` / `JJPieceAtFen`
-  **全部 row0 = 屏幕顶部 = FEN 首行 = 黑方底线**
-- `JJSqFromICCS('h2') = 70`
-- `Position.board` 与 `codes` 同序（`this.board[r*9+c]`，r = FEN 行号）
-- 执红不翻转；执黑时 `JJSqRotate180`
-- `C.RED=0` `C.BLACK=1` `C.EMPTY=0`；RK=1…RP=7、BK=8…BP=14
-- `BOARD_PRIOR = { x0:0.0666, cw:0.1078, y0:0.2773, ch:0.0484 }`（原项目反解值，
-  `refineByPieces` 三级搜索会收敛到本机真实位置）
+### 4. 唯一解一帧提交
+走完棋画面立刻静止 → 上层跳过帧 → JS 不再被调用 → 3 帧确认永远凑不满。
+改为：唯一解当帧提交；不唯一一律放弃。
 
----
+### 5. 停用三条会污染状态的「猜」
+- 漂移整盘吸收（差 4~7 格 → 整体换锚盘）
+- 乐观轮次写 `lastMoverSide`
+- 对称轮次翻转（半区变化 → ply++ / 写走子方 / 清链）
 
-## 出包
+证据：`moves.log` 里一条着法都没有（只有 newgame），HUD 却已是 `p1`。
 
-push 到 main 自动触发 `build-roothide-deb.yml`，约 4 分钟。
-下载：`python download_deb.py`（需在脚本里填 PAT）。
+### 6. 其它
+- 识别失联兜底：画面变了但枚举连续 3 帧解释不了 → 整帧不出建议
+- HUD `sideToMove` 统一为「我执哪方」
+- 诊断位 `d`/`r` 每帧先置未知，不再沿用旧值造成假一致
 
-**注意**：不要往仓库里写明文 token —— GitHub Secret Scanning 会拦（422）。
+## 已知问题（本版保留）
 
-### 装机（iOS MCP）
+### A. 执黑：「走子中」永久停留
+真机：`ply=3 turn=b wait=0 skip=none`，但 0 次提交、HUD 一直「走子中」。
+翻转链路的朝向判定本身是对的（`flipped=1`、`底红黑=0/9`、`p1/黑方` 都对），
+怀疑是翻转后枚举的签名格/噪声判定在某一类着法上不成立，**未定位**。
 
-```
-① POST http://<手机IP>:8090/upload_file     原始二进制 + X-Filename
-② tools/call install_app { path, file_type: "deb" }   ← 会重启 SpringBoard，连接必然断
-③ 等 20s → curl http://<手机IP>:8090/health
-```
+### B. 残局：误读连锁
+`legalNow=0 codesValid=0 repaired=2 illegalStreak=7` —— 残局一次误读（相/仕读到非法格）
+让整盘判非法，整条链路被掐死。
 
-**装机后必查**（deb 更新但容器副本可能还是旧的）：
-```bash
-C="/var/mobile/Containers/Data/Application/141CCCF6-.../Library/Application Support/JJCheat"
-ls -l "$C/engine.js"          # r36 应为 346149 B
-rm -f "$C/engine.js" "$C/engine.js.fp"   # 不对就删，重启 App 会重新释放
-```
+### C. 静止帧不评估（结构性，反复咬人）
+`画面静止 · 跳过本帧` 会让三件事同时失效：凑帧确认、重新同步后重新学习、HUD 刷新。
+r47 曾用「每 2 秒强制重评估」解决，但代价是**游戏卡成 PPT**（每轮 14MB 拷贝 + 整套识别）；
+r49 降到 5 秒仍不理想，故整版回滚。
 
-**MCP 调用坑**：
-- 结果在 `result.content[0].text`（JSON 字符串），不是 `structuredContent`
-- PowerShell 函数参数**不能叫 `$args`**（自动变量会被覆盖成空）
-- 游戏 bundle id = **`cn.jj.chinachess`**（`TKLobby_chess_tuanjie` 是进程名）
-- 手机必须**保持亮屏**，息屏会让 MCP 服务挂起
+## 试过但已回滚的方案（git 历史可查）
 
----
+| 版本 | 方案 | 结果 |
+|---|---|---|
+| r45 | 轮次自愈（盘面变了我没提交 → 对方走的） | 逻辑正确，但与后续改动叠加后未单独验证 |
+| r46 | 低置信度门槛改判「是否合法棋局」 | 有效，但依赖 r47 的强制评估 |
+| r47 | 静止帧每 2 秒强制重评估 | 治了死锁，但**卡成 PPT** |
+| r48 | 合法性以锚盘为准 + 锚盘 FEN 喂引擎 | 架构方向正确，但执黑仍卡 |
+| r49 | 强制评估 2s→5s | 仍不够 |
 
-## 用户长期约束（必须遵守）
+## 下次继续时建议的入口
 
-- **帧数不改**（用户自己设定）
-- **不能靠猜** —— 差分、环反推、高亮推断、补子全部已删除
-- **只留原项目的算法**
-- **UI / 箭头保持原样**（改版预览方案全部被否）
-- **不要擅自推送**，推送前等用户确认
-- 准确度 > 数据一致性 > 稳定性 > 速度
-- 可接受的最坏结果是「暂时没有箭头」，**绝不能是错误箭头**
+1. 先解决 **C（静止帧）**，因为它是 A/B 的共同放大器。
+   方向：不要无差别强制重评估；只在**需要时**放帧 —— 例如
+   `!learnedBoard`（要学习）、`stalled`（要自愈）、或距上次处理超过 N 秒。
+   ObjC 侧 `self.learnedBoard` / 上一次 result 的 `skipReason` 都拿得到。
+2. 再攻 **A（执黑走子中）**：用 `tools/diag-vision.js` 把真机截图喂进识别层，
+   对比「翻转后 canonical 网格」与锚盘的逐格差异，定位是枚举没找到还是找不到唯一解。
+3. B 可以复用 r48 的思路（合法性以锚盘为准），但要单独验证不与 A 冲突。
+
+## 工具
+
+- `tools/diag-vision.js`：**真机截图离线跑识别层**的台架（先用 Pillow 转 RGBA：
+  `python -c "from PIL import Image; ..."`，再 `node tools/diag-vision.js xxx.rgba`）。
+  改视觉参数前必须先跑它，别盲调。
+- `tools/test-enum.js` / `test-enum2.js`：单步 / 两步枚举的离线断言（7 + 13 条）。
+- `tools/test-catchup.js`：锚盘落后时能否连续追上。
+- 热更新通道：App 容器里的 `engine.js` 在 `.fp` 与内嵌副本一致时会被保留
+  （`JJVisionBridge.m` 的 `seedEngineIntoContainer`），因此改 JS 只需写容器 + 重启 App。
+  大文件传输走 base64 分片（单次 MCP 请求体上限约 16KB，中文 JSON 转义会放大）。
+
+## 装机 / 出包
+
+- push 到 main 自动触发 `build-roothide-deb.yml`（约 5~7 分钟）
+- artifact：`JJCheat-roothide-deb`；本机可用 node fetch 拉取（PowerShell/curl 的 TLS 在本机不可用）
+- **降级装不上**（dpkg 拒绝降版本）→ 回滚要用"版本号前进 + 旧代码"的方式
+- Pikafish 缓存键 `v2 → v3`：缓存里的 `.a` 是未打补丁的旧产物，`make` 又因时间戳跳过重编，
+  会导致「引擎补丁没生效：库里找不到 'JJ-NNUE FAIL' 标记」
