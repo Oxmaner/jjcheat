@@ -12,14 +12,14 @@
    下限 100ms（再短不如直接看棋谱），上限 3000ms（手机发烫的临界）。 */
 /* 2.1.76：800 → 650。800ms 满载搜索与游戏渲染抢核，落子后有明显掉帧；
    650ms 在象棋上强度几乎无感差异，但单步占用 CPU 少两成。 */
-#define JJ_THINK_MS_DEFAULT     650
+#define JJ_THINK_MS_DEFAULT     900
 #define JJ_THINK_MS_MIN         100
 #define JJ_THINK_MS_MAX         3000
 
 /* tick 只做「帧序号 + 稀疏指纹」两件极轻的检查，真正重活由新帧触发。
    2.1.77：2 → 4Hz。摘要层已经能 0.15 秒发现变化，但 tick 是唯一的消费入口，
    2Hz 的 500ms 会把它吃掉一半收益；tick 本身只读一个序号，代价可以忽略。 */
-#define JJ_SCAN_FPS             4
+#define JJ_SCAN_FPS             8
 
 /* 帧保鲜：Metal 帧超过这个秒数就不能再喂给 JS。
    16:00 真机日志里 1.1.44 的 s_lastGoodMetal 无时间戳、永久复用同一张旧图，
@@ -71,7 +71,7 @@
    （指纹变了就立刻处理，不看这个间隔）。 */
 /* 2.1.77：0.35 → 0.25。抓帧已经改成「摘要变了才拷」，JS 只会为真实变化跑，
    这道保险不再需要压得那么狠；0.25 让落子响应更快一点。 */
-#define JJ_PROCESS_MIN_GAP      0.25
+#define JJ_PROCESS_MIN_GAP      0.125
 /* 盘面彻底不可信（JS 明确 skipAnalyze）时才退避，正常噪声帧不再退避：
    噪声帧由 JS 侧锚盘覆盖并命中结论缓存，退避只会拖慢真实走子的响应。 */
 /* 2.1.77：2.5 → 分级。旧值是一刀切的黑洞：只要某帧识别出垃圾就 2.5 秒
@@ -99,7 +99,7 @@
 #define JJ_HUD_TOP_HEIGHT       54.0
 
 /* 箭头线宽（point） */
-#define JJ_ARROW_WIDTH          4.0
+#define JJ_ARROW_WIDTH          7.0
 
 /* 建议走法箭头颜色 */
 /* 2.1.90：建议箭头/网格改用**青蓝色**。
