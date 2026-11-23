@@ -87,3 +87,24 @@
 - 降级装不上（dpkg 拒绝降版本）→ 回滚要用"版本号前进 + 旧代码"
 - Pikafish 缓存键已升 `v3`（缓存里的 .a 是未打补丁的旧产物）
 - 手机息屏会让 MCP 服务和 Wi-Fi 一起挂；长任务前先确认亮屏
+
+## 换电脑 / 新环境搭建
+
+仓库已经自包含，克隆下来即可：
+
+```
+git clone https://github.com/Oxmaner/jjcheat.git
+cd jjcheat
+node tools/bundle.js          # 产出 dist/engine.js
+node tools/test-enum.js       # 7 条断言
+node tools/test-enum2.js      # 13 条断言
+node tools/diag-e2e.js <某张截图>.rgba    # 端到端台架
+```
+
+宿主侧脚本（MCP 连接、热更新、采样）在 `host/`，配置说明见 `host/README.md`。
+需要按你的环境改两处：**设备 IP**（`host/mcp.ps1:2`）、**容器 UUID**（`host/transfer.ps1:6`）。
+
+出包：push 到 `main` 自动触发 CI（`.github/workflows/build-roothide-deb.yml`），
+artifact `JJCheat-roothide-deb`，约 5~7 分钟。
+
+手机端：`ios-mcp` 监听 8090；**必须保持亮屏**，息屏会让 MCP 服务和 Wi-Fi 一起挂。
